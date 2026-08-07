@@ -9,7 +9,8 @@ import azure.functions as func
 from psycopg.rows import dict_row
 
 from database import pool
-from queries.los_average import LOS_AVERAGE_SQL, LOS_DISTRIBUTION_SQL
+from queries.los_average import LOS_AVERAGE_SQL
+from queries.los_distribution import LOS_DISTRIBUTION_SQL
 
 app = func.FunctionApp()
 
