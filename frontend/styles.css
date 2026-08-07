@@ -328,3 +328,29 @@ tbody tr:hover {
     }
 
 }
+
+.main-nav {
+    display: flex;
+    gap: 8px;
+
+    margin-bottom: 24px;
+}
+
+.main-nav a {
+    padding: 9px 14px;
+
+    border: 1px solid #d0d5dd;
+    border-radius: 6px;
+
+    background: white;
+    color: #344054;
+
+    text-decoration: none;
+
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.main-nav a:hover {
+    background: #f9fafb;
+}

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>LOS Distribution</title>
+
+    <link
+        rel="stylesheet"
+        href="styles.css"
+    >
+
+</head>
+
+
+<body>
+
+<main class="container">
+
+    <nav class="main-nav">
+
+        <a href="/">
+            Average LOS
+        </a>
+
+        <a href="/distribution.html">
+            LOS Distribution
+        </a>
+
+    </nav>
+
+
+    <header class="page-header">
+
+        <h1>
+            LOS Distribution
+        </h1>
+
+        <p>
+            Explore the distribution of bookings and room nights
+            across length-of-stay segments.
+        </p>
+
+    </header>
+
+
+    <section class="filter-panel">
+
+        <div class="filter-field">
+
+            <label for="startDate">
+                Start date
+            </label>
+
+            <input
+                id="startDate"
+                type="date"
+                value="2026-01-01"
+            >
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="endDate">
+                End date
+            </label>
+
+            <input
+                id="endDate"
+                type="date"
+                value="2026-12-31"
+            >
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="grain">
+                Group by
+            </label>
+
+            <select id="grain">
+
+                <option value="day">
+                    Day
+                </option>
+
+                <option
+                    value="month"
+                    selected
+                >
+                    Month
+                </option>
+
+                <option value="year">
+                    Year
+                </option>
+
+            </select>
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="lyComparisonBasis">
+                LY comparison
+            </label>
+
+            <select id="lyComparisonBasis">
+
+                <option
+                    value="sameDate"
+                    selected
+                >
+                    Same date
+                </option>
+
+                <option value="sameWeekday">
+                    Same weekday
+                </option>
+
+            </select>
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="hotelName">
+                Hotel
+            </label>
+
+            <input
+                id="hotelName"
+                type="text"
+                placeholder="All hotels"
+            >
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="metric">
+                Distribution
+            </label>
+
+            <select id="metric">
+
+                <option
+                    value="bookings"
+                    selected
+                >
+                    Bookings
+                </option>
+
+                <option value="nights">
+                    Room nights
+                </option>
+
+            </select>
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="scenario">
+                Scenario
+            </label>
+
+            <select id="scenario">
+
+                <option
+                    value="current"
+                    selected
+                >
+                    Current
+                </option>
+
+                <option value="ly">
+                    Actual LY
+                </option>
+
+                <option value="spit">
+                    SPIT
+                </option>
+
+                <option value="all">
+                    All comparisons
+                </option>
+
+            </select>
+
+        </div>
+
+
+        <div class="filter-field">
+
+            <label for="level">
+                Display
+            </label>
+
+            <select id="level">
+
+                <option
+                    value="total"
+                    selected
+                >
+                    Portfolio total
+                </option>
+
+                <option value="hotels">
+                    Hotels
+                </option>
+
+            </select>
+
+        </div>
+
+
+        <div class="filter-action">
+
+            <button id="loadButton">
+                Load data
+            </button>
+
+        </div>
+
+    </section>
+
+
+    <section class="status-panel">
+
+        <span id="status">
+            Select your filters.
+        </span>
+
+    </section>
+
+
+    <section
+        id="distributionResults"
+        class="distribution-results"
+    >
+    </section>
+
+
+    <section
+        id="errorPanel"
+        class="error-panel"
+        hidden
+    >
+    </section>
+
+</main>
+
+
+<script src="distribution.js"></script>
+
+</body>
+
+</html>
