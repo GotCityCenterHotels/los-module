@@ -1,0 +1,330 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    font-family:
+        Inter,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+
+    background: #f5f6f8;
+    color: #1f2937;
+}
+
+
+.container {
+    max-width: 1500px;
+
+    margin: 0 auto;
+    padding: 32px;
+}
+
+
+.page-header {
+    margin-bottom: 24px;
+}
+
+
+.page-header h1 {
+    margin: 0;
+
+    font-size: 28px;
+    font-weight: 650;
+}
+
+
+.page-header p {
+    margin-top: 6px;
+
+    color: #667085;
+}
+
+
+/* =====================================
+   FILTERS
+   ===================================== */
+
+.filter-panel {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+
+    align-items: end;
+
+    background: white;
+
+    padding: 20px;
+
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+}
+
+
+.filter-field {
+    display: flex;
+    flex-direction: column;
+
+    gap: 6px;
+
+    min-width: 160px;
+}
+
+
+.filter-field label {
+    font-size: 13px;
+    font-weight: 600;
+
+    color: #475467;
+}
+
+
+.filter-field input,
+.filter-field select {
+    height: 40px;
+
+    padding: 0 10px;
+
+    border: 1px solid #d0d5dd;
+    border-radius: 6px;
+
+    background: white;
+
+    font-size: 14px;
+}
+
+
+.filter-field input:focus,
+.filter-field select:focus {
+    outline: 2px solid #98a2b3;
+    outline-offset: 1px;
+}
+
+
+.filter-action {
+    display: flex;
+    align-items: end;
+}
+
+
+button {
+    height: 40px;
+
+    padding: 0 20px;
+
+    border: 0;
+    border-radius: 6px;
+
+    background: #101828;
+    color: white;
+
+    font-size: 14px;
+    font-weight: 600;
+
+    cursor: pointer;
+}
+
+
+button:hover {
+    background: #344054;
+}
+
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+
+/* =====================================
+   STATUS
+   ===================================== */
+
+.status-panel {
+    margin: 16px 0;
+
+    font-size: 14px;
+    color: #667085;
+}
+
+
+/* =====================================
+   SUMMARY
+   ===================================== */
+
+.summary-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, minmax(160px, 1fr));
+
+    gap: 16px;
+
+    margin-bottom: 24px;
+}
+
+
+.summary-card {
+    background: white;
+
+    padding: 18px;
+
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+}
+
+
+.summary-label {
+    display: block;
+
+    margin-bottom: 8px;
+
+    color: #667085;
+    font-size: 13px;
+}
+
+
+.summary-card strong {
+    font-size: 20px;
+}
+
+
+/* =====================================
+   RESULTS
+   ===================================== */
+
+.results-panel {
+    background: white;
+
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+
+    overflow: hidden;
+}
+
+
+.section-heading {
+    padding: 18px 20px;
+
+    border-bottom: 1px solid #e5e7eb;
+}
+
+
+.section-heading h2 {
+    margin: 0;
+
+    font-size: 18px;
+}
+
+
+.table-wrapper {
+    overflow-x: auto;
+}
+
+
+table {
+    width: 100%;
+
+    border-collapse: collapse;
+
+    font-size: 13px;
+}
+
+
+th,
+td {
+    padding: 11px 14px;
+
+    text-align: right;
+
+    border-bottom: 1px solid #eaecf0;
+
+    white-space: nowrap;
+}
+
+
+th {
+    background: #f9fafb;
+
+    color: #475467;
+
+    font-weight: 600;
+}
+
+
+th:first-child,
+td:first-child,
+th:nth-child(2),
+td:nth-child(2) {
+    text-align: left;
+}
+
+
+tbody tr:hover {
+    background: #f9fafb;
+}
+
+
+.total-row {
+    font-weight: 650;
+
+    background: #f2f4f7;
+}
+
+
+/* =====================================
+   ERRORS
+   ===================================== */
+
+.error-panel {
+    margin-top: 16px;
+
+    padding: 14px;
+
+    background: #fef3f2;
+    color: #b42318;
+
+    border: 1px solid #fecdca;
+    border-radius: 8px;
+}
+
+
+/* =====================================
+   MOBILE
+   ===================================== */
+
+@media (max-width: 900px) {
+
+    .container {
+        padding: 16px;
+    }
+
+    .summary-grid {
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+}
+
+
+@media (max-width: 600px) {
+
+    .filter-field,
+    .filter-action {
+        width: 100%;
+    }
+
+    button {
+        width: 100%;
+    }
+
+    .summary-grid {
+        grid-template-columns: 1fr;
+    }
+
+}

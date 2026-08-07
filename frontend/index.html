@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>LOS Explorer</title>
+
+    <link
+        rel="stylesheet"
+        href="styles.css"
+    >
+</head>
+
+<body>
+
+    <main class="container">
+
+        <header class="page-header">
+            <div>
+                <h1>Length of Stay Explorer</h1>
+
+                <p>
+                    Explore average LOS by arrival period.
+                </p>
+            </div>
+        </header>
+
+
+        <!-- ==========================================
+             FILTERS
+             ========================================== -->
+
+        <section class="filter-panel">
+
+            <div class="filter-field">
+                <label for="startDate">
+                    Start date
+                </label>
+
+                <input
+                    id="startDate"
+                    type="date"
+                    value="2026-01-01"
+                >
+            </div>
+
+
+            <div class="filter-field">
+                <label for="endDate">
+                    End date
+                </label>
+
+                <input
+                    id="endDate"
+                    type="date"
+                    value="2026-12-31"
+                >
+            </div>
+
+
+            <div class="filter-field">
+                <label for="grain">
+                    Group by
+                </label>
+
+                <select id="grain">
+
+                    <option value="day">
+                        Day
+                    </option>
+
+                    <option
+                        value="month"
+                        selected
+                    >
+                        Month
+                    </option>
+
+                    <option value="year">
+                        Year
+                    </option>
+
+                </select>
+            </div>
+
+
+            <div class="filter-field">
+                <label for="lyComparisonBasis">
+                    LY comparison
+                </label>
+
+                <select id="lyComparisonBasis">
+
+                    <option
+                        value="sameDate"
+                        selected
+                    >
+                        Same date
+                    </option>
+
+                    <option value="sameWeekday">
+                        Same weekday
+                    </option>
+
+                </select>
+            </div>
+
+
+            <div class="filter-field">
+                <label for="hotelName">
+                    Hotel
+                </label>
+
+                <input
+                    id="hotelName"
+                    type="text"
+                    placeholder="All hotels"
+                >
+            </div>
+
+
+            <div class="filter-action">
+
+                <button id="loadButton">
+                    Load data
+                </button>
+
+            </div>
+
+        </section>
+
+
+        <!-- ==========================================
+             STATUS
+             ========================================== -->
+
+        <section class="status-panel">
+
+            <span id="status">
+                Select a period and load data.
+            </span>
+
+        </section>
+
+
+        <!-- ==========================================
+             SUMMARY
+             ========================================== -->
+
+        <section
+            id="summary"
+            class="summary-grid"
+            hidden
+        >
+
+            <div class="summary-card">
+                <span class="summary-label">
+                    Rows
+                </span>
+
+                <strong id="rowCount">
+                    -
+                </strong>
+            </div>
+
+
+            <div class="summary-card">
+                <span class="summary-label">
+                    Start
+                </span>
+
+                <strong id="selectedStart">
+                    -
+                </strong>
+            </div>
+
+
+            <div class="summary-card">
+                <span class="summary-label">
+                    End
+                </span>
+
+                <strong id="selectedEnd">
+                    -
+                </strong>
+            </div>
+
+
+            <div class="summary-card">
+                <span class="summary-label">
+                    Grain
+                </span>
+
+                <strong id="selectedGrain">
+                    -
+                </strong>
+            </div>
+
+        </section>
+
+
+        <!-- ==========================================
+             RESULTS TABLE
+             ========================================== -->
+
+        <section
+            id="resultsSection"
+            class="results-panel"
+            hidden
+        >
+
+            <div class="section-heading">
+                <h2>LOS results</h2>
+            </div>
+
+
+            <div class="table-wrapper">
+
+                <table>
+
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Hotel</th>
+
+                            <th>LOS</th>
+                            <th>LOS LY</th>
+                            <th>LOS SPIT</th>
+
+                            <th>Room nights</th>
+                            <th>Room nights LY</th>
+                            <th>Room nights SPIT</th>
+
+                            <th>Bookings</th>
+                            <th>Bookings LY</th>
+                            <th>Bookings SPIT</th>
+                        </tr>
+                    </thead>
+
+                    <tbody id="resultsBody">
+                    </tbody>
+
+                </table>
+
+            </div>
+
+        </section>
+
+
+        <!-- ==========================================
+             ERROR
+             ========================================== -->
+
+        <section
+            id="errorPanel"
+            class="error-panel"
+            hidden
+        >
+        </section>
+
+    </main>
+
+
+    <script src="app.js"></script>
+
+</body>
+</html>
