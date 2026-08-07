@@ -51,7 +51,7 @@ def json_default(value):
         "is not JSON serializable"
     )
 
-
+#s
 @app.route(
     route="los/average",
     methods=["GET"],
