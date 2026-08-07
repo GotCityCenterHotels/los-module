@@ -127,8 +127,9 @@ async function loadData() {
         render();
 
 
-        status.textContent =
-            `Loaded ${payload.rowCount} rows.`;
+        status.textContent = loadedData.length
+            ? "Data loaded."
+            : "No data returned.";
 
     }
 
@@ -370,7 +371,7 @@ function renderRow(row) {
                 ·
                 ${formatNumber(total)}
                 ${metric.value === "bookings"
-                    ? "bookings"
+                    ? "reservations"
                     : "nights"}
             </div>
 

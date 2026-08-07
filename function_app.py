@@ -9,6 +9,7 @@ import azure.functions as func
 from psycopg.rows import dict_row
 
 from database import pool
+from queries.hotels import HOTELS_SQL
 from queries.los_average import LOS_AVERAGE_SQL
 from queries.los_distribution import LOS_DISTRIBUTION_SQL
 
@@ -17,6 +18,7 @@ app = func.FunctionApp()
 
 VALID_GRAINS = {
     "day",
+    "week",
     "month",
     "year",
 }
@@ -52,7 +54,50 @@ def json_default(value):
         "is not JSON serializable"
     )
 
-#s
+
+@app.route(
+    route="los/hotels",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def los_hotels(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+
+    try:
+
+        with pool.connection() as connection:
+
+            with connection.cursor() as cursor:
+
+                cursor.execute(HOTELS_SQL)
+
+                hotels = [
+                    row[0]
+                    for row in cursor.fetchall()
+                ]
+
+        return func.HttpResponse(
+            json.dumps({"data": hotels}),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception:
+
+        logging.exception(
+            "LOS hotels endpoint failed"
+        )
+
+        return func.HttpResponse(
+            json.dumps({
+                "error":
+                    "Unable to retrieve hotels"
+            }),
+            status_code=500,
+            mimetype="application/json",
+        )
+
 @app.route(
     route="los/average",
     methods=["GET"],
@@ -81,7 +126,11 @@ def los_average(
             or "month"
         )
 
-        hotel_name = req.params.get(
+        hotel_names_raw = req.params.get(
+            "hotelNames"
+        )
+
+        legacy_hotel_name = req.params.get(
             "hotelName"
         )
 
@@ -94,15 +143,54 @@ def los_average(
 
 
         # =====================================================
-        # 2. NORMALIZE HOTEL
+        # 2. NORMALIZE HOTELS
         # =====================================================
 
-        if hotel_name:
+        hotel_names = None
 
-            hotel_name = hotel_name.strip()
+        if hotel_names_raw is not None:
 
-            if not hotel_name:
-                hotel_name = None
+            try:
+
+                parsed_hotel_names = json.loads(
+                    hotel_names_raw
+                )
+
+            except json.JSONDecodeError:
+
+                parsed_hotel_names = None
+
+            if (
+                not isinstance(parsed_hotel_names, list)
+                or any(
+                    not isinstance(name, str)
+                    for name in parsed_hotel_names
+                )
+            ):
+
+                return func.HttpResponse(
+                    json.dumps({
+                        "error":
+                            "hotelNames must be a JSON array of strings"
+                    }),
+                    status_code=400,
+                    mimetype="application/json",
+                )
+
+            hotel_names = list(dict.fromkeys(
+                name.strip()
+                for name in parsed_hotel_names
+                if name.strip()
+            ))
+
+        elif (
+            legacy_hotel_name
+            and legacy_hotel_name.strip()
+        ):
+
+            hotel_names = [
+                legacy_hotel_name.strip()
+            ]
 
 
         # =====================================================
@@ -170,6 +258,7 @@ def los_average(
 
                     "allowedValues": [
                         "day",
+                        "week",
                         "month",
                         "year",
                     ]
@@ -212,7 +301,7 @@ def los_average(
             start_date,
             end_date,
             grain,
-            hotel_name,
+            hotel_names,
             ly_comparison_basis,
         )
 
@@ -252,8 +341,8 @@ def los_average(
                 "grain":
                     grain,
 
-                "hotelName":
-                    hotel_name,
+                "hotelNames":
+                    hotel_names,
 
                 "lyComparisonBasis":
                     ly_comparison_basis,
@@ -401,6 +490,7 @@ def los_distribution(
 
                     "allowedValues": [
                         "day",
+                        "week",
                         "month",
                         "year",
                     ]

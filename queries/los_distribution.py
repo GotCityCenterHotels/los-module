@@ -353,6 +353,12 @@ bucketed_reservations AS (
                     r.comparison_arrival_date
                 )::date
 
+            WHEN p.grain = 'week'
+                THEN date_trunc(
+                    'week',
+                    r.comparison_arrival_date
+                )::date
+
             ELSE
                 r.comparison_arrival_date
 

@@ -10,7 +10,7 @@ params AS (
         %s::date AS start_date,
         %s::date AS end_date,
         %s::text AS grain,
-        %s::text AS hotel_name,
+        %s::text[] AS hotel_names,
         %s::text AS ly_comparison_basis
 ),
 
@@ -209,10 +209,11 @@ source_rows AS (
         /* Hotel filter */
 
         AND (
-            c.hotel_name IS NULL
+            c.hotel_names IS NULL
 
-            OR trim(r.hotel_name) =
-               c.hotel_name
+            OR trim(r.hotel_name) = ANY(
+                c.hotel_names
+            )
         )
 
 
@@ -292,10 +293,11 @@ source_rows AS (
         /* Hotel filter */
 
         AND (
-            c.hotel_name IS NULL
+            c.hotel_names IS NULL
 
-            OR trim(r.hotel_name) =
-               c.hotel_name
+            OR trim(r.hotel_name) = ANY(
+                c.hotel_names
+            )
         )
 
 
@@ -482,6 +484,7 @@ reservation_scenarios AS (
 
    Python already validates:
        day
+       week
        month
        year
    ============================================================ */
@@ -504,6 +507,12 @@ bucketed_reservations AS (
             WHEN p.grain = 'month'
                 THEN date_trunc(
                     'month',
+                    r.comparison_arrival_date
+                )::date
+
+            WHEN p.grain = 'week'
+                THEN date_trunc(
+                    'week',
                     r.comparison_arrival_date
                 )::date
 

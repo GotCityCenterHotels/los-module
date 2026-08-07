@@ -86,6 +86,10 @@
                         Day
                     </option>
 
+                    <option value="week">
+                        Week
+                    </option>
+
                     <option
                         value="month"
                         selected
@@ -123,16 +127,53 @@
             </div>
 
 
-            <div class="filter-field">
-                <label for="hotelName">
-                    Hotel
+            <div class="filter-field hotel-filter">
+                <label id="hotelSelectLabel">
+                    Hotels
                 </label>
 
-                <input
-                    id="hotelName"
-                    type="text"
-                    placeholder="All hotels"
+                <div
+                    id="hotelSelect"
+                    class="multi-select"
                 >
+                    <button
+                        id="hotelToggle"
+                        class="multi-select-toggle"
+                        type="button"
+                        aria-labelledby="hotelSelectLabel hotelToggle"
+                        aria-expanded="false"
+                    >
+                        All hotels
+                    </button>
+
+                    <div
+                        id="hotelMenu"
+                        class="multi-select-menu"
+                        hidden
+                    >
+                        <div class="multi-select-actions">
+                            <button
+                                id="selectAllHotels"
+                                type="button"
+                            >
+                                Select all
+                            </button>
+
+                            <button
+                                id="clearAllHotels"
+                                type="button"
+                            >
+                                Unselect all
+                            </button>
+                        </div>
+
+                        <div id="hotelOptions">
+                            <span class="multi-select-empty">
+                                Loading hotels...
+                            </span>
+                        </div>
+                    </div>
+                </div>
             </div>
 
 
@@ -170,49 +211,47 @@
             hidden
         >
 
-            <div class="summary-card">
-                <span class="summary-label">
-                    Rows
+            <div class="summary-card total-summary-card">
+                <span class="summary-heading">
+                    Selected properties total
                 </span>
 
-                <strong id="rowCount">
-                    -
-                </strong>
+                <div class="summary-values">
+                    <div>
+                        <span class="summary-label">LOS</span>
+                        <strong id="totalLos">-</strong>
+                    </div>
+
+                    <div>
+                        <span class="summary-label">LOS LY</span>
+                        <strong id="totalLosLy">-</strong>
+                    </div>
+
+                    <div id="totalLosSpitCard">
+                        <span class="summary-label">LOS SPIT</span>
+                        <strong id="totalLosSpit">-</strong>
+                    </div>
+                </div>
             </div>
 
+        </section>
 
-            <div class="summary-card">
-                <span class="summary-label">
-                    Start
-                </span>
 
-                <strong id="selectedStart">
-                    -
-                </strong>
+        <section
+            id="chartSection"
+            class="chart-panel"
+            hidden
+        >
+            <div class="section-heading chart-heading">
+                <h2>LOS over time</h2>
+
+                <div class="chart-legend" aria-label="Chart legend">
+                    <span><i class="legend-line los-line"></i>LOS</span>
+                    <span><i class="legend-line losly-line"></i>LOS LY</span>
+                </div>
             </div>
 
-
-            <div class="summary-card">
-                <span class="summary-label">
-                    End
-                </span>
-
-                <strong id="selectedEnd">
-                    -
-                </strong>
-            </div>
-
-
-            <div class="summary-card">
-                <span class="summary-label">
-                    Grain
-                </span>
-
-                <strong id="selectedGrain">
-                    -
-                </strong>
-            </div>
-
+            <div id="losChart" class="los-chart"></div>
         </section>
 
 
@@ -242,15 +281,15 @@
 
                             <th>LOS</th>
                             <th>LOS LY</th>
-                            <th>LOS SPIT</th>
+                            <th class="los-spit-column">LOS SPIT</th>
 
                             <th>Room nights</th>
                             <th>Room nights LY</th>
                             <th>Room nights SPIT</th>
 
-                            <th>Bookings</th>
-                            <th>Bookings LY</th>
-                            <th>Bookings SPIT</th>
+                            <th>Reservations</th>
+                            <th>Reservations LY</th>
+                            <th>Reservations SPIT</th>
                         </tr>
                     </thead>
 
