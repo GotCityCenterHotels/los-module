@@ -1,693 +1,762 @@
 LOS_AVERAGE_SQL = """
 WITH
+
+/* ============================================================
+   PARAMETERS
+   ============================================================ */
+
 params AS (
-  SELECT
-    %s::date AS start_date,
-    %s::date AS end_date,
-    %s::text AS grain,
-    %s::text AS hotel_name,
-    %s::text AS ly_comparison_basis
+    SELECT
+        %s::date AS start_date,
+        %s::date AS end_date,
+        %s::text AS grain,
+        %s::text AS hotel_name,
+        %s::text AS ly_comparison_basis
 ),
+
+
+/* ============================================================
+   COMPARISON DATES + UTC QUERY BOUNDARIES
+
+   Calculate these once rather than repeatedly while scanning
+   staging.room_nights_source.
+   ============================================================ */
 
 cutoffs AS (
-  SELECT
-    p.*,
+    SELECT
+        p.*,
 
-    CASE
-      WHEN p.ly_comparison_basis = 'sameWeekday'
-        THEN (now()::date - interval '364 days')::date
-      ELSE (now()::date - interval '1 year')::date
-    END AS created_cutoff,
 
-    CASE
-      WHEN p.ly_comparison_basis = 'sameWeekday'
-        THEN (p.start_date - interval '364 days')::date
-      ELSE (p.start_date - interval '1 year')::date
-    END AS ly_start,
+        /* ----------------------------------------------------
+           Historical booking-position cutoff
+           ---------------------------------------------------- */
 
-    CASE
-      WHEN p.ly_comparison_basis = 'sameWeekday'
-        THEN (p.end_date - interval '364 days')::date
-      ELSE (p.end_date - interval '1 year')::date
-    END AS ly_end
+        CASE
+            WHEN p.ly_comparison_basis = 'sameWeekday'
+                THEN (
+                    CURRENT_DATE
+                    - INTERVAL '364 days'
+                )::date
 
-  FROM params p
+            ELSE (
+                CURRENT_DATE
+                - INTERVAL '1 year'
+            )::date
+        END AS created_cutoff,
+
+
+        /* ----------------------------------------------------
+           LY requested date range
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN p.ly_comparison_basis = 'sameWeekday'
+                THEN (
+                    p.start_date
+                    - INTERVAL '364 days'
+                )::date
+
+            ELSE (
+                p.start_date
+                - INTERVAL '1 year'
+            )::date
+        END AS ly_start,
+
+
+        CASE
+            WHEN p.ly_comparison_basis = 'sameWeekday'
+                THEN (
+                    p.end_date
+                    - INTERVAL '364 days'
+                )::date
+
+            ELSE (
+                p.end_date
+                - INTERVAL '1 year'
+            )::date
+        END AS ly_end,
+
+
+        /* ----------------------------------------------------
+           Shift LY reservations onto comparable current date
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN p.ly_comparison_basis = 'sameWeekday'
+                THEN INTERVAL '364 days'
+
+            ELSE INTERVAL '1 year'
+        END AS ly_forward_shift,
+
+
+        /* ----------------------------------------------------
+           Current UTC range
+           ---------------------------------------------------- */
+
+        (
+            p.start_date::timestamp
+            AT TIME ZONE 'Europe/Stockholm'
+        ) AS current_start_utc,
+
+
+        (
+            (
+                p.end_date
+                + 1
+            )::timestamp
+            AT TIME ZONE 'Europe/Stockholm'
+        ) AS current_end_utc
+
+    FROM params p
 ),
 
+
 /* ============================================================
-   RAW ROOM NIGHT ROWS
+   FINISH THE LY UTC BOUNDARIES
+
+   Done separately because ly_start / ly_end were generated in
+   the previous CTE.
    ============================================================ */
 
-room_night_rows AS (
-  SELECT
-    r.number::text AS res_id,
+query_ranges AS (
+    SELECT
+        c.*,
 
-    trim(r.hotel_name)::text AS hotel_code,
+        (
+            c.ly_start::timestamp
+            AT TIME ZONE 'Europe/Stockholm'
+        ) AS ly_start_utc,
 
-    concat_ws(
-      '|',
-      (
-        r.night_start_utc
-        AT TIME ZONE 'Europe/Stockholm'
-      )::date::text,
-      coalesce(
-        trim(r.assigned_space_name),
-        ''
-      )
-    ) AS night_key,
+        (
+            (
+                c.ly_end
+                + 1
+            )::timestamp
+            AT TIME ZONE 'Europe/Stockholm'
+        ) AS ly_end_utc
 
-    (
-      r.night_start_utc
-      AT TIME ZONE 'Europe/Stockholm'
-    )::date AS night_date,
+    FROM cutoffs c
+),
 
-    (
-      r.start_utc
-      AT TIME ZONE 'Europe/Stockholm'
-    )::date AS arrival_date,
 
-    r.created_utc::date AS created_date,
+/* ============================================================
+   SOURCE ROWS
 
-    r.canceled_utc::date AS cancelled_date
+   IMPORTANT OPTIMIZATION:
 
-  FROM staging.room_nights_source r
+   Current and LY are separate SELECTs rather than:
 
-  CROSS JOIN cutoffs c
+       WHERE current_range OR ly_range
 
-  WHERE r.number IS NOT NULL
+   This gives PostgreSQL two straightforward start_utc range
+   scans and generally makes start_utc indexes easier to use.
 
-    AND r.start_utc IS NOT NULL
+   UNION ALL is intentional.
 
-    AND r.night_start_utc IS NOT NULL
+   If the requested ranges overlap, duplicate source rows do not
+   change LOS because reservation_base later performs
+   COUNT(DISTINCT night_date).
+   ============================================================ */
 
-    /*
-      Load both:
-      - selected current period
-      - required last-year comparison period
-    */
-    AND (
-      (
-        r.start_utc >=
-          c.start_date
-          AT TIME ZONE 'Europe/Stockholm'
+source_rows AS (
+
+    /* --------------------------------------------------------
+       CURRENT RANGE
+       -------------------------------------------------------- */
+
+    SELECT
+        r.number::text AS res_id,
+
+        trim(
+            r.hotel_name
+        )::text AS hotel_code,
+
+        (
+            r.night_start_utc
+            AT TIME ZONE 'Europe/Stockholm'
+        )::date AS night_date,
+
+        (
+            r.start_utc
+            AT TIME ZONE 'Europe/Stockholm'
+        )::date AS arrival_date,
+
+        r.created_utc::date AS created_date,
+
+        r.canceled_utc::date AS cancelled_date
+
+    FROM staging.room_nights_source r
+
+    CROSS JOIN query_ranges c
+
+    WHERE
+        r.number IS NOT NULL
+
+        AND r.start_utc IS NOT NULL
+
+        AND r.night_start_utc IS NOT NULL
+
+
+        /* Current arrival range */
+
+        AND r.start_utc >=
+            c.current_start_utc
 
         AND r.start_utc <
-          (
-            c.end_date
-            + interval '1 day'
-          )
-          AT TIME ZONE 'Europe/Stockholm'
-      )
+            c.current_end_utc
 
-      OR
 
-      (
-        r.start_utc >=
-          c.ly_start
-          AT TIME ZONE 'Europe/Stockholm'
+        /* Hotel filter */
+
+        AND (
+            c.hotel_name IS NULL
+
+            OR trim(r.hotel_name) =
+               c.hotel_name
+        )
+
+
+        /*
+         * Safe early cancellation filter.
+         *
+         * Anything cancelled on/before the historical cutoff
+         * can belong to neither:
+         *
+         *   - current actual / LY actual
+         *     because those require cancellation IS NULL
+         *
+         *   - SPIT
+         *     because SPIT requires cancellation > cutoff
+         *
+         * Removing these rows before COUNT(DISTINCT) can reduce
+         * the expensive aggregation substantially.
+         */
+
+        AND (
+            r.canceled_utc IS NULL
+
+            OR r.canceled_utc::date >
+               c.created_cutoff
+        )
+
+
+    UNION ALL
+
+
+    /* --------------------------------------------------------
+       LAST-YEAR RANGE
+       -------------------------------------------------------- */
+
+    SELECT
+        r.number::text AS res_id,
+
+        trim(
+            r.hotel_name
+        )::text AS hotel_code,
+
+        (
+            r.night_start_utc
+            AT TIME ZONE 'Europe/Stockholm'
+        )::date AS night_date,
+
+        (
+            r.start_utc
+            AT TIME ZONE 'Europe/Stockholm'
+        )::date AS arrival_date,
+
+        r.created_utc::date AS created_date,
+
+        r.canceled_utc::date AS cancelled_date
+
+    FROM staging.room_nights_source r
+
+    CROSS JOIN query_ranges c
+
+    WHERE
+        r.number IS NOT NULL
+
+        AND r.start_utc IS NOT NULL
+
+        AND r.night_start_utc IS NOT NULL
+
+
+        /* LY arrival range */
+
+        AND r.start_utc >=
+            c.ly_start_utc
 
         AND r.start_utc <
-          (
-            c.ly_end
-            + interval '1 day'
-          )
-          AT TIME ZONE 'Europe/Stockholm'
-      )
-    )
+            c.ly_end_utc
 
-    /*
-      NULL hotel_name means all hotels
-    */
-    AND (
-      c.hotel_name IS NULL
-      OR trim(r.hotel_name) = c.hotel_name
-    )
+
+        /* Hotel filter */
+
+        AND (
+            c.hotel_name IS NULL
+
+            OR trim(r.hotel_name) =
+               c.hotel_name
+        )
+
+
+        /* Same safe early cancellation filter */
+
+        AND (
+            r.canceled_utc IS NULL
+
+            OR r.canceled_utc::date >
+               c.created_cutoff
+        )
 ),
 
+
 /* ============================================================
-   CURRENT RESERVATIONS
+   ONE ROW PER RESERVATION
+
+   This is the expensive reservation LOS calculation.
+
+   It now happens ONCE.
+
+   True LOS:
+       count distinct calendar night dates
+
+   We no longer construct:
+
+       date | assigned_space_name
+
+   so room moves / assigned spaces don't inflate LOS and
+   PostgreSQL doesn't need to allocate/deduplicate strings.
    ============================================================ */
 
-los_base AS (
-  SELECT
-    r.res_id,
+reservation_base AS (
+    SELECT
+        s.res_id,
 
-    r.hotel_code,
+        s.hotel_code,
 
-    /*
-      Original LOS definition from your query.
+        s.arrival_date,
 
-      One reservation/space/date combination counts once.
-    */
-    count(
-      DISTINCT r.night_key
-    )::int AS night_count,
+        s.created_date,
 
-    CASE
-      WHEN p.grain = 'year'
-        THEN date_trunc(
-          'year',
-          r.arrival_date
-        )::date
+        s.cancelled_date,
 
-      WHEN p.grain = 'month'
-        THEN date_trunc(
-          'month',
-          r.arrival_date
-        )::date
+        count(
+            DISTINCT s.night_date
+        )::int AS night_count
 
-      ELSE r.arrival_date
+    FROM source_rows s
 
-    END AS bucket_date
-
-  FROM room_night_rows r
-
-  CROSS JOIN params p
-
-  WHERE
-    r.arrival_date
-      BETWEEN p.start_date
-      AND p.end_date
-
-    AND r.cancelled_date IS NULL
-
-  GROUP BY
-    r.res_id,
-    r.hotel_code,
-    bucket_date
+    GROUP BY
+        s.res_id,
+        s.hotel_code,
+        s.arrival_date,
+        s.created_date,
+        s.cancelled_date
 ),
 
+
 /* ============================================================
-   ACTUAL LAST YEAR
+   BUILD CURRENT / LY / SPIT SCENARIOS
+
+   Instead of three separate large CTE trees, each reservation
+   is converted into the scenarios where it qualifies.
+
+   A reservation can produce:
+       current
+       ly
+       spit
+
+   as appropriate.
    ============================================================ */
 
-losly_base AS (
-  SELECT
-    r.res_id,
+reservation_scenarios AS (
+    SELECT
+        scenario_data.scenario,
 
-    r.hotel_code,
+        r.res_id,
 
-    count(
-      DISTINCT r.night_key
-    )::int AS night_count,
+        r.hotel_code,
 
-    /*
-      First shift LY arrival onto the comparable current
-      period date.
+        scenario_data.comparison_arrival_date,
 
-      sameDate    = + 1 year
-      sameWeekday = + 364 days
+        r.night_count
 
-      Then apply day/month/year grain.
-    */
-    CASE
-      WHEN c.grain = 'year'
-        THEN date_trunc(
-          'year',
+    FROM reservation_base r
 
-          CASE
-            WHEN c.ly_comparison_basis = 'sameWeekday'
-              THEN (
-                r.arrival_date
-                + interval '364 days'
-              )
+    CROSS JOIN query_ranges c
 
-            ELSE (
-              r.arrival_date
-              + interval '1 year'
-            )
-          END
-        )::date
 
-      WHEN c.grain = 'month'
-        THEN date_trunc(
-          'month',
+    CROSS JOIN LATERAL (
 
-          CASE
-            WHEN c.ly_comparison_basis = 'sameWeekday'
-              THEN (
-                r.arrival_date
-                + interval '364 days'
-              )
+        VALUES
 
-            ELSE (
-              r.arrival_date
-              + interval '1 year'
-            )
-          END
-        )::date
 
-      ELSE
+        /* ----------------------------------------------------
+           CURRENT ACTUAL
+           ---------------------------------------------------- */
+
         (
-          CASE
-            WHEN c.ly_comparison_basis = 'sameWeekday'
-              THEN (
+            'current'::text,
+
+            r.arrival_date,
+
+            (
                 r.arrival_date
-                + interval '364 days'
-              )
+                    BETWEEN c.start_date
+                    AND c.end_date
 
-            ELSE (
-              r.arrival_date
-              + interval '1 year'
+                AND r.cancelled_date
+                    IS NULL
             )
-          END
-        )::date
+        ),
 
-    END AS bucket_date
 
-  FROM room_night_rows r
+        /* ----------------------------------------------------
+           ACTUAL LY
+           ---------------------------------------------------- */
 
-  CROSS JOIN cutoffs c
-
-  WHERE
-    r.arrival_date
-      BETWEEN c.ly_start
-      AND c.ly_end
-
-    AND r.cancelled_date IS NULL
-
-  GROUP BY
-    r.res_id,
-    r.hotel_code,
-    bucket_date
-),
-
-/* ============================================================
-   SPIT
-   Last year's booking position at the equivalent cutoff
-   ============================================================ */
-
-spit_base AS (
-  SELECT
-    r.res_id,
-
-    r.hotel_code,
-
-    count(
-      DISTINCT r.night_key
-    )::int AS night_count,
-
-    CASE
-      WHEN c.grain = 'year'
-        THEN date_trunc(
-          'year',
-
-          CASE
-            WHEN c.ly_comparison_basis = 'sameWeekday'
-              THEN (
-                r.arrival_date
-                + interval '364 days'
-              )
-
-            ELSE (
-              r.arrival_date
-              + interval '1 year'
-            )
-          END
-        )::date
-
-      WHEN c.grain = 'month'
-        THEN date_trunc(
-          'month',
-
-          CASE
-            WHEN c.ly_comparison_basis = 'sameWeekday'
-              THEN (
-                r.arrival_date
-                + interval '364 days'
-              )
-
-            ELSE (
-              r.arrival_date
-              + interval '1 year'
-            )
-          END
-        )::date
-
-      ELSE
         (
-          CASE
-            WHEN c.ly_comparison_basis = 'sameWeekday'
-              THEN (
+            'ly'::text,
+
+            (
                 r.arrival_date
-                + interval '364 days'
-              )
+                + c.ly_forward_shift
+            )::date,
 
-            ELSE (
-              r.arrival_date
-              + interval '1 year'
+            (
+                r.arrival_date
+                    BETWEEN c.ly_start
+                    AND c.ly_end
+
+                AND r.cancelled_date
+                    IS NULL
             )
-          END
-        )::date
+        ),
 
-    END AS bucket_date
 
-  FROM room_night_rows r
+        /* ----------------------------------------------------
+           SPIT
+           ---------------------------------------------------- */
 
-  CROSS JOIN cutoffs c
+        (
+            'spit'::text,
 
-  WHERE
-    r.created_date <= c.created_cutoff
+            (
+                r.arrival_date
+                + c.ly_forward_shift
+            )::date,
 
-    AND r.arrival_date
-      BETWEEN c.ly_start
-      AND c.ly_end
+            (
+                r.arrival_date
+                    BETWEEN c.ly_start
+                    AND c.ly_end
 
-    /*
-      Reservation must have been active at the
-      historical SPIT cutoff.
-    */
-    AND (
-      r.cancelled_date > c.created_cutoff
-      OR r.cancelled_date IS NULL
+                AND r.created_date <=
+                    c.created_cutoff
+
+                AND (
+                    r.cancelled_date >
+                        c.created_cutoff
+
+                    OR r.cancelled_date
+                        IS NULL
+                )
+            )
+        )
+
+    ) AS scenario_data(
+        scenario,
+        comparison_arrival_date,
+        include_row
     )
 
-  GROUP BY
-    r.res_id,
-    r.hotel_code,
-    bucket_date
+    WHERE
+        scenario_data.include_row
 ),
 
+
 /* ============================================================
-   CURRENT HOTEL AGGREGATION
+   BUCKET RESERVATIONS
+
+   Explicit CASE avoids relying on arbitrary date_trunc text.
+
+   Python already validates:
+       day
+       month
+       year
    ============================================================ */
 
-los_agg AS (
-  SELECT
-    bucket_date,
+bucketed_reservations AS (
+    SELECT
+        r.scenario,
 
-    hotel_code,
+        r.res_id,
 
-    avg(
-      night_count::numeric
-    ) AS los,
+        r.hotel_code,
 
-    sum(
-      night_count
-    ) AS rn,
+        CASE
+            WHEN p.grain = 'year'
+                THEN date_trunc(
+                    'year',
+                    r.comparison_arrival_date
+                )::date
 
-    count(
-      DISTINCT res_id
-    ) AS total_bookings
+            WHEN p.grain = 'month'
+                THEN date_trunc(
+                    'month',
+                    r.comparison_arrival_date
+                )::date
 
-  FROM los_base
+            ELSE
+                r.comparison_arrival_date
 
-  GROUP BY
-    bucket_date,
-    hotel_code
+        END AS bucket_date,
+
+        r.night_count
+
+    FROM reservation_scenarios r
+
+    CROSS JOIN params p
 ),
 
+
 /* ============================================================
-   ACTUAL LY HOTEL AGGREGATION
+   HOTEL + TOTAL AGGREGATION
+
+   GROUPING SETS creates both:
+
+       bucket_date + hotel
+       bucket_date + Total
+
+   in the same aggregate operation.
+
+   This replaces the old:
+
+       los_agg
+       los_total
+
+       losly_agg
+       losly_total
+
+       spit_agg
+       spit_total
+
+   Also note:
+
+       count(*)
+
+   rather than:
+
+       count(DISTINCT res_id)
+
+   because bucketed_reservations is already one row per
+   reservation/scenario.
    ============================================================ */
 
-losly_agg AS (
-  SELECT
-    bucket_date,
+scenario_agg AS (
+    SELECT
+        b.scenario,
 
-    hotel_code,
+        b.bucket_date,
 
-    avg(
-      night_count::numeric
-    ) AS losly,
+        CASE
+            WHEN GROUPING(
+                b.hotel_code
+            ) = 1
+                THEN 'Total'::text
 
-    sum(
-      night_count
-    ) AS rnly,
+            ELSE b.hotel_code
+        END AS hotel_code,
 
-    count(
-      DISTINCT res_id
-    ) AS total_bookings_ly
 
-  FROM losly_base
+        /* Average reservation LOS */
 
-  GROUP BY
-    bucket_date,
-    hotel_code
+        avg(
+            b.night_count::numeric
+        ) AS avg_los,
+
+
+        /* Room nights */
+
+        sum(
+            b.night_count
+        ) AS room_nights,
+
+
+        /* Reservations */
+
+        count(*) AS total_bookings
+
+
+    FROM bucketed_reservations b
+
+
+    GROUP BY
+        b.scenario,
+
+        GROUPING SETS (
+
+            /* Hotel */
+
+            (
+                b.bucket_date,
+                b.hotel_code
+            ),
+
+            /* Portfolio total */
+
+            (
+                b.bucket_date
+            )
+
+        )
 ),
 
-/* ============================================================
-   SPIT HOTEL AGGREGATION
-   ============================================================ */
-
-spit_agg AS (
-  SELECT
-    bucket_date,
-
-    hotel_code,
-
-    avg(
-      night_count::numeric
-    ) AS spit_los_non_strict_arrival,
-
-    sum(
-      night_count
-    ) AS spit_rn_non_strict_arrival,
-
-    count(
-      DISTINCT res_id
-    ) AS total_bookings_spit
-
-  FROM spit_base
-
-  GROUP BY
-    bucket_date,
-    hotel_code
-),
 
 /* ============================================================
-   COMBINE HOTEL LEVEL
+   PIVOT THE THREE SCENARIOS
+
+   scenario_agg is now tiny compared with the original
+   room-night source table.
    ============================================================ */
 
-per_hotel AS (
-  SELECT
-    coalesce(
-      a.bucket_date,
-      ly.bucket_date,
-      s.bucket_date
-    ) AS bucket_date,
+final_result AS (
+    SELECT
+        a.bucket_date,
 
-    coalesce(
-      a.hotel_code,
-      ly.hotel_code,
-      s.hotel_code
-    ) AS hotel_code,
+        a.hotel_code,
 
-    a.los,
 
-    ly.losly,
+        /* ----------------------------------------------------
+           LOS
+           ---------------------------------------------------- */
 
-    s.spit_los_non_strict_arrival,
+        max(
+            a.avg_los
+        ) FILTER (
+            WHERE
+                a.scenario = 'current'
+        ) AS los,
 
-    a.rn,
 
-    ly.rnly,
+        max(
+            a.avg_los
+        ) FILTER (
+            WHERE
+                a.scenario = 'ly'
+        ) AS losly,
 
-    s.spit_rn_non_strict_arrival,
 
-    a.total_bookings,
+        max(
+            a.avg_los
+        ) FILTER (
+            WHERE
+                a.scenario = 'spit'
+        ) AS spit_los_non_strict_arrival,
 
-    ly.total_bookings_ly,
 
-    s.total_bookings_spit
+        /* ----------------------------------------------------
+           ROOM NIGHTS
+           ---------------------------------------------------- */
 
-  FROM los_agg a
+        max(
+            a.room_nights
+        ) FILTER (
+            WHERE
+                a.scenario = 'current'
+        ) AS rn,
 
-  FULL JOIN losly_agg ly
 
-    ON ly.bucket_date = a.bucket_date
+        max(
+            a.room_nights
+        ) FILTER (
+            WHERE
+                a.scenario = 'ly'
+        ) AS rnly,
 
-    AND ly.hotel_code = a.hotel_code
 
-  FULL JOIN spit_agg s
+        max(
+            a.room_nights
+        ) FILTER (
+            WHERE
+                a.scenario = 'spit'
+        ) AS spit_rn_non_strict_arrival,
 
-    ON s.bucket_date = coalesce(
-      a.bucket_date,
-      ly.bucket_date
-    )
 
-    AND s.hotel_code = coalesce(
-      a.hotel_code,
-      ly.hotel_code
-    )
-),
+        /* ----------------------------------------------------
+           BOOKINGS
+           ---------------------------------------------------- */
 
-/* ============================================================
-   CURRENT TOTAL
-   ============================================================ */
+        max(
+            a.total_bookings
+        ) FILTER (
+            WHERE
+                a.scenario = 'current'
+        ) AS total_bookings,
 
-los_total AS (
-  SELECT
-    bucket_date,
 
-    /*
-      Calculate from reservation-level rows rather than
-      averaging hotel averages.
-    */
-    avg(
-      night_count::numeric
-    ) AS los,
+        max(
+            a.total_bookings
+        ) FILTER (
+            WHERE
+                a.scenario = 'ly'
+        ) AS total_bookings_ly,
 
-    sum(
-      night_count
-    ) AS rn,
 
-    count(
-      DISTINCT res_id
-    ) AS total_bookings
+        max(
+            a.total_bookings
+        ) FILTER (
+            WHERE
+                a.scenario = 'spit'
+        ) AS total_bookings_spit
 
-  FROM los_base
 
-  GROUP BY
-    bucket_date
-),
+    FROM scenario_agg a
 
-/* ============================================================
-   ACTUAL LY TOTAL
-   ============================================================ */
 
-losly_total AS (
-  SELECT
-    bucket_date,
-
-    avg(
-      night_count::numeric
-    ) AS losly,
-
-    sum(
-      night_count
-    ) AS rnly,
-
-    count(
-      DISTINCT res_id
-    ) AS total_bookings_ly
-
-  FROM losly_base
-
-  GROUP BY
-    bucket_date
-),
-
-/* ============================================================
-   SPIT TOTAL
-   ============================================================ */
-
-spit_total AS (
-  SELECT
-    bucket_date,
-
-    avg(
-      night_count::numeric
-    ) AS spit_los_non_strict_arrival,
-
-    sum(
-      night_count
-    ) AS spit_rn_non_strict_arrival,
-
-    count(
-      DISTINCT res_id
-    ) AS total_bookings_spit
-
-  FROM spit_base
-
-  GROUP BY
-    bucket_date
-),
-
-/* ============================================================
-   COMBINED TOTAL ROWS
-   ============================================================ */
-
-total_rows AS (
-  SELECT
-    coalesce(
-      t.bucket_date,
-      ly.bucket_date,
-      s.bucket_date
-    ) AS bucket_date,
-
-    'Total'::text AS hotel_code,
-
-    t.los,
-
-    ly.losly,
-
-    s.spit_los_non_strict_arrival,
-
-    t.rn,
-
-    ly.rnly,
-
-    s.spit_rn_non_strict_arrival,
-
-    t.total_bookings,
-
-    ly.total_bookings_ly,
-
-    s.total_bookings_spit
-
-  FROM los_total t
-
-  FULL JOIN losly_total ly
-
-    ON ly.bucket_date = t.bucket_date
-
-  FULL JOIN spit_total s
-
-    ON s.bucket_date = coalesce(
-      t.bucket_date,
-      ly.bucket_date
-    )
+    GROUP BY
+        a.bucket_date,
+        a.hotel_code
 )
 
+
 /* ============================================================
-   FINAL API RESULT
+   FINAL OUTPUT
    ============================================================ */
 
 SELECT
-  bucket_date,
+    bucket_date,
 
-  hotel_code,
+    hotel_code,
 
-  los,
+    los,
 
-  losly,
+    losly,
 
-  spit_los_non_strict_arrival,
+    spit_los_non_strict_arrival,
 
-  rn,
+    rn,
 
-  rnly,
+    rnly,
 
-  spit_rn_non_strict_arrival,
+    spit_rn_non_strict_arrival,
 
-  total_bookings,
+    total_bookings,
 
-  total_bookings_ly,
+    total_bookings_ly,
 
-  total_bookings_spit
+    total_bookings_spit
 
-FROM (
-  SELECT
-    *
-  FROM per_hotel
-
-  UNION ALL
-
-  SELECT
-    *
-  FROM total_rows
-
-) x
+FROM final_result
 
 ORDER BY
-  bucket_date,
+    bucket_date,
 
-  CASE
-    WHEN hotel_code = 'Total'
-      THEN 1
-    ELSE 0
-  END,
+    CASE
+        WHEN hotel_code = 'Total'
+            THEN 1
+        ELSE 0
+    END,
 
-  hotel_code;
+    hotel_code;
 """
