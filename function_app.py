@@ -1,33 +1,18 @@
 import json
 import logging
 
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import date
 
 import azure.functions as func
 
-from psycopg.rows import dict_row
-
 from database import pool
 from queries.hotels import HOTELS_SQL
-from queries.los_average import LOS_AVERAGE_SQL
-from queries.los_distribution import LOS_DISTRIBUTION_SQL
+from services.los_facts_service import fetch_los_facts
+
 
 app = func.FunctionApp()
 
-
-VALID_GRAINS = {
-    "day",
-    "week",
-    "month",
-    "year",
-}
-
-
-VALID_LY_COMPARISONS = {
-    "sameDate",
-    "sameWeekday",
-}
+VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
 
 
 def parse_date(value: str | None) -> date | None:
@@ -36,23 +21,51 @@ def parse_date(value: str | None) -> date | None:
 
     try:
         return date.fromisoformat(value)
-
     except ValueError:
         return None
 
 
-def json_default(value):
-
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-
-    if isinstance(value, Decimal):
-        return float(value)
-
-    raise TypeError(
-        f"Type {type(value).__name__} "
-        "is not JSON serializable"
+def json_response(payload, status_code=200):
+    return func.HttpResponse(
+        json.dumps(payload),
+        status_code=status_code,
+        mimetype="application/json",
     )
+
+
+def validate_facts_parameters(req):
+    start_date = parse_date(req.params.get("startDate"))
+    end_date = parse_date(req.params.get("endDate"))
+    ly_comparison_basis = req.params.get("lyComparisonBasis") or "sameDate"
+
+    if start_date is None:
+        return None, json_response(
+            {"error": "startDate is required and must use YYYY-MM-DD"},
+            400,
+        )
+
+    if end_date is None:
+        return None, json_response(
+            {"error": "endDate is required and must use YYYY-MM-DD"},
+            400,
+        )
+
+    if start_date > end_date:
+        return None, json_response(
+            {"error": "startDate cannot be after endDate"},
+            400,
+        )
+
+    if ly_comparison_basis not in VALID_LY_COMPARISONS:
+        return None, json_response(
+            {
+                "error": "Invalid lyComparisonBasis",
+                "allowedValues": ["sameDate", "sameWeekday"],
+            },
+            400,
+        )
+
+    return (start_date, end_date, ly_comparison_basis), None
 
 
 @app.route(
@@ -60,538 +73,45 @@ def json_default(value):
     methods=["GET"],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
-def los_hotels(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-
+def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
     try:
-
         with pool.connection() as connection:
-
             with connection.cursor() as cursor:
-
                 cursor.execute(HOTELS_SQL)
+                hotels = [row[0] for row in cursor.fetchall()]
 
-                hotels = [
-                    row[0]
-                    for row in cursor.fetchall()
-                ]
-
-        return func.HttpResponse(
-            json.dumps({"data": hotels}),
-            status_code=200,
-            mimetype="application/json",
-        )
-
+        return json_response({"data": hotels})
     except Exception:
-
-        logging.exception(
-            "LOS hotels endpoint failed"
-        )
-
-        return func.HttpResponse(
-            json.dumps({
-                "error":
-                    "Unable to retrieve hotels"
-            }),
-            status_code=500,
-            mimetype="application/json",
-        )
-
-@app.route(
-    route="los/average",
-    methods=["GET"],
-    auth_level=func.AuthLevel.ANONYMOUS,
-)
-def los_average(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-
-    try:
-
-        # =====================================================
-        # 1. READ QUERY PARAMETERS
-        # =====================================================
-
-        start_date_raw = req.params.get(
-            "startDate"
-        )
-
-        end_date_raw = req.params.get(
-            "endDate"
-        )
-
-        grain = (
-            req.params.get("grain")
-            or "month"
-        )
-
-        hotel_names_raw = req.params.get(
-            "hotelNames"
-        )
-
-        legacy_hotel_name = req.params.get(
-            "hotelName"
-        )
-
-        ly_comparison_basis = (
-            req.params.get(
-                "lyComparisonBasis"
-            )
-            or "sameDate"
-        )
-
-
-        # =====================================================
-        # 2. NORMALIZE HOTELS
-        # =====================================================
-
-        hotel_names = None
-
-        if hotel_names_raw is not None:
-
-            try:
-
-                parsed_hotel_names = json.loads(
-                    hotel_names_raw
-                )
-
-            except json.JSONDecodeError:
-
-                parsed_hotel_names = None
-
-            if (
-                not isinstance(parsed_hotel_names, list)
-                or any(
-                    not isinstance(name, str)
-                    for name in parsed_hotel_names
-                )
-            ):
-
-                return func.HttpResponse(
-                    json.dumps({
-                        "error":
-                            "hotelNames must be a JSON array of strings"
-                    }),
-                    status_code=400,
-                    mimetype="application/json",
-                )
-
-            hotel_names = list(dict.fromkeys(
-                name.strip()
-                for name in parsed_hotel_names
-                if name.strip()
-            ))
-
-        elif (
-            legacy_hotel_name
-            and legacy_hotel_name.strip()
-        ):
-
-            hotel_names = [
-                legacy_hotel_name.strip()
-            ]
-
-
-        # =====================================================
-        # 3. VALIDATE DATES
-        # =====================================================
-
-        start_date = parse_date(
-            start_date_raw
-        )
-
-        end_date = parse_date(
-            end_date_raw
-        )
-
-
-        if start_date is None:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "startDate is required "
-                        "and must use YYYY-MM-DD"
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        if end_date is None:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "endDate is required "
-                        "and must use YYYY-MM-DD"
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        if start_date > end_date:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "startDate cannot be "
-                        "after endDate"
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        # =====================================================
-        # 4. VALIDATE GRAIN
-        # =====================================================
-
-        if grain not in VALID_GRAINS:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "Invalid grain",
-
-                    "allowedValues": [
-                        "day",
-                        "week",
-                        "month",
-                        "year",
-                    ]
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        # =====================================================
-        # 5. VALIDATE LY COMPARISON
-        # =====================================================
-
-        if (
-            ly_comparison_basis
-            not in VALID_LY_COMPARISONS
-        ):
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "Invalid "
-                        "lyComparisonBasis",
-
-                    "allowedValues": [
-                        "sameDate",
-                        "sameWeekday",
-                    ]
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        # =====================================================
-        # 6. SQL PARAMETERS
-        # =====================================================
-
-        sql_parameters = (
-            start_date,
-            end_date,
-            grain,
-            hotel_names,
-            ly_comparison_basis,
-        )
-
-
-        # =====================================================
-        # 7. EXECUTE POSTGRESQL
-        # =====================================================
-
-        with pool.connection() as connection:
-
-            with connection.cursor(
-                row_factory=dict_row
-            ) as cursor:
-
-                cursor.execute(
-                    LOS_AVERAGE_SQL,
-                    sql_parameters,
-                )
-
-                rows = cursor.fetchall()
-
-
-        # =====================================================
-        # 8. CREATE RESPONSE
-        # =====================================================
-
-        response = {
-
-            "parameters": {
-
-                "startDate":
-                    start_date.isoformat(),
-
-                "endDate":
-                    end_date.isoformat(),
-
-                "grain":
-                    grain,
-
-                "hotelNames":
-                    hotel_names,
-
-                "lyComparisonBasis":
-                    ly_comparison_basis,
-            },
-
-            "rowCount":
-                len(rows),
-
-            "data":
-                rows,
-        }
-
-
-        # =====================================================
-        # 9. RETURN JSON
-        # =====================================================
-
-        return func.HttpResponse(
-            json.dumps(
-                response,
-                default=json_default,
-            ),
-            status_code=200,
-            mimetype="application/json",
-        )
-
-
-    except Exception:
-
-        logging.exception(
-            "LOS average endpoint failed"
-        )
-
-        return func.HttpResponse(
-            json.dumps({
-                "error":
-                    "Unable to retrieve "
-                    "LOS data"
-            }),
-            status_code=500,
-            mimetype="application/json",
-        )
+        logging.exception("LOS hotels endpoint failed")
+        return json_response({"error": "Unable to retrieve hotels"}, 500)
 
 
 @app.route(
-    route="los/distribution",
+    route="los/facts",
     methods=["GET"],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
-def los_distribution(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
+def los_facts(req: func.HttpRequest) -> func.HttpResponse:
+    parameters, error_response = validate_facts_parameters(req)
+    if error_response is not None:
+        return error_response
+
+    start_date, end_date, ly_comparison_basis = parameters
 
     try:
-
-        start_date_raw = req.params.get(
-            "startDate"
-        )
-
-        end_date_raw = req.params.get(
-            "endDate"
-        )
-
-        grain = (
-            req.params.get("grain")
-            or "month"
-        )
-
-        hotel_name = req.params.get(
-            "hotelName"
-        )
-
-        ly_comparison_basis = (
-            req.params.get(
-                "lyComparisonBasis"
-            )
-            or "sameDate"
-        )
-
-
-        if hotel_name:
-
-            hotel_name = (
-                hotel_name.strip()
-            )
-
-            if not hotel_name:
-                hotel_name = None
-
-
-        start_date = parse_date(
-            start_date_raw
-        )
-
-        end_date = parse_date(
-            end_date_raw
-        )
-
-
-        if start_date is None:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "Invalid startDate. "
-                        "Use YYYY-MM-DD."
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        if end_date is None:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "Invalid endDate. "
-                        "Use YYYY-MM-DD."
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        if start_date > end_date:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "startDate cannot "
-                        "be after endDate."
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        if grain not in VALID_GRAINS:
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "Invalid grain.",
-
-                    "allowedValues": [
-                        "day",
-                        "week",
-                        "month",
-                        "year",
-                    ]
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        if (
-            ly_comparison_basis
-            not in VALID_LY_COMPARISONS
-        ):
-
-            return func.HttpResponse(
-                json.dumps({
-                    "error":
-                        "Invalid lyComparisonBasis.",
-
-                    "allowedValues": [
-                        "sameDate",
-                        "sameWeekday",
-                    ]
-                }),
-                status_code=400,
-                mimetype="application/json",
-            )
-
-
-        parameters = (
-            start_date,
-            end_date,
-            grain,
-            hotel_name,
-            ly_comparison_basis,
-        )
-
-
-        with pool.connection() as connection:
-
-            with connection.cursor(
-                row_factory=dict_row
-            ) as cursor:
-
-                cursor.execute(
-                    LOS_DISTRIBUTION_SQL,
-                    parameters,
-                )
-
-                rows = cursor.fetchall()
-
-
-        response = {
-
-            "parameters": {
-                "startDate":
-                    start_date.isoformat(),
-
-                "endDate":
-                    end_date.isoformat(),
-
-                "grain":
-                    grain,
-
-                "hotelName":
-                    hotel_name,
-
-                "lyComparisonBasis":
-                    ly_comparison_basis,
-            },
-
-            "rowCount":
-                len(rows),
-
-            "data":
-                rows,
-        }
-
-
-        return func.HttpResponse(
-            json.dumps(
-                response,
-                default=json_default,
-            ),
-            status_code=200,
-            mimetype="application/json",
-        )
-
-
+        rows = fetch_los_facts(start_date, end_date, ly_comparison_basis)
     except Exception:
+        logging.exception("LOS facts endpoint failed")
+        return json_response({"error": "Unable to retrieve LOS facts"}, 500)
 
-        logging.exception(
-            "LOS distribution request failed"
-        )
-
-        return func.HttpResponse(
-            json.dumps({
-                "error":
-                    "Unable to retrieve "
-                    "LOS distribution."
-            }),
-            status_code=500,
-            mimetype="application/json",
-        )
+    return json_response(
+        {
+            "parameters": {
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+                "lyComparisonBasis": ly_comparison_basis,
+            },
+            "rowCount": len(rows),
+            "data": rows,
+        }
+    )
