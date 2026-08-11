@@ -43,6 +43,14 @@ test("daily facts aggregate into month and year keys", () => {
     assert.equal(LosData.getPeriodKey("2026-07-19", "week"), "2026-07-13");
 });
 
+test("selected full months can include non-contiguous periods", () => {
+    const selected = LosData.filterByMonths(facts, ["2026-01", "2026-03"]);
+
+    assert.equal(selected.length, 3);
+    assert.ok(selected.every((fact) => fact.arrivalDate.startsWith("2026-01")));
+    assert.equal(LosData.filterByMonths(facts, []).length, facts.length);
+});
+
 test("Current, LY, and SPIT remain separate", () => {
     const rows = LosData.calculateAverageLos(facts, { grain: "year", portfolio: true });
     assert.deepEqual(rows.map((row) => row.scenario), ["current", "ly", "spit"]);

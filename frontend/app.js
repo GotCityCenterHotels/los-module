@@ -23,8 +23,18 @@ const hotelOptions = document.getElementById("hotelOptions");
 const selectAllHotelsButton = document.getElementById("selectAllHotels");
 const clearAllHotelsButton = document.getElementById("clearAllHotels");
 
+const periodPicker = LosPeriodPicker.create({
+    rootElement: document.getElementById("monthPicker"),
+    startInput: startDateInput,
+    endInput: endDateInput
+});
+
 let loadedFacts = [];
 let loadedParameters = null;
+let loadedMonths = [];
+let lastLoadedRequestKey = null;
+let hotelListLoaded = false;
+let requestInProgress = false;
 
 const decimalFormatter = new Intl.NumberFormat("en-SE", {
     minimumFractionDigits: 2,
@@ -49,6 +59,7 @@ function getHotelCheckboxes() {
 }
 
 function getSelectedHotels() {
+    if (!hotelListLoaded) return null;
     return getHotelCheckboxes().filter(({ checked }) => checked).map(({ value }) => value);
 }
 
@@ -56,34 +67,24 @@ function updateHotelToggleText() {
     const checkboxes = getHotelCheckboxes();
     const selected = checkboxes.filter(({ checked }) => checked);
 
-    if (checkboxes.length > 0 && selected.length === checkboxes.length) {
-        hotelToggle.textContent = "All hotels";
-    }
-    else if (selected.length === 0) {
-        hotelToggle.textContent = "No hotels selected";
-    }
-    else if (selected.length === 1) {
-        hotelToggle.textContent = selected[0].value;
-    }
-    else {
-        hotelToggle.textContent = `${selected.length} hotels selected`;
-    }
+    if (!hotelListLoaded) hotelToggle.textContent = "Loading hotels...";
+    else if (checkboxes.length > 0 && selected.length === checkboxes.length) hotelToggle.textContent = "All hotels";
+    else if (selected.length === 0) hotelToggle.textContent = "No hotels selected";
+    else if (selected.length === 1) hotelToggle.textContent = selected[0].value;
+    else hotelToggle.textContent = `${selected.length} hotels selected`;
 }
 
-function populateHotels(facts) {
-    const existing = getHotelCheckboxes();
-    const selected = new Set(existing.filter(({ checked }) => checked).map(({ value }) => value));
-    const allWereSelected = existing.length === 0 || selected.size === existing.length;
-    const hotels = Array.from(new Set(facts.map(({ hotelCode }) => hotelCode))).sort();
-
+async function loadHotels() {
+    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels`);
     hotelOptions.innerHTML = "";
-    for (const hotel of hotels) {
+
+    for (const hotel of payload.data || []) {
         const label = document.createElement("label");
         label.className = "multi-select-option";
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.value = hotel;
-        checkbox.checked = allWereSelected || selected.has(hotel);
+        checkbox.checked = true;
         checkbox.addEventListener("change", () => {
             updateHotelToggleText();
             render();
@@ -94,10 +95,48 @@ function populateHotels(facts) {
         hotelOptions.appendChild(label);
     }
 
-    if (hotels.length === 0) {
-        hotelOptions.innerHTML = '<span class="multi-select-empty">No hotels in this dataset.</span>';
+    hotelListLoaded = true;
+    if ((payload.data || []).length === 0) {
+        hotelOptions.innerHTML = '<span class="multi-select-empty">No hotels found.</span>';
     }
     updateHotelToggleText();
+    if (lastLoadedRequestKey !== null) render();
+}
+
+function isValidPeriod() {
+    return Boolean(
+        startDateInput.value
+        && endDateInput.value
+        && startDateInput.value <= endDateInput.value
+    );
+}
+
+function getRequestState() {
+    return {
+        startDate: startDateInput.value,
+        endDate: endDateInput.value,
+        lyComparisonBasis: lyComparisonInput.value,
+        selectedMonths: periodPicker.getSelectedMonths()
+    };
+}
+
+function getRequestKey() {
+    return JSON.stringify(getRequestState());
+}
+
+function updateLoadButtonState() {
+    const changed = lastLoadedRequestKey === null || getRequestKey() !== lastLoadedRequestKey;
+    loadButton.disabled = requestInProgress || !isValidPeriod() || !changed;
+    loadButton.textContent = requestInProgress ? "Updating..." : "Update data";
+}
+
+function markBackendSettingChanged() {
+    updateLoadButtonState();
+    if (lastLoadedRequestKey !== null) {
+        statusElement.textContent = getRequestKey() !== lastLoadedRequestKey
+            ? "Period settings changed. Click Update data to refresh."
+            : "Data is up to date.";
+    }
 }
 
 function validateInputs() {
@@ -111,48 +150,53 @@ function validateInputs() {
 
 async function loadData() {
     clearError();
+    const requestedState = getRequestState();
+    const requestedKey = JSON.stringify(requestedState);
+
     try {
         validateInputs();
-        loadButton.disabled = true;
-        loadButton.textContent = "Loading...";
-        statusElement.textContent = "Loading LOS facts...";
+        requestInProgress = true;
+        updateLoadButtonState();
+        statusElement.textContent = "Updating LOS facts...";
         const params = new URLSearchParams({
-            startDate: startDateInput.value,
-            endDate: endDateInput.value,
-            lyComparisonBasis: lyComparisonInput.value
+            startDate: requestedState.startDate,
+            endDate: requestedState.endDate,
+            lyComparisonBasis: requestedState.lyComparisonBasis
         });
         const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/facts?${params}`);
         loadedFacts = payload.data || [];
         loadedParameters = payload.parameters || null;
-        populateHotels(loadedFacts);
+        loadedMonths = requestedState.selectedMonths;
+        lastLoadedRequestKey = requestedKey;
         render();
-        statusElement.textContent = loadedFacts.length ? "Data loaded." : "No data returned.";
+        statusElement.textContent = loadedFacts.length ? "Data is up to date." : "No data returned.";
     }
     catch (error) {
         console.error(error);
-        showError(error.message || "Unable to load data.");
-        statusElement.textContent = "Request failed.";
+        showError(error.message || "Unable to update data.");
+        statusElement.textContent = "Update failed.";
     }
     finally {
-        loadButton.disabled = false;
-        loadButton.textContent = "Load data";
+        requestInProgress = false;
+        updateLoadButtonState();
     }
 }
 
 function render() {
+    if (lastLoadedRequestKey === null) return;
+
+    const facts = LosData.filterByMonths(loadedFacts, loadedMonths);
     const hotels = getSelectedHotels();
     const options = { grain: grainInput.value, hotelCodes: hotels };
-    const hotelRows = LosData.calculateAverageLos(loadedFacts, options);
-    const totalRows = LosData.calculateAverageLos(loadedFacts, { ...options, portfolio: true });
+    const hotelRows = LosData.calculateAverageLos(facts, options);
+    const totalRows = LosData.calculateAverageLos(facts, { ...options, portfolio: true });
     const rows = pivotAverageRows([...hotelRows, ...totalRows]);
-    const summaryRows = LosData.calculateAverageLos(loadedFacts, {
+    const summaryRows = LosData.calculateAverageLos(facts, {
         grain: "all",
         hotelCodes: hotels,
         portfolio: true
     });
-    const summaryByScenario = Object.fromEntries(
-        summaryRows.map((row) => [row.scenario, row])
-    );
+    const summaryByScenario = Object.fromEntries(summaryRows.map((row) => [row.scenario, row]));
     const showSpit = shouldShowSpit(loadedParameters?.endDate);
 
     summaryElement.hidden = false;
@@ -168,11 +212,7 @@ function pivotAverageRows(rows) {
     const groups = new Map();
     for (const row of rows) {
         const key = JSON.stringify([row.periodKey, row.hotelCode]);
-        const group = groups.get(key) || {
-            periodKey: row.periodKey,
-            hotelCode: row.hotelCode,
-            scenarios: {}
-        };
+        const group = groups.get(key) || { periodKey: row.periodKey, hotelCode: row.hotelCode, scenarios: {} };
         group.scenarios[row.scenario] = row;
         groups.set(key, group);
     }
@@ -220,6 +260,27 @@ function renderTable(rows, showSpit) {
     resultsSection.hidden = false;
 }
 
+function getChartLabel(periodKey) {
+    const date = new Date(`${periodKey}T00:00:00Z`);
+    const month = date.toLocaleString("en", { month: "short", timeZone: "UTC" }).toUpperCase();
+    const day = String(date.getUTCDate()).padStart(2, "0");
+    const year = String(date.getUTCFullYear());
+
+    if (grainInput.value === "year") return { primary: year, year: null };
+    if (grainInput.value === "month") return { primary: month, year };
+    if (grainInput.value === "week") return { primary: `${day} ${month}`, year };
+    return { primary: `${day} ${month}`, year };
+}
+
+function tooltipScenario(label, color, row) {
+    return `
+        <div class="chart-tooltip-series">
+            <span><i style="background:${color}"></i>${label}</span>
+            <strong>${formatDecimal(row?.averageLos ?? null)}</strong>
+            <small>${formatInteger(row?.nightCount ?? null)} nights &middot; ${formatInteger(row?.bookingCount ?? null)} reservations</small>
+        </div>`;
+}
+
 function renderChart(rows) {
     chartSection.hidden = false;
     losChart.innerHTML = "";
@@ -230,8 +291,8 @@ function renderChart(rows) {
 
     const svgNs = "http://www.w3.org/2000/svg";
     const width = 1100;
-    const height = 340;
-    const margin = { top: 20, right: 24, bottom: 54, left: 58 };
+    const height = 370;
+    const margin = { top: 24, right: 24, bottom: 78, left: 58 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
     const series = [
@@ -247,9 +308,7 @@ function renderChart(rows) {
     }
 
     const maxValue = Math.max(1, Math.ceil(Math.max(...values) * 1.1));
-    const x = (index) => margin.left + (rows.length === 1
-        ? plotWidth / 2
-        : index * plotWidth / (rows.length - 1));
+    const x = (index) => margin.left + (rows.length === 1 ? plotWidth / 2 : index * plotWidth / (rows.length - 1));
     const y = (value) => margin.top + plotHeight - (value / maxValue) * plotHeight;
     const svg = document.createElementNS(svgNs, "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
@@ -273,19 +332,39 @@ function renderChart(rows) {
         svg.appendChild(label);
     }
 
-    const labelCount = Math.min(5, rows.length);
-    const labelIndexes = Array.from(new Set(Array.from({ length: labelCount }, (_, index) =>
-        Math.round(index * (rows.length - 1) / Math.max(1, labelCount - 1))
-    )));
-    for (const index of labelIndexes) {
+    const labelStep = grainInput.value === "month" && rows.length <= 18
+        ? 1
+        : Math.max(1, Math.ceil(rows.length / 10));
+    rows.forEach((row, index) => {
+        if (index % labelStep !== 0 && index !== rows.length - 1) return;
+        const parts = getChartLabel(row.periodKey);
         const label = document.createElementNS(svgNs, "text");
         label.setAttribute("x", x(index));
-        label.setAttribute("y", height - 20);
-        label.setAttribute("class", "chart-axis-label chart-x-label");
-        label.textContent = rows[index].periodKey;
+        label.setAttribute("y", height - 38);
+        label.setAttribute("class", "chart-axis-label chart-x-label chart-period-label");
+        label.textContent = parts.primary;
         svg.appendChild(label);
+    });
+
+    if (grainInput.value !== "year") {
+        const yearGroups = [];
+        rows.forEach((row, index) => {
+            const year = row.periodKey.slice(0, 4);
+            const last = yearGroups.at(-1);
+            if (last?.year === year) last.end = index;
+            else yearGroups.push({ year, start: index, end: index });
+        });
+        yearGroups.forEach(({ year, start, end }) => {
+            const label = document.createElementNS(svgNs, "text");
+            label.setAttribute("x", (x(start) + x(end)) / 2);
+            label.setAttribute("y", height - 14);
+            label.setAttribute("class", "chart-axis-label chart-x-label chart-year-label");
+            label.textContent = year;
+            svg.appendChild(label);
+        });
     }
 
+    const pointLayer = document.createElementNS(svgNs, "g");
     for (const item of series) {
         let pathData = "";
         let previousPresent = false;
@@ -300,12 +379,10 @@ function renderChart(rows) {
             const point = document.createElementNS(svgNs, "circle");
             point.setAttribute("cx", x(index));
             point.setAttribute("cy", y(value));
-            point.setAttribute("r", 3.5);
+            point.setAttribute("r", 4);
             point.setAttribute("fill", item.color);
-            const title = document.createElementNS(svgNs, "title");
-            title.textContent = `${row.periodKey}: ${item.label} ${formatDecimal(value)}`;
-            point.appendChild(title);
-            svg.appendChild(point);
+            point.setAttribute("class", "chart-point");
+            pointLayer.appendChild(point);
         });
         if (pathData) {
             const path = document.createElementNS(svgNs, "path");
@@ -315,10 +392,61 @@ function renderChart(rows) {
             path.setAttribute("stroke-width", "3");
             path.setAttribute("stroke-linecap", "round");
             path.setAttribute("stroke-linejoin", "round");
-            svg.insertBefore(path, svg.querySelector("circle"));
+            svg.appendChild(path);
         }
     }
-    losChart.appendChild(svg);
+    svg.appendChild(pointLayer);
+
+    const hoverLine = document.createElementNS(svgNs, "line");
+    hoverLine.setAttribute("y1", margin.top);
+    hoverLine.setAttribute("y2", margin.top + plotHeight);
+    hoverLine.setAttribute("class", "chart-hover-line");
+    hoverLine.setAttribute("visibility", "hidden");
+    svg.appendChild(hoverLine);
+
+    const tooltip = document.createElement("div");
+    tooltip.className = "chart-tooltip";
+    tooltip.hidden = true;
+
+    function showPoint(index) {
+        const row = rows[index];
+        const label = getChartLabel(row.periodKey);
+        hoverLine.setAttribute("visibility", "visible");
+        hoverLine.setAttribute("x1", x(index));
+        hoverLine.setAttribute("x2", x(index));
+        tooltip.hidden = false;
+        tooltip.classList.toggle("align-right", x(index) > width * 0.72);
+        tooltip.style.left = `${x(index) / width * 100}%`;
+        tooltip.innerHTML = `
+            <strong class="chart-tooltip-title">${escapeHtml(label.primary)}${label.year ? ` ${escapeHtml(label.year)}` : ""}</strong>
+            ${tooltipScenario("LOS", "#2563eb", row.scenarios.current)}
+            ${tooltipScenario("LOS LY", "#f97316", row.scenarios.ly)}`;
+    }
+
+    function hidePoint() {
+        hoverLine.setAttribute("visibility", "hidden");
+        tooltip.hidden = true;
+    }
+
+    rows.forEach((row, index) => {
+        const previousX = index === 0 ? margin.left : (x(index - 1) + x(index)) / 2;
+        const nextX = index === rows.length - 1 ? width - margin.right : (x(index) + x(index + 1)) / 2;
+        const hitArea = document.createElementNS(svgNs, "rect");
+        hitArea.setAttribute("x", previousX);
+        hitArea.setAttribute("y", margin.top);
+        hitArea.setAttribute("width", Math.max(1, nextX - previousX));
+        hitArea.setAttribute("height", plotHeight);
+        hitArea.setAttribute("class", "chart-hit-area");
+        hitArea.setAttribute("tabindex", "0");
+        hitArea.setAttribute("aria-label", `Show data for ${row.periodKey}`);
+        hitArea.addEventListener("mouseenter", () => showPoint(index));
+        hitArea.addEventListener("focus", () => showPoint(index));
+        hitArea.addEventListener("mouseleave", hidePoint);
+        hitArea.addEventListener("blur", hidePoint);
+        svg.appendChild(hitArea);
+    });
+
+    losChart.append(svg, tooltip);
 }
 
 function localToday() {
@@ -367,6 +495,19 @@ document.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") setHotelMenuOpen(false);
 });
+startDateInput.addEventListener("input", markBackendSettingChanged);
+endDateInput.addEventListener("input", markBackendSettingChanged);
+document.getElementById("monthPicker").addEventListener("periodchange", markBackendSettingChanged);
+lyComparisonInput.addEventListener("change", markBackendSettingChanged);
 grainInput.addEventListener("change", render);
 loadButton.addEventListener("click", loadData);
-document.addEventListener("DOMContentLoaded", loadData);
+document.addEventListener("DOMContentLoaded", () => {
+    updateHotelToggleText();
+    updateLoadButtonState();
+    loadHotels().catch((error) => {
+        console.error(error);
+        hotelOptions.innerHTML = '<span class="multi-select-empty">Hotel list unavailable.</span>';
+        hotelToggle.textContent = "Hotels unavailable";
+        showError(error.message || "Unable to load hotels.");
+    });
+});

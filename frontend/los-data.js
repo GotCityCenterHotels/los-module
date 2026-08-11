@@ -71,6 +71,15 @@
         );
     }
 
+    function filterByMonths(facts, selectedMonths = []) {
+        if (!selectedMonths || selectedMonths.length === 0) {
+            return facts;
+        }
+
+        const months = new Set(selectedMonths);
+        return facts.filter((fact) => months.has(String(fact.arrivalDate).slice(0, 7)));
+    }
+
     function aggregateFacts(
         facts,
         { grain = "day", hotelCodes = null, scenario = null, portfolio = false } = {}
@@ -208,6 +217,7 @@
         getPeriodKey,
         getLosBucket,
         filterFacts,
+        filterByMonths,
         aggregateFacts,
         calculateAverageLos,
         calculatePercentages,

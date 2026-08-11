@@ -74,6 +74,11 @@
                 >
             </div>
 
+            <div class="filter-field month-picker-field">
+                <label id="monthPickerLabel">Full months</label>
+                <div id="monthPicker" aria-labelledby="monthPickerLabel"></div>
+            </div>
+
 
             <div class="filter-field">
                 <label for="grain">
@@ -180,7 +185,7 @@
             <div class="filter-action">
 
                 <button id="loadButton">
-                    Load data
+                    Update data
                 </button>
 
             </div>
@@ -195,7 +200,7 @@
         <section class="status-panel">
 
             <span id="status">
-                Select a period and load data.
+                Select a period, then click Update data.
             </span>
 
         </section>
@@ -319,6 +324,7 @@
 
     <script src="los-data.js"></script>
     <script src="los-api.js"></script>
+    <script src="los-period-picker.js"></script>
     <script src="app.js"></script>
 
 </body>
