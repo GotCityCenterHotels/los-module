@@ -67,13 +67,39 @@ def validate_facts_parameters(req):
     return (start_date, end_date, ly_comparison_basis), None
 
 
+def validate_hotels_parameters(req):
+    start_date_raw = req.params.get("startDate")
+    end_date_raw = req.params.get("endDate")
+
+    # Backward compatibility for cached clients that called the original
+    # metadata route without parameters. Keep that fallback period-bounded.
+    if not start_date_raw and not end_date_raw:
+        current_year = date.today().year
+        ly_comparison_basis = req.params.get("lyComparisonBasis") or "sameDate"
+        if ly_comparison_basis not in VALID_LY_COMPARISONS:
+            return None, json_response(
+                {
+                    "error": "Invalid lyComparisonBasis",
+                    "allowedValues": ["sameDate", "sameWeekday"],
+                },
+                400,
+            )
+        return (
+            date(current_year, 1, 1),
+            date(current_year, 12, 31),
+            ly_comparison_basis,
+        ), None
+
+    return validate_facts_parameters(req)
+
+
 @app.route(
     route="los/hotels",
     methods=["GET"],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
 def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
-    parameters, error_response = validate_facts_parameters(req)
+    parameters, error_response = validate_hotels_parameters(req)
     if error_response is not None:
         return error_response
 
