@@ -26,7 +26,7 @@ def parse_date(value: str | None) -> date | None:
 
 def json_response(payload, status_code=200):
     return func.HttpResponse(
-        json.dumps(payload),
+        json.dumps(payload, separators=(",", ":")),
         status_code=status_code,
         mimetype="application/json",
     )

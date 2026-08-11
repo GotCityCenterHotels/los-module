@@ -71,6 +71,21 @@
         );
     }
 
+    function createFactPredicate({ hotelCodes = null, scenario = null, selectedMonths = [] } = {}) {
+        const hotels = hotelCodes === null
+            ? null
+            : new Set(Array.isArray(hotelCodes) ? hotelCodes : [hotelCodes]);
+        const scenarios = scenario === null || scenario === "all"
+            ? null
+            : new Set(Array.isArray(scenario) ? scenario : [scenario]);
+        const months = selectedMonths?.length ? new Set(selectedMonths) : null;
+
+        return (fact) =>
+            (hotels === null || hotels.has(fact.hotelCode))
+            && (scenarios === null || scenarios.has(fact.scenario))
+            && (months === null || months.has(String(fact.arrivalDate).slice(0, 7)));
+    }
+
     function filterByMonths(facts, selectedMonths = []) {
         if (!selectedMonths || selectedMonths.length === 0) {
             return facts;
@@ -137,6 +152,64 @@
         return Array.from(groups.values()).sort(compareRows);
     }
 
+    function calculateAverageView(
+        facts,
+        { grain = "day", hotelCodes = null, scenario = null, selectedMonths = [] } = {}
+    ) {
+        const includeFact = createFactPredicate({ hotelCodes, scenario, selectedMonths });
+        const hotelGroups = new Map();
+        const portfolioGroups = new Map();
+        const summaryGroups = new Map();
+
+        function addToGroup(groups, key, seed, fact) {
+            const group = groups.get(key) || seed;
+            group.bookingCount += Number(fact.bookingCount) || 0;
+            group.nightCount += Number(fact.nightCount) || 0;
+            groups.set(key, group);
+        }
+
+        for (const fact of facts) {
+            if (!includeFact(fact)) continue;
+            const periodKey = getPeriodKey(fact.arrivalDate, grain);
+
+            addToGroup(
+                hotelGroups,
+                JSON.stringify([periodKey, fact.hotelCode, fact.scenario]),
+                { periodKey, hotelCode: fact.hotelCode, scenario: fact.scenario, bookingCount: 0, nightCount: 0 },
+                fact
+            );
+            addToGroup(
+                portfolioGroups,
+                JSON.stringify([periodKey, fact.scenario]),
+                { periodKey, hotelCode: "Total", scenario: fact.scenario, bookingCount: 0, nightCount: 0 },
+                fact
+            );
+            addToGroup(
+                summaryGroups,
+                fact.scenario,
+                { periodKey: "All", hotelCode: "Total", scenario: fact.scenario, bookingCount: 0, nightCount: 0 },
+                fact
+            );
+        }
+
+        function finalize(groups) {
+            return Array.from(groups.values()).map((group) => ({
+                ...group,
+                averageLos: group.bookingCount > 0 ? group.nightCount / group.bookingCount : null
+            })).sort(compareRows);
+        }
+
+        const hotelRows = finalize(hotelGroups);
+        const portfolioRows = finalize(portfolioGroups);
+        const summaryRows = finalize(summaryGroups);
+        return {
+            hotelRows,
+            portfolioRows,
+            summaryRows,
+            rows: [...hotelRows, ...portfolioRows].sort(compareRows)
+        };
+    }
+
     function calculatePercentages(values) {
         const total = values.reduce((sum, value) => sum + Number(value || 0), 0);
         return values.map((value) => total > 0 ? Number(value || 0) / total * 100 : 0);
@@ -150,24 +223,29 @@
             scenario = null,
             portfolio = false,
             metric = "bookings",
-            buckets = DEFAULT_LOS_BUCKETS
+            buckets = DEFAULT_LOS_BUCKETS,
+            selectedMonths = []
         } = {}
     ) {
         if (!new Set(["bookings", "nights"]).has(metric)) {
             throw new Error(`Unsupported distribution metric: ${metric}`);
         }
 
-        const exactLosFacts = aggregateFacts(
-            facts,
-            { grain, hotelCodes, scenario, portfolio }
-        );
+        const includeFact = createFactPredicate({
+            hotelCodes,
+            scenario,
+            selectedMonths
+        });
         const groups = new Map();
 
-        for (const fact of exactLosFacts) {
-            const key = JSON.stringify([fact.periodKey, fact.hotelCode, fact.scenario]);
+        for (const fact of facts) {
+            if (!includeFact(fact)) continue;
+            const periodKey = getPeriodKey(fact.arrivalDate, grain);
+            const hotelCode = portfolio ? "Total" : fact.hotelCode;
+            const key = JSON.stringify([periodKey, hotelCode, fact.scenario]);
             const group = groups.get(key) || {
-                periodKey: fact.periodKey,
-                hotelCode: fact.hotelCode,
+                periodKey,
+                hotelCode,
                 scenario: fact.scenario,
                 metric,
                 total: 0,
@@ -217,9 +295,11 @@
         getPeriodKey,
         getLosBucket,
         filterFacts,
+        createFactPredicate,
         filterByMonths,
         aggregateFacts,
         calculateAverageLos,
+        calculateAverageView,
         calculatePercentages,
         calculateDistribution
     };

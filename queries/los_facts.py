@@ -55,7 +55,7 @@ current_facts AS (
         'current'::text AS scenario,
         los,
         count(*)::bigint AS booking_count,
-        sum(los)::bigint AS night_count
+        (los::bigint * count(*))::bigint AS night_count
     FROM current_reservation_los
     GROUP BY
         arrival_date,
@@ -138,8 +138,8 @@ ly_reservation_los AS (
         cancelled_date
 ),
 
-/* Calculate LY reservation LOS once, then emit whichever scenarios qualify. */
-ly_scenarios AS (
+/* Calculate eligibility once without expanding each reservation into rows. */
+ly_reservation_flags AS (
     SELECT
         CASE
             WHEN %(ly_comparison_basis)s = 'sameWeekday'
@@ -147,50 +147,60 @@ ly_scenarios AS (
             ELSE (r.arrival_date + INTERVAL '1 year')::date
         END AS arrival_date,
         r.hotel_code,
-        scenario_data.scenario,
-        r.los
-    FROM ly_reservation_los r
-    CROSS JOIN LATERAL (
-        VALUES
-            ('ly'::text, r.cancelled_date IS NULL),
-            (
-                'spit'::text,
-                r.created_date <= (
+        r.los,
+        r.cancelled_date IS NULL AS include_ly,
+        (
+            r.created_date <= (
+                CASE
+                    WHEN %(ly_comparison_basis)s = 'sameWeekday'
+                        THEN CURRENT_DATE - 364
+                    ELSE (CURRENT_DATE - INTERVAL '1 year')::date
+                END
+            )
+            AND (
+                r.cancelled_date IS NULL
+                OR r.cancelled_date > (
                     CASE
                         WHEN %(ly_comparison_basis)s = 'sameWeekday'
                             THEN CURRENT_DATE - 364
                         ELSE (CURRENT_DATE - INTERVAL '1 year')::date
                     END
                 )
-                AND (
-                    r.cancelled_date IS NULL
-                    OR r.cancelled_date > (
-                        CASE
-                            WHEN %(ly_comparison_basis)s = 'sameWeekday'
-                                THEN CURRENT_DATE - 364
-                            ELSE (CURRENT_DATE - INTERVAL '1 year')::date
-                        END
-                    )
-                )
             )
-    ) AS scenario_data(scenario, include_reservation)
-    WHERE scenario_data.include_reservation
+        ) AS include_spit
+    FROM ly_reservation_los r
+),
+
+/* Aggregate first; scenario rows are emitted only at the small fact grain. */
+ly_fact_components AS (
+    SELECT
+        arrival_date,
+        hotel_code,
+        los,
+        count(*) FILTER (WHERE include_ly)::bigint AS ly_booking_count,
+        count(*) FILTER (WHERE include_spit)::bigint AS spit_booking_count
+    FROM ly_reservation_flags
+    GROUP BY
+        arrival_date,
+        hotel_code,
+        los
 ),
 
 ly_facts AS (
     SELECT
-        arrival_date,
-        hotel_code,
-        scenario,
-        los,
-        count(*)::bigint AS booking_count,
-        sum(los)::bigint AS night_count
-    FROM ly_scenarios
-    GROUP BY
-        arrival_date,
-        hotel_code,
-        scenario,
-        los
+        f.arrival_date,
+        f.hotel_code,
+        scenario_data.scenario,
+        f.los,
+        scenario_data.booking_count,
+        (f.los::bigint * scenario_data.booking_count)::bigint AS night_count
+    FROM ly_fact_components f
+    CROSS JOIN LATERAL (
+        VALUES
+            ('ly'::text, f.ly_booking_count),
+            ('spit'::text, f.spit_booking_count)
+    ) AS scenario_data(scenario, booking_count)
+    WHERE scenario_data.booking_count > 0
 ),
 
 los_facts AS (
@@ -207,13 +217,5 @@ SELECT
     booking_count,
     night_count
 FROM los_facts
-ORDER BY
-    arrival_date,
-    hotel_code,
-    CASE scenario
-        WHEN 'current' THEN 1
-        WHEN 'ly' THEN 2
-        WHEN 'spit' THEN 3
-    END,
-    los;
+;
 """

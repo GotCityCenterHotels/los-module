@@ -35,6 +35,8 @@ let lastLoadedRequestKey = null;
 let hotelListLoaded = false;
 let requestInProgress = false;
 let hotelRequestId = 0;
+let loadedHotelRequestKey = null;
+let loadedRequestState = null;
 
 const decimalFormatter = new Intl.NumberFormat("en-SE", {
     minimumFractionDigits: 2,
@@ -67,24 +69,39 @@ function updateHotelToggleText() {
     const checkboxes = getHotelCheckboxes();
     const selected = checkboxes.filter(({ checked }) => checked);
 
-    if (!hotelListLoaded) hotelToggle.textContent = "Loading hotels...";
+    if (!hotelListLoaded) hotelToggle.textContent = "All hotels";
     else if (checkboxes.length > 0 && selected.length === checkboxes.length) hotelToggle.textContent = "All hotels";
     else if (selected.length === 0) hotelToggle.textContent = "No hotels selected";
     else if (selected.length === 1) hotelToggle.textContent = selected[0].value;
     else hotelToggle.textContent = `${selected.length} hotels selected`;
 }
 
-async function loadHotels(requestState = getRequestState()) {
+function getHotelRequestKey(requestState) {
+    return JSON.stringify([
+        requestState.startDate,
+        requestState.endDate,
+        requestState.lyComparisonBasis
+    ]);
+}
+
+async function loadHotels(requestState = loadedRequestState || getRequestState(), { forceRefresh = false } = {}) {
     const requestId = ++hotelRequestId;
     const existing = getHotelCheckboxes();
     const selectedHotels = new Set(existing.filter(({ checked }) => checked).map(({ value }) => value));
     const allWereSelected = !hotelListLoaded || selectedHotels.size === existing.length;
-    const params = new URLSearchParams({
+    const requestKey = getHotelRequestKey(requestState);
+    if (!forceRefresh && hotelListLoaded && loadedHotelRequestKey === requestKey) return;
+    if (!hotelListLoaded) {
+        hotelToggle.textContent = "Loading hotels...";
+        hotelOptions.innerHTML = '<span class="multi-select-empty">Loading hotels...</span>';
+    }
+    const payload = await LosApi.fetchHotelList({
+        apiBaseUrl: API_BASE_URL,
         startDate: requestState.startDate,
         endDate: requestState.endDate,
-        lyComparisonBasis: requestState.lyComparisonBasis
+        lyComparisonBasis: requestState.lyComparisonBasis,
+        forceRefresh
     });
-    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels?${params}`);
     if (requestId !== hotelRequestId) return;
 
     hotelOptions.innerHTML = "";
@@ -107,6 +124,7 @@ async function loadHotels(requestState = getRequestState()) {
     }
 
     hotelListLoaded = true;
+    loadedHotelRequestKey = requestKey;
     if ((payload.data || []).length === 0) {
         hotelOptions.innerHTML = '<span class="multi-select-empty">No hotels found.</span>';
     }
@@ -168,19 +186,25 @@ async function loadData() {
         validateInputs();
         requestInProgress = true;
         updateLoadButtonState();
-        statusElement.textContent = "Updating LOS facts...";
-        const params = new URLSearchParams({
-            startDate: requestedState.startDate,
-            endDate: requestedState.endDate,
-            lyComparisonBasis: requestedState.lyComparisonBasis
+        const ranges = LosApi.buildContiguousMonthRanges(
+            requestedState.selectedMonths,
+            requestedState.startDate,
+            requestedState.endDate
+        );
+        statusElement.textContent = ranges.length === 1
+            ? "Updating LOS facts..."
+            : `Updating LOS facts across ${ranges.length} selected ranges...`;
+        const payload = await LosApi.fetchLosFactRanges({
+            apiBaseUrl: API_BASE_URL,
+            ...requestedState
         });
-        loadHotels(requestedState).catch(handleHotelError);
-        const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/facts?${params}`);
         loadedFacts = payload.data || [];
         loadedMonths = requestedState.selectedMonths;
+        loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
         statusElement.textContent = loadedFacts.length ? "Data is up to date." : "No data returned.";
+        loadHotels(requestedState, { forceRefresh: true }).catch(handleHotelError);
     }
     catch (error) {
         console.error(error);
@@ -196,18 +220,14 @@ async function loadData() {
 function render() {
     if (lastLoadedRequestKey === null) return;
 
-    const facts = LosData.filterByMonths(loadedFacts, loadedMonths);
     const hotels = getSelectedHotels();
-    const options = { grain: grainInput.value, hotelCodes: hotels };
-    const hotelRows = LosData.calculateAverageLos(facts, options);
-    const totalRows = LosData.calculateAverageLos(facts, { ...options, portfolio: true });
-    const rows = pivotAverageRows([...hotelRows, ...totalRows]);
-    const summaryRows = LosData.calculateAverageLos(facts, {
-        grain: "all",
+    const view = LosData.calculateAverageView(loadedFacts, {
+        grain: grainInput.value,
         hotelCodes: hotels,
-        portfolio: true
+        selectedMonths: loadedMonths
     });
-    const summaryByScenario = Object.fromEntries(summaryRows.map((row) => [row.scenario, row]));
+    const rows = pivotAverageRows(view.rows);
+    const summaryByScenario = Object.fromEntries(view.summaryRows.map((row) => [row.scenario, row]));
     summaryElement.hidden = false;
     totalLosElement.textContent = formatDecimal(summaryByScenario.current?.averageLos ?? null);
     totalLosLyElement.textContent = formatDecimal(summaryByScenario.ly?.averageLos ?? null);
@@ -488,7 +508,11 @@ function handleHotelError(error) {
     }
 }
 
-hotelToggle.addEventListener("click", () => setHotelMenuOpen(hotelMenu.hidden));
+hotelToggle.addEventListener("click", () => {
+    const opening = hotelMenu.hidden;
+    setHotelMenuOpen(opening);
+    if (opening) loadHotels().catch(handleHotelError);
+});
 selectAllHotelsButton.addEventListener("click", () => {
     getHotelCheckboxes().forEach((checkbox) => { checkbox.checked = true; });
     updateHotelToggleText();
@@ -514,5 +538,4 @@ loadButton.addEventListener("click", loadData);
 document.addEventListener("DOMContentLoaded", () => {
     updateHotelToggleText();
     updateLoadButtonState();
-    loadHotels().catch(handleHotelError);
 });

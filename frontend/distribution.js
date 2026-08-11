@@ -24,6 +24,9 @@ let loadedMonths = [];
 let lastLoadedRequestKey = null;
 let requestInProgress = false;
 let hotelRequestId = 0;
+let hotelListLoaded = false;
+let loadedHotelRequestKey = null;
+let loadedRequestState = null;
 
 function isValidPeriod() {
     return Boolean(startDate.value && endDate.value && startDate.value <= endDate.value);
@@ -66,15 +69,27 @@ function validateInputs() {
     }
 }
 
-async function loadHotels(requestState = getRequestState()) {
+function getHotelRequestKey(requestState) {
+    return JSON.stringify([
+        requestState.startDate,
+        requestState.endDate,
+        requestState.lyComparisonBasis
+    ]);
+}
+
+async function loadHotels(requestState = loadedRequestState || getRequestState(), { forceRefresh = false } = {}) {
     const requestId = ++hotelRequestId;
     const selectedHotel = hotelName.value;
-    const params = new URLSearchParams({
+    const requestKey = getHotelRequestKey(requestState);
+    if (!forceRefresh && hotelListLoaded && loadedHotelRequestKey === requestKey) return;
+    if (!hotelListLoaded) hotelName.options[0].textContent = "Loading hotels...";
+    const payload = await LosApi.fetchHotelList({
+        apiBaseUrl: API_BASE_URL,
         startDate: requestState.startDate,
         endDate: requestState.endDate,
-        lyComparisonBasis: requestState.lyComparisonBasis
+        lyComparisonBasis: requestState.lyComparisonBasis,
+        forceRefresh
     });
-    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels?${params}`);
     if (requestId !== hotelRequestId) return;
 
     hotelName.innerHTML = '<option value="">All hotels</option>';
@@ -87,6 +102,8 @@ async function loadHotels(requestState = getRequestState()) {
     if (Array.from(hotelName.options).some(({ value }) => value === selectedHotel)) {
         hotelName.value = selectedHotel;
     }
+    hotelListLoaded = true;
+    loadedHotelRequestKey = requestKey;
     if (lastLoadedRequestKey !== null) render();
 }
 
@@ -99,19 +116,25 @@ async function loadData() {
         validateInputs();
         requestInProgress = true;
         updateLoadButtonState();
-        status.textContent = "Updating LOS facts...";
-        const params = new URLSearchParams({
-            startDate: requestedState.startDate,
-            endDate: requestedState.endDate,
-            lyComparisonBasis: requestedState.lyComparisonBasis
+        const ranges = LosApi.buildContiguousMonthRanges(
+            requestedState.selectedMonths,
+            requestedState.startDate,
+            requestedState.endDate
+        );
+        status.textContent = ranges.length === 1
+            ? "Updating LOS facts..."
+            : `Updating LOS facts across ${ranges.length} selected ranges...`;
+        const payload = await LosApi.fetchLosFactRanges({
+            apiBaseUrl: API_BASE_URL,
+            ...requestedState
         });
-        loadHotels(requestedState).catch(handleHotelError);
-        const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/facts?${params}`);
         loadedFacts = payload.data || [];
         loadedMonths = requestedState.selectedMonths;
+        loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
         status.textContent = loadedFacts.length ? "Data is up to date." : "No data returned.";
+        loadHotels(requestedState, { forceRefresh: true }).catch(handleHotelError);
     }
     catch (error) {
         console.error(error);
@@ -129,14 +152,14 @@ function render() {
     if (lastLoadedRequestKey === null) return;
 
     const selectedHotel = hotelName.value;
-    const facts = LosData.filterByMonths(loadedFacts, loadedMonths);
-    const rows = LosData.calculateDistribution(facts, {
+    const rows = LosData.calculateDistribution(loadedFacts, {
         grain: grain.value,
         hotelCodes: selectedHotel ? [selectedHotel] : null,
         scenario: scenario.value,
         portfolio: level.value === "total",
         metric: metric.value,
-        buckets: LosData.DEFAULT_LOS_BUCKETS
+        buckets: LosData.DEFAULT_LOS_BUCKETS,
+        selectedMonths: loadedMonths
     });
 
     results.innerHTML = "";
@@ -207,5 +230,6 @@ scenario.addEventListener("change", render);
 level.addEventListener("change", render);
 document.addEventListener("DOMContentLoaded", () => {
     updateLoadButtonState();
-    loadHotels().catch(handleHotelError);
 });
+hotelName.addEventListener("pointerdown", () => loadHotels().catch(handleHotelError));
+hotelName.addEventListener("focus", () => loadHotels().catch(handleHotelError));

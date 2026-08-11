@@ -25,6 +25,29 @@ test("weighted Average LOS uses additive nights and bookings", () => {
     assert.notEqual(row.averageLos, ((7 / 3) + 3) / 2);
 });
 
+test("one-pass Average view returns hotel, portfolio, and summary results", () => {
+    let iterations = 0;
+    const iterableFacts = {
+        *[Symbol.iterator]() {
+            iterations += 1;
+            yield* facts;
+        }
+    };
+    const view = LosData.calculateAverageView(iterableFacts, {
+        grain: "month",
+        hotelCodes: ["A", "B"]
+    });
+
+    assert.equal(iterations, 1);
+    assert.equal(view.hotelRows.length, 4);
+    assert.equal(view.portfolioRows.length, 3);
+    assert.deepEqual(view.summaryRows.map((row) => row.scenario), ["current", "ly", "spit"]);
+    assert.equal(
+        view.summaryRows.find((row) => row.scenario === "current").averageLos,
+        19 / 7
+    );
+});
+
 test("portfolio aggregation sums hotels", () => {
     const rows = LosData.aggregateFacts(facts, {
         grain: "month",
@@ -104,6 +127,26 @@ test("room-night distribution percentages use night counts", () => {
     assert.ok(Math.abs(
         row.values.reduce((sum, item) => sum + item.percentage, 0) - 100
     ) < 1e-10);
+});
+
+test("direct distribution bucketing traverses its input once", () => {
+    let iterations = 0;
+    const iterableFacts = {
+        *[Symbol.iterator]() {
+            iterations += 1;
+            yield* facts;
+        }
+    };
+
+    const rows = LosData.calculateDistribution(iterableFacts, {
+        grain: "month",
+        scenario: "current",
+        portfolio: true,
+        metric: "bookings"
+    });
+
+    assert.equal(iterations, 1);
+    assert.equal(rows[0].total, 7);
 });
 
 test("empty datasets return empty analytical views", () => {

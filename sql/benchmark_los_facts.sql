@@ -1,10 +1,7 @@
 /*
-Canonical LOS facts benchmark -- run manually in pgAdmin against production.
-
-Representative request:
-  startDate=2026-01-01
-  endDate=2026-12-31
-  lyComparisonBasis=sameWeekday
+Optimized canonical LOS facts candidate -- run manually in pgAdmin after the
+matching baseline script. The four cases cover one month/full year and both
+comparison bases.
 
 Inspect, without assuming a particular result:
   - Execution Time, planning time, shared hits/reads, and temp reads/writes.
@@ -24,13 +21,7 @@ Do not compare only the final Execution Time. Save the complete text plan and
 send it back for analysis. This script contains no expected timing.
 */
 
-EXPLAIN (
-    ANALYZE,
-    BUFFERS,
-    VERBOSE,
-    SETTINGS,
-    SUMMARY
-)
+PREPARE los_facts_candidate(date, date, text) AS
 WITH
 current_source AS (
     SELECT
@@ -46,12 +37,8 @@ current_source AS (
         AND r.start_utc IS NOT NULL
         AND r.night_start_utc IS NOT NULL
         AND r.canceled_utc IS NULL
-        AND r.start_utc >= (
-            DATE '2026-01-01'::timestamp AT TIME ZONE 'Europe/Stockholm'
-        )
-        AND r.start_utc < (
-            DATE '2027-01-01'::timestamp AT TIME ZONE 'Europe/Stockholm'
-        )
+        AND r.start_utc >= ($1::date::timestamp AT TIME ZONE 'Europe/Stockholm')
+        AND r.start_utc < (($2::date + 1)::timestamp AT TIME ZONE 'Europe/Stockholm')
 ),
 current_reservation_los AS (
     SELECT
@@ -69,7 +56,7 @@ current_facts AS (
         'current'::text AS scenario,
         los,
         count(*)::bigint AS booking_count,
-        sum(los)::bigint AS night_count
+        (los::bigint * count(*))::bigint AS night_count
     FROM current_reservation_los
     GROUP BY arrival_date, hotel_code, los
 ),
@@ -89,16 +76,26 @@ ly_source AS (
         AND r.start_utc IS NOT NULL
         AND r.night_start_utc IS NOT NULL
         AND r.start_utc >= (
-            DATE '2025-01-02'::timestamp AT TIME ZONE 'Europe/Stockholm'
+            (CASE WHEN $3 = 'sameWeekday' THEN $1 - 364
+                ELSE ($1 - INTERVAL '1 year')::date END)::timestamp
+            AT TIME ZONE 'Europe/Stockholm'
         )
         AND r.start_utc < (
-            DATE '2026-01-02'::timestamp AT TIME ZONE 'Europe/Stockholm'
+            (CASE WHEN $3 = 'sameWeekday' THEN $2 - 364 + 1
+                ELSE (($2 - INTERVAL '1 year')::date + 1) END)::timestamp
+            AT TIME ZONE 'Europe/Stockholm'
         )
         AND (
             r.canceled_utc IS NULL
             OR (
-                r.created_utc::date <= CURRENT_DATE - 364
-                AND r.canceled_utc::date > CURRENT_DATE - 364
+                r.created_utc::date <= (
+                    CASE WHEN $3 = 'sameWeekday' THEN CURRENT_DATE - 364
+                        ELSE (CURRENT_DATE - INTERVAL '1 year')::date END
+                )
+                AND r.canceled_utc::date > (
+                    CASE WHEN $3 = 'sameWeekday' THEN CURRENT_DATE - 364
+                        ELSE (CURRENT_DATE - INTERVAL '1 year')::date END
+                )
             )
         )
 ),
@@ -118,37 +115,50 @@ ly_reservation_los AS (
         created_date,
         cancelled_date
 ),
-ly_scenarios AS (
+ly_reservation_flags AS (
     SELECT
-        r.arrival_date + 364 AS arrival_date,
+        CASE WHEN $3 = 'sameWeekday' THEN r.arrival_date + 364
+            ELSE (r.arrival_date + INTERVAL '1 year')::date END AS arrival_date,
         r.hotel_code,
-        scenario_data.scenario,
-        r.los
-    FROM ly_reservation_los r
-    CROSS JOIN LATERAL (
-        VALUES
-            ('ly'::text, r.cancelled_date IS NULL),
-            (
-                'spit'::text,
-                r.created_date <= CURRENT_DATE - 364
-                AND (
-                    r.cancelled_date IS NULL
-                    OR r.cancelled_date > CURRENT_DATE - 364
-                )
+        r.los,
+        r.cancelled_date IS NULL AS include_ly,
+        r.created_date <= (
+            CASE WHEN $3 = 'sameWeekday' THEN CURRENT_DATE - 364
+                ELSE (CURRENT_DATE - INTERVAL '1 year')::date END
+        ) AND (
+            r.cancelled_date IS NULL
+            OR r.cancelled_date > (
+                CASE WHEN $3 = 'sameWeekday' THEN CURRENT_DATE - 364
+                    ELSE (CURRENT_DATE - INTERVAL '1 year')::date END
             )
-    ) AS scenario_data(scenario, include_reservation)
-    WHERE scenario_data.include_reservation
+        ) AS include_spit
+    FROM ly_reservation_los r
 ),
-ly_facts AS (
+ly_fact_components AS (
     SELECT
         arrival_date,
         hotel_code,
-        scenario,
         los,
-        count(*)::bigint AS booking_count,
-        sum(los)::bigint AS night_count
-    FROM ly_scenarios
-    GROUP BY arrival_date, hotel_code, scenario, los
+        count(*) FILTER (WHERE include_ly)::bigint AS ly_booking_count,
+        count(*) FILTER (WHERE include_spit)::bigint AS spit_booking_count
+    FROM ly_reservation_flags
+    GROUP BY arrival_date, hotel_code, los
+),
+ly_facts AS (
+    SELECT
+        f.arrival_date,
+        f.hotel_code,
+        scenario_data.scenario,
+        f.los,
+        scenario_data.booking_count,
+        (f.los::bigint * scenario_data.booking_count)::bigint AS night_count
+    FROM ly_fact_components f
+    CROSS JOIN LATERAL (
+        VALUES
+            ('ly'::text, f.ly_booking_count),
+            ('spit'::text, f.spit_booking_count)
+    ) AS scenario_data(scenario, booking_count)
+    WHERE scenario_data.booking_count > 0
 ),
 los_facts AS (
     SELECT * FROM current_facts
@@ -162,13 +172,18 @@ SELECT
     los,
     booking_count,
     night_count
-FROM los_facts
-ORDER BY
-    arrival_date,
-    hotel_code,
-    CASE scenario
-        WHEN 'current' THEN 1
-        WHEN 'ly' THEN 2
-        WHEN 'spit' THEN 3
-    END,
-    los;
+FROM los_facts;
+
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
+EXECUTE los_facts_candidate(DATE '2026-01-01', DATE '2026-01-31', 'sameDate');
+
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
+EXECUTE los_facts_candidate(DATE '2026-01-01', DATE '2026-01-31', 'sameWeekday');
+
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
+EXECUTE los_facts_candidate(DATE '2026-01-01', DATE '2026-12-31', 'sameDate');
+
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
+EXECUTE los_facts_candidate(DATE '2026-01-01', DATE '2026-12-31', 'sameWeekday');
+
+DEALLOCATE los_facts_candidate;

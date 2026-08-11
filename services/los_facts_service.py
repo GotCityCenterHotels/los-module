@@ -1,3 +1,7 @@
+import logging
+
+from time import monotonic
+
 from psycopg.rows import dict_row
 
 from database import pool
@@ -11,10 +15,22 @@ def fetch_los_facts(start_date, end_date, ly_comparison_basis):
         "ly_comparison_basis": ly_comparison_basis,
     }
 
+    started_at = monotonic()
+
     with pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(LOS_FACTS_SQL, parameters)
             rows = cursor.fetchall()
+
+    logging.info(
+        "LOS facts query completed start_date=%s end_date=%s "
+        "ly_comparison_basis=%s row_count=%d duration_ms=%.1f",
+        start_date,
+        end_date,
+        ly_comparison_basis,
+        len(rows),
+        (monotonic() - started_at) * 1000,
+    )
 
     return [
         {

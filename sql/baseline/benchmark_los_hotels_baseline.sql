@@ -1,15 +1,9 @@
 /*
-Period-bounded hotel-list candidate -- run manually in pgAdmin after the
-matching baseline. The SQL shape is intentionally unchanged; the application
-optimizations are lazy loading, five-minute caching, and request coalescing.
-
-Inspect the two source branches separately. Confirm that the Current and LY
-start_utc predicates are applied at the underlying reservation scan, then
-inspect actual rows, loops, shared reads, temp I/O, and sort/hash work used by
-the final DISTINCT. Do not infer improvement from the SQL shape alone.
+Pre-optimization period-bounded hotel-list baseline. Run manually in pgAdmin
+and save each complete plan separately. No expected execution time is stated.
 */
 
-PREPARE los_hotels_candidate(date, date, text) AS
+PREPARE los_hotels_baseline(date, date, text) AS
 WITH hotel_codes AS (
     SELECT trim(r.hotel_name)::text AS hotel_code
     FROM staging.room_nights_source r
@@ -42,15 +36,15 @@ FROM hotel_codes
 ORDER BY hotel_code;
 
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
-EXECUTE los_hotels_candidate(DATE '2026-01-01', DATE '2026-01-31', 'sameDate');
+EXECUTE los_hotels_baseline(DATE '2026-01-01', DATE '2026-01-31', 'sameDate');
 
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
-EXECUTE los_hotels_candidate(DATE '2026-01-01', DATE '2026-01-31', 'sameWeekday');
+EXECUTE los_hotels_baseline(DATE '2026-01-01', DATE '2026-01-31', 'sameWeekday');
 
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
-EXECUTE los_hotels_candidate(DATE '2026-01-01', DATE '2026-12-31', 'sameDate');
+EXECUTE los_hotels_baseline(DATE '2026-01-01', DATE '2026-12-31', 'sameDate');
 
 EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, SUMMARY)
-EXECUTE los_hotels_candidate(DATE '2026-01-01', DATE '2026-12-31', 'sameWeekday');
+EXECUTE los_hotels_baseline(DATE '2026-01-01', DATE '2026-12-31', 'sameWeekday');
 
-DEALLOCATE los_hotels_candidate;
+DEALLOCATE los_hotels_baseline;
