@@ -80,12 +80,15 @@
                 button.dataset.month = key;
                 button.setAttribute("aria-pressed", String(selectedMonths.has(key)));
                 if (selectedMonths.has(key)) button.classList.add("selected");
-                button.addEventListener("click", () => {
+                button.addEventListener("click", (event) => {
+                    event.stopPropagation();
                     if (selectedMonths.has(key)) selectedMonths.delete(key);
                     else selectedMonths.add(key);
+                    const isSelected = selectedMonths.has(key);
+                    button.classList.toggle("selected", isSelected);
+                    button.setAttribute("aria-pressed", String(isSelected));
                     syncDates();
                     updateToggleText();
-                    render();
                     notifyChange();
                 });
                 grid.appendChild(button);

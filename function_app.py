@@ -5,8 +5,7 @@ from datetime import date
 
 import azure.functions as func
 
-from database import pool
-from queries.hotels import HOTELS_SQL
+from services.hotels_service import fetch_hotels
 from services.los_facts_service import fetch_los_facts
 
 
@@ -74,13 +73,25 @@ def validate_facts_parameters(req):
     auth_level=func.AuthLevel.ANONYMOUS,
 )
 def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        with pool.connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(HOTELS_SQL)
-                hotels = [row[0] for row in cursor.fetchall()]
+    parameters, error_response = validate_facts_parameters(req)
+    if error_response is not None:
+        return error_response
 
-        return json_response({"data": hotels})
+    start_date, end_date, ly_comparison_basis = parameters
+
+    try:
+        hotels = fetch_hotels(start_date, end_date, ly_comparison_basis)
+
+        return json_response(
+            {
+                "parameters": {
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                    "lyComparisonBasis": ly_comparison_basis,
+                },
+                "data": hotels,
+            }
+        )
     except Exception:
         logging.exception("LOS hotels endpoint failed")
         return json_response({"error": "Unable to retrieve hotels"}, 500)

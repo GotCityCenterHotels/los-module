@@ -545,6 +545,11 @@ button:disabled {
 }
 
 
+.spit-line {
+    background: #7c3aed;
+}
+
+
 .los-chart {
     position: relative;
 

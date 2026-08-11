@@ -30,11 +30,11 @@ const periodPicker = LosPeriodPicker.create({
 });
 
 let loadedFacts = [];
-let loadedParameters = null;
 let loadedMonths = [];
 let lastLoadedRequestKey = null;
 let hotelListLoaded = false;
 let requestInProgress = false;
+let hotelRequestId = 0;
 
 const decimalFormatter = new Intl.NumberFormat("en-SE", {
     minimumFractionDigits: 2,
@@ -74,8 +74,19 @@ function updateHotelToggleText() {
     else hotelToggle.textContent = `${selected.length} hotels selected`;
 }
 
-async function loadHotels() {
-    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels`);
+async function loadHotels(requestState = getRequestState()) {
+    const requestId = ++hotelRequestId;
+    const existing = getHotelCheckboxes();
+    const selectedHotels = new Set(existing.filter(({ checked }) => checked).map(({ value }) => value));
+    const allWereSelected = !hotelListLoaded || selectedHotels.size === existing.length;
+    const params = new URLSearchParams({
+        startDate: requestState.startDate,
+        endDate: requestState.endDate,
+        lyComparisonBasis: requestState.lyComparisonBasis
+    });
+    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels?${params}`);
+    if (requestId !== hotelRequestId) return;
+
     hotelOptions.innerHTML = "";
 
     for (const hotel of payload.data || []) {
@@ -84,7 +95,7 @@ async function loadHotels() {
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
         checkbox.value = hotel;
-        checkbox.checked = true;
+        checkbox.checked = allWereSelected || selectedHotels.has(hotel);
         checkbox.addEventListener("change", () => {
             updateHotelToggleText();
             render();
@@ -163,9 +174,9 @@ async function loadData() {
             endDate: requestedState.endDate,
             lyComparisonBasis: requestedState.lyComparisonBasis
         });
+        loadHotels(requestedState).catch(handleHotelError);
         const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/facts?${params}`);
         loadedFacts = payload.data || [];
-        loadedParameters = payload.parameters || null;
         loadedMonths = requestedState.selectedMonths;
         lastLoadedRequestKey = requestedKey;
         render();
@@ -197,14 +208,12 @@ function render() {
         portfolio: true
     });
     const summaryByScenario = Object.fromEntries(summaryRows.map((row) => [row.scenario, row]));
-    const showSpit = shouldShowSpit(loadedParameters?.endDate);
-
     summaryElement.hidden = false;
     totalLosElement.textContent = formatDecimal(summaryByScenario.current?.averageLos ?? null);
     totalLosLyElement.textContent = formatDecimal(summaryByScenario.ly?.averageLos ?? null);
     totalLosSpitElement.textContent = formatDecimal(summaryByScenario.spit?.averageLos ?? null);
-    totalLosSpitCard.hidden = !showSpit;
-    renderTable(rows, showSpit);
+    totalLosSpitCard.hidden = false;
+    renderTable(rows);
     renderChart(rows.filter(({ hotelCode }) => hotelCode === "Total"));
 }
 
@@ -223,14 +232,14 @@ function pivotAverageRows(rows) {
     );
 }
 
-function renderTable(rows, showSpit) {
+function renderTable(rows) {
     resultsBody.innerHTML = "";
-    document.querySelector("th.los-spit-column").hidden = !showSpit;
+    document.querySelector("th.los-spit-column").hidden = false;
 
     if (rows.length === 0) {
         const row = document.createElement("tr");
         const cell = document.createElement("td");
-        cell.colSpan = showSpit ? 11 : 10;
+        cell.colSpan = 11;
         cell.className = "empty-table-cell";
         cell.textContent = "No data returned for the selected hotels.";
         row.appendChild(cell);
@@ -248,7 +257,7 @@ function renderTable(rows, showSpit) {
             <td>${escapeHtml(item.hotelCode)}</td>
             <td>${formatDecimal(current?.averageLos ?? null)}</td>
             <td>${formatDecimal(ly?.averageLos ?? null)}</td>
-            <td class="los-spit-column" ${showSpit ? "" : "hidden"}>${formatDecimal(spit?.averageLos ?? null)}</td>
+            <td class="los-spit-column">${formatDecimal(spit?.averageLos ?? null)}</td>
             <td>${formatInteger(current?.nightCount ?? null)}</td>
             <td>${formatInteger(ly?.nightCount ?? null)}</td>
             <td>${formatInteger(spit?.nightCount ?? null)}</td>
@@ -297,7 +306,8 @@ function renderChart(rows) {
     const plotHeight = height - margin.top - margin.bottom;
     const series = [
         { scenario: "current", label: "LOS", color: "#2563eb" },
-        { scenario: "ly", label: "LOS LY", color: "#f97316" }
+        { scenario: "ly", label: "LOS LY", color: "#f97316" },
+        { scenario: "spit", label: "LOS SPIT", color: "#7c3aed" }
     ];
     const values = rows.flatMap(({ scenarios }) =>
         series.map(({ scenario }) => scenarios[scenario]?.averageLos).filter(Number.isFinite)
@@ -313,7 +323,7 @@ function renderChart(rows) {
     const svg = document.createElementNS(svgNs, "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.setAttribute("role", "img");
-    svg.setAttribute("aria-label", "LOS and LOS last year over the selected period");
+    svg.setAttribute("aria-label", "Current, last year, and SPIT LOS over the selected period");
 
     for (let tick = 0; tick <= 4; tick += 1) {
         const value = maxValue * tick / 4;
@@ -420,7 +430,8 @@ function renderChart(rows) {
         tooltip.innerHTML = `
             <strong class="chart-tooltip-title">${escapeHtml(label.primary)}${label.year ? ` ${escapeHtml(label.year)}` : ""}</strong>
             ${tooltipScenario("LOS", "#2563eb", row.scenarios.current)}
-            ${tooltipScenario("LOS LY", "#f97316", row.scenarios.ly)}`;
+            ${tooltipScenario("LOS LY", "#f97316", row.scenarios.ly)}
+            ${tooltipScenario("LOS SPIT", "#7c3aed", row.scenarios.spit)}`;
     }
 
     function hidePoint() {
@@ -449,15 +460,6 @@ function renderChart(rows) {
     losChart.append(svg, tooltip);
 }
 
-function localToday() {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-}
-
-function shouldShowSpit(endDate) {
-    return Boolean(endDate && endDate >= localToday());
-}
-
 function setHotelMenuOpen(open) {
     hotelMenu.hidden = !open;
     hotelToggle.setAttribute("aria-expanded", String(open));
@@ -476,6 +478,14 @@ function showError(message) {
 function clearError() {
     errorPanel.hidden = true;
     errorPanel.textContent = "";
+}
+
+function handleHotelError(error) {
+    console.error(error);
+    if (!hotelListLoaded) {
+        hotelOptions.innerHTML = '<span class="multi-select-empty">Hotel list unavailable.</span>';
+        hotelToggle.textContent = "Hotels unavailable";
+    }
 }
 
 hotelToggle.addEventListener("click", () => setHotelMenuOpen(hotelMenu.hidden));
@@ -504,10 +514,5 @@ loadButton.addEventListener("click", loadData);
 document.addEventListener("DOMContentLoaded", () => {
     updateHotelToggleText();
     updateLoadButtonState();
-    loadHotels().catch((error) => {
-        console.error(error);
-        hotelOptions.innerHTML = '<span class="multi-select-empty">Hotel list unavailable.</span>';
-        hotelToggle.textContent = "Hotels unavailable";
-        showError(error.message || "Unable to load hotels.");
-    });
+    loadHotels().catch(handleHotelError);
 });

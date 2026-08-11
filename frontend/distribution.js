@@ -23,6 +23,7 @@ let loadedFacts = [];
 let loadedMonths = [];
 let lastLoadedRequestKey = null;
 let requestInProgress = false;
+let hotelRequestId = 0;
 
 function isValidPeriod() {
     return Boolean(startDate.value && endDate.value && startDate.value <= endDate.value);
@@ -65,14 +66,28 @@ function validateInputs() {
     }
 }
 
-async function loadHotels() {
-    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels`);
+async function loadHotels(requestState = getRequestState()) {
+    const requestId = ++hotelRequestId;
+    const selectedHotel = hotelName.value;
+    const params = new URLSearchParams({
+        startDate: requestState.startDate,
+        endDate: requestState.endDate,
+        lyComparisonBasis: requestState.lyComparisonBasis
+    });
+    const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/hotels?${params}`);
+    if (requestId !== hotelRequestId) return;
+
+    hotelName.innerHTML = '<option value="">All hotels</option>';
     for (const hotel of payload.data || []) {
         const option = document.createElement("option");
         option.value = hotel;
         option.textContent = hotel;
         hotelName.appendChild(option);
     }
+    if (Array.from(hotelName.options).some(({ value }) => value === selectedHotel)) {
+        hotelName.value = selectedHotel;
+    }
+    if (lastLoadedRequestKey !== null) render();
 }
 
 async function loadData() {
@@ -90,6 +105,7 @@ async function loadData() {
             endDate: requestedState.endDate,
             lyComparisonBasis: requestedState.lyComparisonBasis
         });
+        loadHotels(requestedState).catch(handleHotelError);
         const payload = await LosApi.fetchJson(`${API_BASE_URL}/los/facts?${params}`);
         loadedFacts = payload.data || [];
         loadedMonths = requestedState.selectedMonths;
@@ -172,6 +188,13 @@ function escapeHtml(value) {
         .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
 
+function handleHotelError(error) {
+    console.error(error);
+    if (hotelName.options.length === 1) {
+        hotelName.options[0].textContent = "Hotels unavailable";
+    }
+}
+
 startDate.addEventListener("input", markBackendSettingChanged);
 endDate.addEventListener("input", markBackendSettingChanged);
 document.getElementById("monthPicker").addEventListener("periodchange", markBackendSettingChanged);
@@ -184,9 +207,5 @@ scenario.addEventListener("change", render);
 level.addEventListener("change", render);
 document.addEventListener("DOMContentLoaded", () => {
     updateLoadButtonState();
-    loadHotels().catch((error) => {
-        console.error(error);
-        errorPanel.hidden = false;
-        errorPanel.textContent = error.message || "Unable to load hotels.";
-    });
+    loadHotels().catch(handleHotelError);
 });
