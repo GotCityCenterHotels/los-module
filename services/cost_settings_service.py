@@ -32,6 +32,8 @@ def _json_row(row):
 
 
 def list_cost_settings_hotels():
+    # enterprise_current lives in the source/export database. Cost settings
+    # themselves are always read from and written to the separate cost pool.
     sql = """
         SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
         FROM enterprise_current
@@ -58,7 +60,7 @@ def _get_cost_settings_hotel(enterprise_id):
                 """
                 SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
                 FROM enterprise_current
-                WHERE tenant_key = 'GCCH' AND id = %s
+                WHERE tenant_key = 'GCCH' AND id::text = %s
                 """,
                 (enterprise_id,),
             )

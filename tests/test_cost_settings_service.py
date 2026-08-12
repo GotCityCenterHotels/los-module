@@ -41,6 +41,37 @@ class CostSettingsValidationTests(unittest.TestCase):
         }])
         self.assertIn("FROM enterprise_current", connection.cursor_instance.sql)
 
+    def test_property_lookup_uses_source_database_and_text_id_comparison(self):
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql, parameters):
+                self.sql = sql
+                self.parameters = parameters
+            def fetchone(self):
+                return {
+                    "enterprise_id": "property-42",
+                    "hotel_name": "Hotel A",
+                }
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self): self.cursor_instance = Cursor(); return self.cursor_instance
+
+        connection = Connection()
+        with patch.object(
+            cost_settings_service,
+            "get_export_connection",
+            return_value=connection,
+        ) as source_connection:
+            result = cost_settings_service._get_cost_settings_hotel("property-42")
+
+        source_connection.assert_called_once_with()
+        self.assertEqual(result["hotelName"], "Hotel A")
+        self.assertIn("id::text = %s", connection.cursor_instance.sql)
+        self.assertEqual(connection.cursor_instance.parameters, ("property-42",))
+
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(
             "00000000-0000-0000-0000-000000000001", "Hotel A", {}
