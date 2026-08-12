@@ -8,6 +8,11 @@ import azure.functions as func
 from services.hotels_service import fetch_hotels
 from services.los_facts_service import fetch_los_facts
 from services.cost_data_service import fetch_cost_data
+from services.cost_settings_service import (
+    fetch_cost_settings,
+    list_cost_settings_hotels,
+    save_cost_settings,
+)
 
 
 app = func.FunctionApp()
@@ -203,3 +208,41 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             "data": datasets,
         }
     )
+
+
+@app.route(
+    route="costdata/settings/hotels",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def cost_settings_hotels(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        return json_response({"data": list_cost_settings_hotels()})
+    except Exception:
+        logging.exception("Cost settings hotel endpoint failed")
+        return json_response({"error": "Unable to retrieve properties"}, 500)
+
+
+@app.route(
+    route="costdata/settings/{hotel_name}",
+    methods=["GET", "PUT"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
+    hotel_name = (req.route_params.get("hotel_name") or "").strip()
+    if not hotel_name:
+        return json_response({"error": "Hotel is required"}, 400)
+
+    try:
+        if req.method == "GET":
+            return json_response({"data": fetch_cost_settings(hotel_name)})
+        try:
+            payload = req.get_json()
+        except ValueError:
+            return json_response({"error": "Request body must be valid JSON"}, 400)
+        return json_response({"data": save_cost_settings(hotel_name, payload)})
+    except ValueError as error:
+        return json_response({"error": str(error)}, 400)
+    except Exception:
+        logging.exception("Cost settings endpoint failed hotel_name=%s", hotel_name)
+        return json_response({"error": "Unable to save cost settings"}, 500)

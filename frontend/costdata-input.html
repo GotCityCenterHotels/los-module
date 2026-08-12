@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cost Data Input</title>
+    <link rel="stylesheet" href="styles.css?v=20260812-2">
+</head>
+<body>
+<main class="container cost-workspace settings-workspace">
+    <nav class="main-nav" aria-label="Primary navigation">
+        <a href="/">Average LOS</a><a href="/distribution.html">LOS Distribution</a>
+        <a href="/costdata.html">Cost Data</a><a href="/costdata-input.html" aria-current="page">Cost Input</a>
+    </nav>
+
+    <header class="page-header settings-header">
+        <div><span class="page-kicker">PROPERTY COST RULEBOOK</span><h1>Cost Data Input</h1>
+            <p>Maintain the assumptions used to turn operating data into property costs.</p></div>
+        <div class="settings-property">
+            <label for="settingsHotel">Property</label>
+            <div><select id="settingsHotel"><option value="">Select property</option></select><button id="newProperty" type="button" class="secondary-button">New</button></div>
+        </div>
+    </header>
+
+    <div id="settingsStatus" class="cost-status-line" role="status" aria-live="polite">Select a property to begin.</div>
+    <div id="settingsLayout" class="settings-layout" hidden>
+        <aside class="settings-nav" aria-label="Cost setting categories">
+            <button type="button" aria-current="page" data-section="distribution"><span>01</span>Distribution</button>
+            <button type="button" data-section="cleaning"><span>02</span>Cleaning</button>
+            <button type="button" data-section="arrivals"><span>03</span>Arrivals</button>
+            <button type="button" data-section="breakfast"><span>04</span>Breakfast</button>
+            <button type="button" data-section="rent"><span>05</span>Rent & cards</button>
+            <button type="button" data-section="fixed"><span>06</span>Fixed costs</button>
+        </aside>
+
+        <form id="settingsForm" class="settings-editor">
+            <section data-settings-section="distribution">
+                <div class="editor-heading"><div><span class="section-eyebrow">ROOM REVENUE</span><h2>Distribution costs</h2><p>Group rate or channel values and assign the cost percentage charged to each.</p></div><button type="button" class="secondary-button" data-add="distributionGroups">Add group</button></div>
+                <div class="setting-strip"><label>Fallback distribution %<input name="distributionDefaultPercent" type="number" min="0" max="100" step="0.01" required></label></div>
+                <div id="distributionGroups" class="rule-list"></div>
+            </section>
+            <section data-settings-section="cleaning" hidden>
+                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Cleaning labour plus linen cost is selected by the room’s guest category.</p></div><button type="button" class="secondary-button" data-add="cleaningCategories">Add category</button></div>
+                <div class="setting-strip"><label>Cleaning cost / minute<input name="cleaningCostPerMinute" type="number" min="0" step="0.01" required></label><label>Currency<input name="currency" maxlength="3" pattern="[A-Za-z]{3}" required></label></div>
+                <div id="cleaningCategories" class="rule-list"></div>
+            </section>
+            <section data-settings-section="arrivals" hidden>
+                <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set reception hours required when daily arrivals enter a threshold.</p></div><button type="button" class="secondary-button" data-add="arrivalTiers">Add threshold</button></div>
+                <div class="setting-strip"><label>Reception cost / hour<input name="receptionCostPerHour" type="number" min="0" step="0.01" required></label></div>
+                <div id="arrivalTiers" class="rule-list"></div>
+            </section>
+            <section data-settings-section="breakfast" hidden>
+                <div class="editor-heading"><div><span class="section-eyebrow">BREAKFAST GUESTS</span><h2>Food & staffing</h2><p>Apply direct food cost per guest and staff hours by guest-count threshold.</p></div><button type="button" class="secondary-button" data-add="breakfastTiers">Add threshold</button></div>
+                <div class="setting-strip"><label>Calculate from<select name="breakfastCalculationBasis"><option value="guests">Breakfast guests</option><option value="products">Sold products</option></select></label><label>Food cost / unit<input name="breakfastFoodCostPerGuest" type="number" min="0" step="0.01" required></label><label>Staff cost / hour<input name="breakfastStaffCostPerHour" type="number" min="0" step="0.01" required></label></div>
+                <div id="breakfastTiers" class="rule-list"></div>
+            </section>
+            <section data-settings-section="rent" hidden>
+                <div class="editor-heading"><div><span class="section-eyebrow">REVENUE & PAYMENTS</span><h2>Rent and card costs</h2><p>Percentages apply to the matching net revenue stream or gross payments.</p></div></div>
+                <div class="setting-grid"><label>Room rent %<input name="roomRentPercent" type="number" min="0" max="100" step="0.01" required><small>Room revenue net</small></label><label>Breakfast rent %<input name="breakfastRentPercent" type="number" min="0" max="100" step="0.01" required><small>Breakfast revenue net</small></label><label>Parking rent %<input name="parkingRentPercent" type="number" min="0" max="100" step="0.01" required><small>Parking revenue net</small></label><label>Card cost %<input name="cardCostPercent" type="number" min="0" max="100" step="0.01" required><small>Gross payments; default 2%</small></label></div>
+            </section>
+            <section data-settings-section="fixed" hidden>
+                <div class="editor-heading"><div><span class="section-eyebrow">OPEN PROPERTY</span><h2>Fixed costs</h2><p>Add recurring costs such as electricity, insurance, or subscriptions.</p></div><button type="button" class="secondary-button" data-add="fixedCosts">Add cost</button></div>
+                <div id="fixedCosts" class="rule-list"></div>
+            </section>
+            <div class="settings-savebar"><span id="dirtyState">No unsaved changes</span><button id="saveSettings" type="submit">Save property settings</button></div>
+        </form>
+    </div>
+    <section id="settingsError" class="error-panel" role="alert" hidden></section>
+</main>
+<script src="los-api.js?v=20260811-2"></script><script src="costdata-input.js?v=20260812-2"></script>
+</body>
+</html>
