@@ -1,3 +1,5 @@
+import logging
+
 from decimal import Decimal, InvalidOperation
 from psycopg.rows import dict_row
 
@@ -21,6 +23,45 @@ DEFAULT_PROFILE = {
     "parkingRentPercent": "0", "cardCostPercent": "2",
 }
 
+SOURCE_PROPERTIES_SQL = """
+    SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
+    FROM enterprise_current
+    WHERE tenant_key = 'GCCH'
+      AND name IS NOT NULL
+      AND trim(name) <> ''
+    ORDER BY hotel_name, enterprise_id
+"""
+
+IMPORTED_PROPERTIES_SQL = """
+    SELECT DISTINCT ON (enterprise_id)
+        enterprise_id,
+        hotel_name
+    FROM (
+        SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, 1 AS priority
+        FROM functions.breakfast_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+
+        UNION ALL
+
+        SELECT enterprise_id::text, trim(hotel_name)::text, 2
+        FROM functions.parking_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+
+        UNION ALL
+
+        SELECT enterprise_id::text, trim(hotel_name)::text, 3
+        FROM functions.total_payment_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+
+        UNION ALL
+
+        SELECT enterprise_id::text, trim(hotel_name)::text, 4
+        FROM functions.room_revenue_night_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+    ) imported
+    ORDER BY enterprise_id, priority, hotel_name
+"""
+
 
 def _camel(name):
     parts = name.split("_")
@@ -31,43 +72,97 @@ def _json_row(row):
     return {_camel(key): str(value) if isinstance(value, Decimal) else value for key, value in row.items()}
 
 
-def list_cost_settings_hotels():
-    # enterprise_current lives in the source/export database. Cost settings
-    # themselves are always read from and written to the separate cost pool.
-    sql = """
-        SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
-        FROM enterprise_current
-        WHERE tenant_key = 'GCCH'
-          AND name IS NOT NULL
-          AND trim(name) <> ''
-        ORDER BY hotel_name, enterprise_id
-    """
+def _property_json(row):
+    return {
+        "enterpriseId": str(row["enterprise_id"]),
+        "hotelName": row["hotel_name"],
+    }
+
+
+def _list_source_properties():
     with get_export_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(sql)
-            return [
-                {"enterpriseId": str(row["enterprise_id"]), "hotelName": row["hotel_name"]}
-                for row in cursor.fetchall()
-            ]
+            cursor.execute(SOURCE_PROPERTIES_SQL)
+            return [_property_json(row) for row in cursor.fetchall()]
+
+
+def _list_imported_properties():
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(IMPORTED_PROPERTIES_SQL)
+            return [_property_json(row) for row in cursor.fetchall()]
+
+
+def _get_imported_property(enterprise_id):
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                f"""
+                SELECT enterprise_id, hotel_name
+                FROM ({IMPORTED_PROPERTIES_SQL.rstrip().rstrip(';')}) imported_properties
+                WHERE enterprise_id = %s
+                LIMIT 1
+                """,
+                (enterprise_id,),
+            )
+            row = cursor.fetchone()
+    return _property_json(row) if row is not None else None
+
+
+def list_cost_settings_hotels():
+    # enterprise_current lives in the source/export database. Imported facts in
+    # the cost database provide a safe fallback when that database is temporarily
+    # unavailable or its property query returns no rows.
+    try:
+        properties = _list_source_properties()
+        if properties:
+            return properties
+        logging.warning(
+            "enterprise_current returned no GCCH properties; using imported cost facts"
+        )
+    except Exception:
+        logging.warning(
+            "Unable to read enterprise_current; using imported cost facts",
+            exc_info=True,
+        )
+
+    return sorted(
+        _list_imported_properties(),
+        key=lambda property_row: (
+            property_row["hotelName"].casefold(),
+            property_row["enterpriseId"],
+        ),
+    )
 
 
 def _get_cost_settings_hotel(enterprise_id):
     enterprise_id = _required_text(enterprise_id, "Enterprise ID", 250)
 
-    with get_export_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
-                FROM enterprise_current
-                WHERE tenant_key = 'GCCH' AND id::text = %s
-                """,
-                (enterprise_id,),
-            )
-            row = cursor.fetchone()
-    if row is None:
-        raise ValueError("Property was not found in enterprise_current")
-    return {"enterpriseId": str(row["enterprise_id"]), "hotelName": row["hotel_name"]}
+    try:
+        with get_export_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
+                    FROM enterprise_current
+                    WHERE tenant_key = 'GCCH' AND id::text = %s
+                    """,
+                    (enterprise_id,),
+                )
+                row = cursor.fetchone()
+        if row is not None:
+            return _property_json(row)
+    except Exception:
+        logging.warning(
+            "Unable to resolve property from enterprise_current enterprise_id=%s",
+            enterprise_id,
+            exc_info=True,
+        )
+
+    property_record = _get_imported_property(enterprise_id)
+    if property_record is None:
+        raise ValueError("Property was not found in enterprise_current or imported cost data")
+    return property_record
 
 
 def fetch_cost_settings(enterprise_id, hotel_name=None):

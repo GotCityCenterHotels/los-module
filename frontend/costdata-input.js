@@ -16,6 +16,8 @@
     const defaults = { cleaningCategories:{categoryName:"",minGuests:1,maxGuests:"",cleaningMinutes:0,linenCost:0}, arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0}, fixedCosts:{costName:"",amount:0,cadence:"monthly",active:true}, distributionGroups:{groupName:"",costPercent:0,rules:[]} };
 
     async function loadHotels() {
+        status.textContent = "Loading properties...";
+        hotel.disabled = true;
         try {
             const payload = await LosApi.fetchJson(`${API}/hotels`);
             const properties = (payload.data || []).filter((property) =>
@@ -32,10 +34,11 @@
             }
             else {
                 layout.hidden = true;
-                status.textContent = "No properties were returned from enterprise_current.";
+                status.textContent = "No properties were found in the source or imported cost data.";
+                hotel.disabled = false;
             }
         }
-        catch (error) { showError(error); }
+        catch (error) { hotel.disabled = false; showError(error); }
     }
     async function loadSettings(name) {
         if (!name || name === "undefined" || name === "null") {

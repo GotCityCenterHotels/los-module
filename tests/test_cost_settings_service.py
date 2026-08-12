@@ -72,6 +72,40 @@ class CostSettingsValidationTests(unittest.TestCase):
         self.assertIn("id::text = %s", connection.cursor_instance.sql)
         self.assertEqual(connection.cursor_instance.parameters, ("property-42",))
 
+    def test_property_list_falls_back_to_imported_cost_data(self):
+        imported = [{"enterpriseId": "property-42", "hotelName": "Hotel A"}]
+
+        with patch.object(
+            cost_settings_service,
+            "_list_source_properties",
+            side_effect=RuntimeError("source unavailable"),
+        ), patch.object(
+            cost_settings_service,
+            "_list_imported_properties",
+            return_value=imported,
+        ) as imported_properties:
+            result = cost_settings_service.list_cost_settings_hotels()
+
+        self.assertEqual(result, imported)
+        imported_properties.assert_called_once_with()
+
+    def test_property_lookup_falls_back_to_imported_cost_data(self):
+        imported = {"enterpriseId": "property-42", "hotelName": "Hotel A"}
+
+        with patch.object(
+            cost_settings_service,
+            "get_export_connection",
+            side_effect=RuntimeError("source unavailable"),
+        ), patch.object(
+            cost_settings_service,
+            "_get_imported_property",
+            return_value=imported,
+        ) as imported_property:
+            result = cost_settings_service._get_cost_settings_hotel("property-42")
+
+        self.assertEqual(result, imported)
+        imported_property.assert_called_once_with("property-42")
+
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(
             "00000000-0000-0000-0000-000000000001", "Hotel A", {}
