@@ -124,6 +124,10 @@ class CostSettingsValidationTests(unittest.TestCase):
     def test_selected_property_pair_survives_a_repeat_lookup_miss(self):
         with patch.object(
             cost_settings_service,
+            "_get_preloaded_property",
+            return_value=None,
+        ), patch.object(
+            cost_settings_service,
             "_get_cost_settings_hotel",
             side_effect=ValueError("not found"),
         ):
@@ -140,10 +144,35 @@ class CostSettingsValidationTests(unittest.TestCase):
     def test_repeat_lookup_miss_without_selected_name_is_rejected(self):
         with patch.object(
             cost_settings_service,
+            "_get_preloaded_property",
+            return_value=None,
+        ), patch.object(
+            cost_settings_service,
             "_get_cost_settings_hotel",
             side_effect=ValueError("not found"),
         ), self.assertRaisesRegex(ValueError, "not found"):
             cost_settings_service._resolve_cost_settings_hotel("property-42")
+
+    def test_preloaded_property_avoids_a_second_source_lookup(self):
+        preloaded = {
+            "enterpriseId": "7b09bedb-2aeb-4855-b5d4-ac1700c0605a",
+            "hotelName": "Hotel Vasa",
+        }
+        with patch.object(
+            cost_settings_service,
+            "_get_preloaded_property",
+            return_value=preloaded,
+        ) as local_lookup, patch.object(
+            cost_settings_service,
+            "_get_cost_settings_hotel",
+        ) as source_lookup:
+            result = cost_settings_service._resolve_cost_settings_hotel(
+                preloaded["enterpriseId"]
+            )
+
+        self.assertEqual(result, preloaded)
+        local_lookup.assert_called_once_with(preloaded["enterpriseId"])
+        source_lookup.assert_not_called()
 
     def test_property_preload_inserts_defaults_without_overwriting_settings(self):
         class Cursor:

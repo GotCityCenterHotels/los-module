@@ -115,6 +115,21 @@ def _get_imported_property(enterprise_id):
     return _property_json(row) if row is not None else None
 
 
+def _get_preloaded_property(enterprise_id):
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                SELECT enterprise_id, hotel_name
+                FROM functions.cost_property_settings
+                WHERE enterprise_id = %s
+                """,
+                (enterprise_id,),
+            )
+            row = cursor.fetchone()
+    return _property_json(row) if row is not None else None
+
+
 def _preload_property_settings(properties):
     if not properties:
         return
@@ -206,6 +221,10 @@ def _get_cost_settings_hotel(enterprise_id):
 
 
 def _resolve_cost_settings_hotel(enterprise_id, fallback_hotel_name=None):
+    preloaded_property = _get_preloaded_property(enterprise_id)
+    if preloaded_property is not None:
+        return preloaded_property
+
     try:
         return _get_cost_settings_hotel(enterprise_id)
     except ValueError:
@@ -232,7 +251,7 @@ def _resolve_cost_settings_hotel(enterprise_id, fallback_hotel_name=None):
 def fetch_cost_settings(enterprise_id, hotel_name=None):
     ensure_cost_settings_schema()
     if hotel_name is None:
-        property_record = _get_cost_settings_hotel(enterprise_id)
+        property_record = _resolve_cost_settings_hotel(enterprise_id)
         enterprise_id = property_record["enterpriseId"]
         hotel_name = property_record["hotelName"]
     with cost_pool.connection() as connection:
