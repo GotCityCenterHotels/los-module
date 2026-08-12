@@ -13,11 +13,10 @@ def main(mytimer: func.TimerRequest) -> None:
         if mytimer.past_due:
             logging.warning("CostDataTimer is running later than scheduled.")
 
-        wwwroot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        costdata_dir = os.path.join(wwwroot, "CostData")
+        app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-        if costdata_dir not in sys.path:
-            sys.path.insert(0, costdata_dir)
+        if app_root not in sys.path:
+            sys.path.insert(0, app_root)
 
         from shared.pipeline import run_all_datasets
 

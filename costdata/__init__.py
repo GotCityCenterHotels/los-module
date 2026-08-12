@@ -11,10 +11,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("InsertData function started.")
 
     try:
-        # Make the function folder importable, e.g. InsertData/utils/...
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        if current_dir not in sys.path:
-            sys.path.insert(0, current_dir)
+        app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if app_root not in sys.path:
+            sys.path.insert(0, app_root)
 
         from shared.pipeline import run_all_datasets, run_dataset
 
