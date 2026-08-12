@@ -1,15 +1,22 @@
-import sys
+import os
 import unittest
 
-from pathlib import Path
 from unittest.mock import patch
 
-import TimerFunc
-import costdata
+
+os.environ.setdefault("DB_HOST", "localhost")
+os.environ.setdefault("DB_NAME", "los-test")
+os.environ.setdefault("DB_USER", "los-test")
+os.environ.setdefault("DB_PASSWORD", "not-used")
+
+import function_app
+from cost_database import cost_pool
+from database import pool
 from shared import pipeline
 
 
-APP_ROOT = str(Path(__file__).resolve().parent.parent)
+cost_pool.close()
+pool.close()
 
 
 class FakeTimer:
@@ -17,8 +24,9 @@ class FakeTimer:
 
 
 class FakeRequest:
-    def __init__(self, body):
+    def __init__(self, body, params=None):
         self.body = body
+        self.params = params or {}
 
     def get_json(self):
         return self.body
@@ -45,24 +53,55 @@ class CostDataTriggerTests(unittest.TestCase):
         )
         self.assertEqual(result, {"dataset": "properties", **expected})
 
-    def test_timer_imports_shared_pipeline_from_application_root(self):
+    def test_timer_runs_every_dataset(self):
         expected = {"status": "success", "results": []}
 
-        with patch("shared.pipeline.run_all_datasets", return_value=expected) as run_all:
-            TimerFunc.main(FakeTimer())
+        with patch.object(
+            function_app,
+            "run_all_datasets",
+            return_value=expected,
+        ) as run_all:
+            function_app.cost_data_timer(FakeTimer())
 
         run_all.assert_called_once_with()
-        self.assertIn(APP_ROOT, sys.path)
 
     def test_manual_trigger_runs_a_selected_dataset(self):
         expected = {"dataset": "parking", "export_rows": 2, "import_rows": 2}
 
-        with patch("shared.pipeline.run_dataset", return_value=expected) as run_one:
-            response = costdata.main(FakeRequest({"dataset": "parking"}))
+        with patch.object(
+            function_app,
+            "run_dataset",
+            return_value=expected,
+        ) as run_one:
+            response = function_app.cost_data_import(
+                FakeRequest({"dataset": "parking"})
+            )
 
         run_one.assert_called_once_with("parking")
         self.assertEqual(response.status_code, 200)
-        self.assertIn('"dataset": "parking"', response.get_body().decode())
+        self.assertIn('"dataset":"parking"', response.get_body().decode())
+
+    def test_manual_trigger_defaults_to_all_datasets(self):
+        expected = {"status": "success", "results": []}
+
+        with patch.object(
+            function_app,
+            "run_all_datasets",
+            return_value=expected,
+        ) as run_all:
+            response = function_app.cost_data_import(FakeRequest({}))
+
+        run_all.assert_called_once_with()
+        self.assertEqual(response.status_code, 200)
+
+    def test_v2_function_app_registers_manual_and_timer_triggers(self):
+        function_names = {
+            registered.get_function_name()
+            for registered in function_app.app.get_functions()
+        }
+
+        self.assertIn("CostDataImport", function_names)
+        self.assertIn("CostDataTimer", function_names)
 
 
 if __name__ == "__main__":

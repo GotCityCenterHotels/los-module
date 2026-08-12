@@ -14,6 +14,7 @@ from services.cost_settings_service import (
     save_cost_settings,
 )
 from services.cost_schema_service import CostSettingsSchemaError
+from shared.pipeline import run_all_datasets, run_dataset
 
 
 app = func.FunctionApp()
@@ -255,3 +256,64 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("Cost settings endpoint failed enterprise_id=%s", enterprise_id)
         action = "retrieve" if req.method == "GET" else "save"
         return json_response({"error": f"Unable to {action} cost settings"}, 500)
+
+
+@app.function_name(name="CostDataImport")
+@app.route(
+    route="costdata/import",
+    methods=["POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def cost_data_import(req: func.HttpRequest) -> func.HttpResponse:
+    """Manually transfer one cost dataset, or every dataset, to Database A."""
+    try:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = {}
+
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return json_response({"error": "Request body must be a JSON object"}, 400)
+
+        dataset = body.get("dataset") or req.params.get("dataset") or "all"
+        dataset = str(dataset).strip().lower()
+
+        if dataset == "all":
+            result = run_all_datasets()
+        else:
+            result = {
+                "status": "success",
+                "results": [run_dataset(dataset)],
+            }
+
+        status_code = 200 if result.get("status") == "success" else 207
+        return json_response(result, status_code)
+    except ValueError as error:
+        return json_response({"error": str(error)}, 400)
+    except Exception:
+        logging.exception("Manual cost data import failed")
+        return json_response({"error": "Unable to import cost data"}, 500)
+
+
+@app.function_name(name="CostDataTimer")
+@app.timer_trigger(
+    schedule="0 5 0 * * *",
+    arg_name="mytimer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def cost_data_timer(mytimer: func.TimerRequest) -> None:
+    """Transfer every cost dataset once per day at 00:05."""
+    if mytimer.past_due:
+        logging.warning("CostDataTimer is running later than scheduled")
+
+    logging.info("CostDataTimer started")
+    result = run_all_datasets()
+    logging.info("CostDataTimer finished result=%s", result)
+
+    if result.get("status") != "success":
+        raise RuntimeError(
+            f"CostDataTimer finished with non-success status: {result}"
+        )
