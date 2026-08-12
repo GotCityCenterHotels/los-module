@@ -7,6 +7,7 @@ import azure.functions as func
 
 from services.hotels_service import fetch_hotels
 from services.los_facts_service import fetch_los_facts
+from services.cost_data_service import fetch_cost_data
 
 
 app = func.FunctionApp()
@@ -150,5 +151,55 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
             },
             "rowCount": len(rows),
             "data": rows,
+        }
+    )
+
+
+@app.route(
+    route="costdata/facts",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
+    start_date = parse_date(req.params.get("startDate"))
+    end_date = parse_date(req.params.get("endDate"))
+
+    if start_date is None:
+        return json_response(
+            {"error": "startDate is required and must use YYYY-MM-DD"},
+            400,
+        )
+    if end_date is None:
+        return json_response(
+            {"error": "endDate is required and must use YYYY-MM-DD"},
+            400,
+        )
+    if start_date > end_date:
+        return json_response({"error": "startDate cannot be after endDate"}, 400)
+
+    try:
+        datasets, row_counts = fetch_cost_data(start_date, end_date)
+    except Exception:
+        logging.exception("Cost data endpoint failed")
+        return json_response({"error": "Unable to retrieve cost data"}, 500)
+
+    hotels = sorted(
+        {
+            row["hotelName"]
+            for rows in datasets.values()
+            for row in rows
+            if row.get("hotelName")
+        }
+    )
+
+    return json_response(
+        {
+            "parameters": {
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+            },
+            "rowCounts": row_counts,
+            "hotels": hotels,
+            "data": datasets,
         }
     )
