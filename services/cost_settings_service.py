@@ -1,6 +1,4 @@
 from decimal import Decimal, InvalidOperation
-from uuid import UUID
-
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
@@ -51,10 +49,7 @@ def list_cost_settings_hotels():
 
 
 def _get_cost_settings_hotel(enterprise_id):
-    try:
-        enterprise_id = str(UUID(str(enterprise_id)))
-    except (ValueError, TypeError, AttributeError):
-        raise ValueError("Enterprise ID must be a valid UUID") from None
+    enterprise_id = _required_text(enterprise_id, "Enterprise ID", 250)
 
     with get_export_connection() as connection:
         with connection.cursor() as cursor:

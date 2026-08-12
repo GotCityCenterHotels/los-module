@@ -16,11 +16,33 @@
     const defaults = { cleaningCategories:{categoryName:"",minGuests:1,maxGuests:"",cleaningMinutes:0,linenCost:0}, arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0}, fixedCosts:{costName:"",amount:0,cadence:"monthly",active:true}, distributionGroups:{groupName:"",costPercent:0,rules:[]} };
 
     async function loadHotels() {
-        try { const payload = await LosApi.fetchJson(`${API}/hotels`); for (const property of payload.data || []) hotel.add(new Option(property.hotelName, property.enterpriseId)); }
+        try {
+            const payload = await LosApi.fetchJson(`${API}/hotels`);
+            const properties = (payload.data || []).filter((property) =>
+                property && property.enterpriseId != null && String(property.enterpriseId).trim()
+                && property.hotelName && String(property.hotelName).trim()
+            );
+            hotel.replaceChildren(new Option("Select property", ""));
+            for (const property of properties) {
+                hotel.add(new Option(property.hotelName, String(property.enterpriseId)));
+            }
+            if (properties.length) {
+                hotel.value = String(properties[0].enterpriseId);
+                await loadSettings(hotel.value);
+            }
+            else {
+                layout.hidden = true;
+                status.textContent = "No properties were returned from enterprise_current.";
+            }
+        }
         catch (error) { showError(error); }
     }
     async function loadSettings(name) {
-        if (!name) { layout.hidden = true; return; }
+        if (!name || name === "undefined" || name === "null") {
+            layout.hidden = true;
+            status.textContent = "Select a property to begin.";
+            return;
+        }
         setBusy(true); errorPanel.hidden = true;
         try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}`); model = payload.data; loadedEnterpriseId = model.enterpriseId; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${model.hotelName}`; }
         catch (error) { showError(error); } finally { setBusy(false); }

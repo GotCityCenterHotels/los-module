@@ -49,6 +49,13 @@ class CostSettingsValidationTests(unittest.TestCase):
         self.assertEqual(result["profile"]["cardCostPercent"], 2)
         self.assertEqual(result["profile"]["breakfastCalculationBasis"], "guests")
 
+    def test_enterprise_ids_are_treated_as_opaque_source_keys(self):
+        result = cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {}
+        )
+
+        self.assertEqual(result["enterpriseId"], "property-42")
+
     def test_complete_property_configuration_is_normalized(self):
         result = cost_settings_service.validate_cost_settings("00000000-0000-0000-0000-000000000001", " Hotel A ", {
             "profile": {"currency": "sek", "cardCostPercent": "2.5", "breakfastCalculationBasis": "products"},
