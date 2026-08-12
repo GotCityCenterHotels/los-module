@@ -32,7 +32,14 @@ class CostSettingsValidationTests(unittest.TestCase):
             def cursor(self): self.cursor_instance = Cursor(); return self.cursor_instance
 
         connection = Connection()
-        with patch.object(cost_settings_service, "get_export_connection", return_value=connection):
+        with patch.object(
+            cost_settings_service,
+            "get_export_connection",
+            return_value=connection,
+        ), patch.object(
+            cost_settings_service,
+            "_preload_property_settings",
+        ) as preload:
             result = cost_settings_service.list_cost_settings_hotels()
 
         self.assertEqual(result, [{
@@ -40,6 +47,7 @@ class CostSettingsValidationTests(unittest.TestCase):
             "hotelName": "Hotel A",
         }])
         self.assertIn("FROM enterprise_current", connection.cursor_instance.sql)
+        preload.assert_called_once_with(result)
 
     def test_property_lookup_uses_source_database_and_text_id_comparison(self):
         class Cursor:
@@ -83,11 +91,18 @@ class CostSettingsValidationTests(unittest.TestCase):
             cost_settings_service,
             "_list_imported_properties",
             return_value=imported,
-        ) as imported_properties:
+        ) as imported_properties, patch.object(
+            cost_settings_service,
+            "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service,
+            "_preload_property_settings",
+        ) as preload:
             result = cost_settings_service.list_cost_settings_hotels()
 
         self.assertEqual(result, imported)
         imported_properties.assert_called_once_with()
+        preload.assert_called_once_with(imported)
 
     def test_property_lookup_falls_back_to_imported_cost_data(self):
         imported = {"enterpriseId": "property-42", "hotelName": "Hotel A"}
@@ -129,6 +144,48 @@ class CostSettingsValidationTests(unittest.TestCase):
             side_effect=ValueError("not found"),
         ), self.assertRaisesRegex(ValueError, "not found"):
             cost_settings_service._resolve_cost_settings_hotel("property-42")
+
+    def test_property_preload_inserts_defaults_without_overwriting_settings(self):
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def executemany(self, sql, parameters):
+                self.sql = sql
+                self.parameters = parameters
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self): self.cursor_instance = Cursor(); return self.cursor_instance
+
+        class Pool:
+            def __init__(self): self.connection_instance = Connection()
+            def connection(self): return self.connection_instance
+
+        pool = Pool()
+        properties = [
+            {"enterpriseId": "property-42", "hotelName": "Hotel A"},
+            {"enterpriseId": "property-43", "hotelName": "Hotel B"},
+        ]
+        with patch.object(
+            cost_settings_service,
+            "ensure_cost_settings_schema",
+        ) as ensure_schema, patch.object(
+            cost_settings_service,
+            "cost_pool",
+            pool,
+        ):
+            cost_settings_service._preload_property_settings(properties)
+
+        ensure_schema.assert_called_once_with()
+        cursor = pool.connection_instance.cursor_instance
+        self.assertEqual(cursor.parameters, [
+            ("property-42", "Hotel A"),
+            ("property-43", "Hotel B"),
+        ])
+        self.assertIn("INSERT INTO functions.cost_property_settings", cursor.sql)
+        self.assertIn("ON CONFLICT (enterprise_id) DO UPDATE", cursor.sql)
+        self.assertNotIn("card_cost_percent", cursor.sql)
 
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(

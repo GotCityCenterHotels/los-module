@@ -37,6 +37,12 @@ IMPORTED_PROPERTIES_SQL = """
         enterprise_id,
         hotel_name
     FROM (
+        SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, 0 AS priority
+        FROM functions.cost_property_settings
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+
+        UNION ALL
+
         SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, 1 AS priority
         FROM functions.breakfast_data
         WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
@@ -109,6 +115,36 @@ def _get_imported_property(enterprise_id):
     return _property_json(row) if row is not None else None
 
 
+def _preload_property_settings(properties):
+    if not properties:
+        return
+
+    ensure_cost_settings_schema()
+    with cost_pool.connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO functions.cost_property_settings (
+                    enterprise_id,
+                    hotel_name
+                )
+                VALUES (%s, %s)
+                ON CONFLICT (enterprise_id) DO UPDATE SET
+                    hotel_name = EXCLUDED.hotel_name,
+                    updated_at = CASE
+                        WHEN functions.cost_property_settings.hotel_name
+                            IS DISTINCT FROM EXCLUDED.hotel_name
+                        THEN now()
+                        ELSE functions.cost_property_settings.updated_at
+                    END
+                """,
+                [
+                    (property_row["enterpriseId"], property_row["hotelName"])
+                    for property_row in properties
+                ],
+            )
+
+
 def list_cost_settings_hotels():
     # enterprise_current lives in the source/export database. Imported facts in
     # the cost database provide a safe fallback when that database is temporarily
@@ -116,6 +152,7 @@ def list_cost_settings_hotels():
     try:
         properties = _list_source_properties()
         if properties:
+            _preload_property_settings(properties)
             return properties
         logging.warning(
             "enterprise_current returned no GCCH properties; using imported cost facts"
@@ -126,13 +163,16 @@ def list_cost_settings_hotels():
             exc_info=True,
         )
 
-    return sorted(
+    ensure_cost_settings_schema()
+    properties = sorted(
         _list_imported_properties(),
         key=lambda property_row: (
             property_row["hotelName"].casefold(),
             property_row["enterpriseId"],
         ),
     )
+    _preload_property_settings(properties)
+    return properties
 
 
 def _get_cost_settings_hotel(enterprise_id):
