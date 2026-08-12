@@ -27,6 +27,58 @@ ALTER TABLE IF EXISTS functions.cost_breakfast_staffing_tiers
 ALTER TABLE IF EXISTS functions.cost_fixed_lines
     ADD COLUMN IF NOT EXISTS enterprise_id text;
 
+/* Drop dependencies, then normalize any interim uuid columns to text before
+ * assigning text IDs from the imported property map. */
+DO $migration$
+DECLARE
+    constraint_record record;
+BEGIN
+    FOR constraint_record IN
+        SELECT conrelid::regclass AS table_name, conname
+        FROM pg_constraint
+        WHERE contype = 'f'
+          AND confrelid = 'functions.cost_property_settings'::regclass
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %s DROP CONSTRAINT %I',
+            constraint_record.table_name,
+            constraint_record.conname
+        );
+    END LOOP;
+END
+$migration$;
+
+DO $migration$
+DECLARE
+    primary_key_name text;
+BEGIN
+    SELECT conname INTO primary_key_name
+    FROM pg_constraint
+    WHERE conrelid = 'functions.cost_property_settings'::regclass
+      AND contype = 'p';
+
+    IF primary_key_name IS NOT NULL THEN
+        EXECUTE format(
+            'ALTER TABLE functions.cost_property_settings DROP CONSTRAINT %I',
+            primary_key_name
+        );
+    END IF;
+END
+$migration$;
+
+ALTER TABLE functions.cost_property_settings
+    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
+ALTER TABLE functions.cost_distribution_groups
+    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
+ALTER TABLE functions.cost_cleaning_categories
+    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
+ALTER TABLE functions.cost_arrival_staffing_tiers
+    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
+ALTER TABLE functions.cost_breakfast_staffing_tiers
+    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
+ALTER TABLE functions.cost_fixed_lines
+    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
+
 /* Resolve existing hotel-name settings against imported source identifiers. */
 WITH property_candidates AS (
     SELECT enterprise_id::text, trim(hotel_name) AS hotel_name, 1 AS priority
@@ -100,57 +152,6 @@ BEGIN
     END LOOP;
 END
 $migration$;
-
-/* Drop foreign keys before changing uuid columns to opaque text identifiers. */
-DO $migration$
-DECLARE
-    constraint_record record;
-BEGIN
-    FOR constraint_record IN
-        SELECT conrelid::regclass AS table_name, conname
-        FROM pg_constraint
-        WHERE contype = 'f'
-          AND confrelid = 'functions.cost_property_settings'::regclass
-    LOOP
-        EXECUTE format(
-            'ALTER TABLE %s DROP CONSTRAINT %I',
-            constraint_record.table_name,
-            constraint_record.conname
-        );
-    END LOOP;
-END
-$migration$;
-
-DO $migration$
-DECLARE
-    primary_key_name text;
-BEGIN
-    SELECT conname INTO primary_key_name
-    FROM pg_constraint
-    WHERE conrelid = 'functions.cost_property_settings'::regclass
-      AND contype = 'p';
-
-    IF primary_key_name IS NOT NULL THEN
-        EXECUTE format(
-            'ALTER TABLE functions.cost_property_settings DROP CONSTRAINT %I',
-            primary_key_name
-        );
-    END IF;
-END
-$migration$;
-
-ALTER TABLE functions.cost_property_settings
-    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
-ALTER TABLE functions.cost_distribution_groups
-    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
-ALTER TABLE functions.cost_cleaning_categories
-    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
-ALTER TABLE functions.cost_arrival_staffing_tiers
-    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
-ALTER TABLE functions.cost_breakfast_staffing_tiers
-    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
-ALTER TABLE functions.cost_fixed_lines
-    ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
 
 ALTER TABLE functions.cost_property_settings ALTER COLUMN enterprise_id SET NOT NULL;
 ALTER TABLE functions.cost_distribution_groups ALTER COLUMN enterprise_id SET NOT NULL;
@@ -246,5 +247,14 @@ CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_enterprise
     ON functions.cost_breakfast_staffing_tiers(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_enterprise
     ON functions.cost_fixed_lines(enterprise_id);
+
+CREATE TABLE IF NOT EXISTS functions.schema_migrations (
+    migration_name text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO functions.schema_migrations (migration_name)
+VALUES ('001_cost_settings_enterprise_text')
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

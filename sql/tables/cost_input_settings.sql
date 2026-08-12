@@ -104,3 +104,12 @@ CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.c
 CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_enterprise ON functions.cost_breakfast_staffing_tiers(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_enterprise ON functions.cost_fixed_lines(enterprise_id);
+
+CREATE TABLE IF NOT EXISTS functions.schema_migrations (
+    migration_name text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO functions.schema_migrations (migration_name)
+VALUES ('001_cost_settings_enterprise_text')
+ON CONFLICT (migration_name) DO NOTHING;

@@ -13,6 +13,7 @@ from services.cost_settings_service import (
     list_cost_settings_hotels,
     save_cost_settings,
 )
+from services.cost_schema_service import CostSettingsSchemaError
 
 
 app = func.FunctionApp()
@@ -243,6 +244,8 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
         return json_response({"data": save_cost_settings(enterprise_id, payload)})
     except ValueError as error:
         return json_response({"error": str(error)}, 400)
+    except CostSettingsSchemaError as error:
+        return json_response({"error": str(error)}, 503)
     except Exception:
         logging.exception("Cost settings endpoint failed enterprise_id=%s", enterprise_id)
         action = "retrieve" if req.method == "GET" else "save"
