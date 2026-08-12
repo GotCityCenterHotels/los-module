@@ -236,7 +236,10 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         if req.method == "GET":
-            return json_response({"data": fetch_cost_settings(enterprise_id)})
+            hotel_name = (req.params.get("hotelName") or "").strip() or None
+            return json_response(
+                {"data": fetch_cost_settings(enterprise_id, hotel_name)}
+            )
         try:
             payload = req.get_json()
         except ValueError:

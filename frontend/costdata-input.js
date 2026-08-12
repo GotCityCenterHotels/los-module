@@ -47,7 +47,11 @@
             return;
         }
         setBusy(true); errorPanel.hidden = true;
-        try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}`); model = payload.data; loadedEnterpriseId = model.enterpriseId; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${model.hotelName}`; }
+        const selectedOption = hotel.options[hotel.selectedIndex];
+        const parameters = new URLSearchParams({
+            hotelName: selectedOption ? selectedOption.textContent : ""
+        });
+        try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}?${parameters}`); model = payload.data; loadedEnterpriseId = model.enterpriseId; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${model.hotelName}`; }
         catch (error) { showError(error); } finally { setBusy(false); }
     }
     function render() {

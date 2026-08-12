@@ -106,6 +106,30 @@ class CostSettingsValidationTests(unittest.TestCase):
         self.assertEqual(result, imported)
         imported_property.assert_called_once_with("property-42")
 
+    def test_selected_property_pair_survives_a_repeat_lookup_miss(self):
+        with patch.object(
+            cost_settings_service,
+            "_get_cost_settings_hotel",
+            side_effect=ValueError("not found"),
+        ):
+            result = cost_settings_service._resolve_cost_settings_hotel(
+                "property-42",
+                "Hotel A",
+            )
+
+        self.assertEqual(result, {
+            "enterpriseId": "property-42",
+            "hotelName": "Hotel A",
+        })
+
+    def test_repeat_lookup_miss_without_selected_name_is_rejected(self):
+        with patch.object(
+            cost_settings_service,
+            "_get_cost_settings_hotel",
+            side_effect=ValueError("not found"),
+        ), self.assertRaisesRegex(ValueError, "not found"):
+            cost_settings_service._resolve_cost_settings_hotel("property-42")
+
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(
             "00000000-0000-0000-0000-000000000001", "Hotel A", {}

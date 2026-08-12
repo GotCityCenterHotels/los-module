@@ -165,6 +165,30 @@ def _get_cost_settings_hotel(enterprise_id):
     return property_record
 
 
+def _resolve_cost_settings_hotel(enterprise_id, fallback_hotel_name=None):
+    try:
+        return _get_cost_settings_hotel(enterprise_id)
+    except ValueError:
+        if not fallback_hotel_name:
+            raise
+        logging.warning(
+            "Using supplied property name after lookup miss enterprise_id=%s",
+            enterprise_id,
+        )
+        return {
+            "enterpriseId": _required_text(
+                enterprise_id,
+                "Enterprise ID",
+                250,
+            ),
+            "hotelName": _required_text(
+                fallback_hotel_name,
+                "Hotel",
+                250,
+            ),
+        }
+
+
 def fetch_cost_settings(enterprise_id, hotel_name=None):
     ensure_cost_settings_schema()
     if hotel_name is None:
@@ -305,7 +329,13 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
 
 def save_cost_settings(enterprise_id, payload):
     ensure_cost_settings_schema()
-    property_record = _get_cost_settings_hotel(enterprise_id)
+    # The property picker already obtained this ID/name pair from the property
+    # list endpoint. The submitted name is a fallback if a repeated source
+    # lookup is temporarily unavailable.
+    property_record = _resolve_cost_settings_hotel(
+        enterprise_id,
+        payload.get("hotelName"),
+    )
     data = validate_cost_settings(
         property_record["enterpriseId"],
         property_record["hotelName"],
