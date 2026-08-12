@@ -1,12 +1,17 @@
-from .sql_runner import fetch_export_rows, import_rows, transfer_dataset
 from datetime import datetime, timezone
+
+from .sql_runner import transfer_dataset
+
 
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-
 DATASETS = {
+    "properties": {
+        "export_sql": "export/cost_properties.sql",
+        "import_sql": "import/upsert_cost_properties.sql",
+    },
     "parking": {
         "export_sql": "export/parking_data.sql",
         "import_sql": "import/upsert_parking_data.sql",
@@ -19,21 +24,30 @@ DATASETS = {
         "export_sql": "export/total_payment_data.sql",
         "import_sql": "import/upsert_total_payment_data.sql",
     },
-       "arr_dep": {
+    "arr_dep": {
         "export_sql": "export/arr_dep_data.sql",
         "import_sql": "import/upsert_arr_dep_data.sql",
-    }, 
-       "breakfast": {
+    },
+    "breakfast": {
         "export_sql": "export/breakfast_data.sql",
         "import_sql": "import/upsert_breakfast_data.sql",
-    }
+    },
 }
+
 
 def run_dataset(dataset_name):
     if dataset_name not in DATASETS:
         raise ValueError(
             f"Unknown dataset '{dataset_name}'. Allowed: {sorted(DATASETS)}"
         )
+
+    if dataset_name == "properties":
+        # The source row lives in Database B, but the import target is the
+        # functions schema in Database A. Ensure that target exists before the
+        # first scheduled/manual sync runs.
+        from services.cost_schema_service import ensure_cost_settings_schema
+
+        ensure_cost_settings_schema()
 
     config = DATASETS[dataset_name]
 

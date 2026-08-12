@@ -34,9 +34,19 @@ class CostSettingsValidationTests(unittest.TestCase):
         connection = Connection()
         with patch.object(
             cost_settings_service,
+            "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service,
+            "_list_mirrored_properties",
+            return_value=[],
+        ), patch.object(
+            cost_settings_service,
             "get_export_connection",
             return_value=connection,
         ), patch.object(
+            cost_settings_service,
+            "_upsert_mirrored_properties",
+        ) as mirror, patch.object(
             cost_settings_service,
             "_preload_property_settings",
         ) as preload:
@@ -47,6 +57,7 @@ class CostSettingsValidationTests(unittest.TestCase):
             "hotelName": "Hotel A",
         }])
         self.assertIn("FROM enterprise_current", connection.cursor_instance.sql)
+        mirror.assert_called_once_with(result)
         preload.assert_called_once_with(result)
 
     def test_property_lookup_uses_source_database_and_text_id_comparison(self):
@@ -70,20 +81,55 @@ class CostSettingsValidationTests(unittest.TestCase):
         connection = Connection()
         with patch.object(
             cost_settings_service,
+            "_get_mirrored_property",
+            return_value=None,
+        ), patch.object(
+            cost_settings_service,
             "get_export_connection",
             return_value=connection,
-        ) as source_connection:
+        ) as source_connection, patch.object(
+            cost_settings_service,
+            "_upsert_mirrored_properties",
+        ) as mirror:
             result = cost_settings_service._get_cost_settings_hotel("property-42")
 
         source_connection.assert_called_once_with()
         self.assertEqual(result["hotelName"], "Hotel A")
         self.assertIn("id::text = %s", connection.cursor_instance.sql)
         self.assertEqual(connection.cursor_instance.parameters, ("property-42",))
+        mirror.assert_called_once_with([result])
+
+    def test_property_list_prefers_database_a_mirror(self):
+        mirrored = [{"enterpriseId": "property-42", "hotelName": "Hotel A"}]
+
+        with patch.object(
+            cost_settings_service,
+            "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service,
+            "_list_mirrored_properties",
+            return_value=mirrored,
+        ), patch.object(
+            cost_settings_service,
+            "_list_source_properties",
+        ) as source, patch.object(
+            cost_settings_service,
+            "_preload_property_settings",
+        ) as preload:
+            result = cost_settings_service.list_cost_settings_hotels()
+
+        self.assertEqual(result, mirrored)
+        source.assert_not_called()
+        preload.assert_called_once_with(mirrored)
 
     def test_property_list_falls_back_to_imported_cost_data(self):
         imported = [{"enterpriseId": "property-42", "hotelName": "Hotel A"}]
 
         with patch.object(
+            cost_settings_service,
+            "_list_mirrored_properties",
+            return_value=[],
+        ), patch.object(
             cost_settings_service,
             "_list_source_properties",
             side_effect=RuntimeError("source unavailable"),
@@ -108,6 +154,10 @@ class CostSettingsValidationTests(unittest.TestCase):
         imported = {"enterpriseId": "property-42", "hotelName": "Hotel A"}
 
         with patch.object(
+            cost_settings_service,
+            "_get_mirrored_property",
+            return_value=None,
+        ), patch.object(
             cost_settings_service,
             "get_export_connection",
             side_effect=RuntimeError("source unavailable"),

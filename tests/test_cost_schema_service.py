@@ -86,7 +86,9 @@ class CostSchemaServiceTests(unittest.TestCase):
         )
 
     def test_uuid_columns_are_converted_before_text_property_mapping(self):
-        migration_sql = cost_schema_service.MIGRATION_PATH.read_text(encoding="utf-8")
+        migration_sql = cost_schema_service.MIGRATIONS[0][1].read_text(
+            encoding="utf-8"
+        )
 
         conversion_position = migration_sql.index(
             "ALTER COLUMN enterprise_id TYPE text"

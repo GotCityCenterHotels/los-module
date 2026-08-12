@@ -1,5 +1,16 @@
 CREATE SCHEMA IF NOT EXISTS functions;
 
+CREATE TABLE IF NOT EXISTS functions.cost_properties (
+    enterprise_id text PRIMARY KEY,
+    tenant_key text NOT NULL,
+    hotel_name text NOT NULL,
+    first_inserted_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_updated_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (nullif(trim(enterprise_id), '') IS NOT NULL),
+    CHECK (nullif(trim(hotel_name), '') IS NOT NULL)
+);
+
 CREATE TABLE IF NOT EXISTS functions.cost_property_settings (
     enterprise_id text PRIMARY KEY,
     hotel_name text NOT NULL,
@@ -99,6 +110,7 @@ CREATE TABLE IF NOT EXISTS functions.cost_fixed_lines (
 );
 
 CREATE INDEX IF NOT EXISTS ix_cost_property_settings_hotel_name ON functions.cost_property_settings(hotel_name);
+CREATE INDEX IF NOT EXISTS ix_cost_properties_hotel_name ON functions.cost_properties(hotel_name);
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_enterprise ON functions.cost_distribution_groups(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.cost_cleaning_categories(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);
@@ -112,4 +124,8 @@ CREATE TABLE IF NOT EXISTS functions.schema_migrations (
 
 INSERT INTO functions.schema_migrations (migration_name)
 VALUES ('001_cost_settings_enterprise_text')
+ON CONFLICT (migration_name) DO NOTHING;
+
+INSERT INTO functions.schema_migrations (migration_name)
+VALUES ('002_cost_properties')
 ON CONFLICT (migration_name) DO NOTHING;

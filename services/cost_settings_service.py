@@ -37,6 +37,12 @@ IMPORTED_PROPERTIES_SQL = """
         enterprise_id,
         hotel_name
     FROM (
+        SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, -1 AS priority
+        FROM functions.cost_properties
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+
+        UNION ALL
+
         SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, 0 AS priority
         FROM functions.cost_property_settings
         WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
@@ -97,6 +103,62 @@ def _list_imported_properties():
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(IMPORTED_PROPERTIES_SQL)
             return [_property_json(row) for row in cursor.fetchall()]
+
+
+def _list_mirrored_properties():
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("""
+                SELECT enterprise_id, hotel_name
+                FROM functions.cost_properties
+                WHERE tenant_key = 'GCCH'
+                ORDER BY hotel_name, enterprise_id
+            """)
+            return [_property_json(row) for row in cursor.fetchall()]
+
+
+def _get_mirrored_property(enterprise_id):
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                SELECT enterprise_id, hotel_name
+                FROM functions.cost_properties
+                WHERE enterprise_id = %s
+                """,
+                (enterprise_id,),
+            )
+            row = cursor.fetchone()
+    return _property_json(row) if row is not None else None
+
+
+def _upsert_mirrored_properties(properties):
+    if not properties:
+        return
+    with cost_pool.connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO functions.cost_properties (
+                    enterprise_id, tenant_key, hotel_name
+                )
+                VALUES (%s, 'GCCH', %s)
+                ON CONFLICT (enterprise_id) DO UPDATE SET
+                    tenant_key = EXCLUDED.tenant_key,
+                    hotel_name = EXCLUDED.hotel_name,
+                    last_seen_at = now(),
+                    last_updated_at = CASE
+                        WHEN functions.cost_properties.hotel_name
+                            IS DISTINCT FROM EXCLUDED.hotel_name
+                        THEN now()
+                        ELSE functions.cost_properties.last_updated_at
+                    END
+                """,
+                [
+                    (property_row["enterpriseId"], property_row["hotelName"])
+                    for property_row in properties
+                ],
+            )
 
 
 def _get_imported_property(enterprise_id):
@@ -161,12 +223,19 @@ def _preload_property_settings(properties):
 
 
 def list_cost_settings_hotels():
-    # enterprise_current lives in the source/export database. Imported facts in
-    # the cost database provide a safe fallback when that database is temporarily
-    # unavailable or its property query returns no rows.
+    # Normal page reads stay entirely inside Database A. Database B is only used
+    # to bootstrap an empty mirror; the scheduled properties pipeline keeps the
+    # mirror authoritative afterwards.
+    ensure_cost_settings_schema()
+    properties = _list_mirrored_properties()
+    if properties:
+        _preload_property_settings(properties)
+        return properties
+
     try:
         properties = _list_source_properties()
         if properties:
+            _upsert_mirrored_properties(properties)
             _preload_property_settings(properties)
             return properties
         logging.warning(
@@ -178,7 +247,6 @@ def list_cost_settings_hotels():
             exc_info=True,
         )
 
-    ensure_cost_settings_schema()
     properties = sorted(
         _list_imported_properties(),
         key=lambda property_row: (
@@ -193,6 +261,12 @@ def list_cost_settings_hotels():
 def _get_cost_settings_hotel(enterprise_id):
     enterprise_id = _required_text(enterprise_id, "Enterprise ID", 250)
 
+    mirrored_property = _get_mirrored_property(enterprise_id)
+    if mirrored_property is not None:
+        return mirrored_property
+
+    # Bootstrap compatibility for a mirror that has not yet been populated by
+    # the timer. This is a two-connection application transfer, not a cross-DB SQL join.
     try:
         with get_export_connection() as connection:
             with connection.cursor() as cursor:
@@ -206,7 +280,9 @@ def _get_cost_settings_hotel(enterprise_id):
                 )
                 row = cursor.fetchone()
         if row is not None:
-            return _property_json(row)
+            property_record = _property_json(row)
+            _upsert_mirrored_properties([property_record])
+            return property_record
     except Exception:
         logging.warning(
             "Unable to resolve property from enterprise_current enterprise_id=%s",
@@ -216,7 +292,10 @@ def _get_cost_settings_hotel(enterprise_id):
 
     property_record = _get_imported_property(enterprise_id)
     if property_record is None:
-        raise ValueError("Property was not found in enterprise_current or imported cost data")
+        raise ValueError(
+            "Property was not found in synchronized cost properties. "
+            "Run the properties cost-data import."
+        )
     return property_record
 
 

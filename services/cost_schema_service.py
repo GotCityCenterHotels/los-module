@@ -8,8 +8,16 @@ from cost_database import cost_pool
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 BASE_SCHEMA_PATH = APP_ROOT / "sql" / "tables" / "cost_input_settings.sql"
-MIGRATION_PATH = APP_ROOT / "sql" / "migrations" / "001_cost_settings_enterprise_text.sql"
-MIGRATION_NAME = "001_cost_settings_enterprise_text"
+MIGRATIONS = (
+    (
+        "001_cost_settings_enterprise_text",
+        APP_ROOT / "sql" / "migrations" / "001_cost_settings_enterprise_text.sql",
+    ),
+    (
+        "002_cost_properties",
+        APP_ROOT / "sql" / "migrations" / "002_cost_properties.sql",
+    ),
+)
 
 _schema_ready = False
 _schema_lock = Lock()
@@ -44,15 +52,7 @@ def ensure_cost_settings_schema():
                         "SELECT to_regclass('functions.schema_migrations')"
                     )
                     migration_table_exists = cursor.fetchone()[0] is not None
-                    migration_applied = False
-                    if migration_table_exists:
-                        cursor.execute(
-                            "SELECT 1 FROM functions.schema_migrations WHERE migration_name = %s",
-                            (MIGRATION_NAME,),
-                        )
-                        migration_applied = cursor.fetchone() is not None
-
-                    if not migration_applied:
+                    if not migration_table_exists:
                         cursor.execute("CREATE SCHEMA IF NOT EXISTS functions")
                         cursor.execute("""
                             CREATE TABLE IF NOT EXISTS functions.schema_migrations (
@@ -60,25 +60,30 @@ def ensure_cost_settings_schema():
                                 applied_at timestamptz NOT NULL DEFAULT now()
                             )
                         """)
-                        cursor.execute(
-                            "SELECT to_regclass('functions.cost_property_settings')"
-                        )
-                        settings_table_exists = cursor.fetchone()[0] is not None
-                        script_path = (
-                            MIGRATION_PATH if settings_table_exists else BASE_SCHEMA_PATH
-                        )
-                        cursor.execute(_read_sql(script_path))
-                        cursor.execute(
-                            """
-                            INSERT INTO functions.schema_migrations (migration_name)
-                            VALUES (%s)
-                            ON CONFLICT (migration_name) DO NOTHING
-                            """,
-                            (MIGRATION_NAME,),
-                        )
+                    cursor.execute(
+                        "SELECT to_regclass('functions.cost_property_settings')"
+                    )
+                    settings_table_exists = cursor.fetchone()[0] is not None
+                    if not settings_table_exists:
+                        cursor.execute(_read_sql(BASE_SCHEMA_PATH))
                         logging.info(
-                            "Applied cost settings database script path=%s",
-                            script_path,
+                            "Applied fresh cost settings schema path=%s",
+                            BASE_SCHEMA_PATH,
+                        )
+
+                    for migration_name, migration_path in MIGRATIONS:
+                        cursor.execute(
+                            "SELECT 1 FROM functions.schema_migrations "
+                            "WHERE migration_name = %s",
+                            (migration_name,),
+                        )
+                        if cursor.fetchone() is not None:
+                            continue
+                        cursor.execute(_read_sql(migration_path))
+                        logging.info(
+                            "Applied cost settings migration name=%s path=%s",
+                            migration_name,
+                            migration_path,
                         )
                 except Exception as error:
                     # A failed multi-statement migration leaves PostgreSQL's
@@ -92,7 +97,7 @@ def ensure_cost_settings_schema():
                     )
                     raise CostSettingsSchemaError(
                         f"Cost settings database schema is not ready (SQLSTATE {sqlstate}). "
-                        "Apply sql/migrations/001_cost_settings_enterprise_text.sql "
+                        "Apply the pending scripts in sql/migrations "
                         "with a database owner account."
                     ) from error
                 finally:

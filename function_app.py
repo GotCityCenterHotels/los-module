@@ -219,6 +219,8 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
 def cost_settings_hotels(req: func.HttpRequest) -> func.HttpResponse:
     try:
         return json_response({"data": list_cost_settings_hotels()})
+    except CostSettingsSchemaError as error:
+        return json_response({"error": str(error)}, 503)
     except Exception:
         logging.exception("Cost settings hotel endpoint failed")
         return json_response({"error": "Unable to retrieve properties"}, 500)

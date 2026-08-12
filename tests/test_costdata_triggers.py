@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import TimerFunc
 import costdata
+from shared import pipeline
 
 
 APP_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -24,6 +25,26 @@ class FakeRequest:
 
 
 class CostDataTriggerTests(unittest.TestCase):
+    def test_property_sync_creates_database_a_target_before_transfer(self):
+        expected = {"export_rows": 8, "import_rows": 8}
+
+        with patch(
+            "services.cost_schema_service.ensure_cost_settings_schema",
+        ) as ensure_schema, patch.object(
+            pipeline,
+            "transfer_dataset",
+            return_value=expected,
+        ) as transfer:
+            result = pipeline.run_dataset("properties")
+
+        ensure_schema.assert_called_once_with()
+        transfer.assert_called_once_with(
+            export_sql_file="export/cost_properties.sql",
+            import_sql_file="import/upsert_cost_properties.sql",
+            batch_size=5000,
+        )
+        self.assertEqual(result, {"dataset": "properties", **expected})
+
     def test_timer_imports_shared_pipeline_from_application_root(self):
         expected = {"status": "success", "results": []}
 
