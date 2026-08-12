@@ -224,25 +224,25 @@ def cost_settings_hotels(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(
-    route="costdata/settings/{hotel_name}",
+    route="costdata/settings/{enterprise_id}",
     methods=["GET", "PUT"],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
 def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
-    hotel_name = (req.route_params.get("hotel_name") or "").strip()
-    if not hotel_name:
-        return json_response({"error": "Hotel is required"}, 400)
+    enterprise_id = (req.route_params.get("enterprise_id") or "").strip()
+    if not enterprise_id:
+        return json_response({"error": "Enterprise ID is required"}, 400)
 
     try:
         if req.method == "GET":
-            return json_response({"data": fetch_cost_settings(hotel_name)})
+            return json_response({"data": fetch_cost_settings(enterprise_id)})
         try:
             payload = req.get_json()
         except ValueError:
             return json_response({"error": "Request body must be valid JSON"}, 400)
-        return json_response({"data": save_cost_settings(hotel_name, payload)})
+        return json_response({"data": save_cost_settings(enterprise_id, payload)})
     except ValueError as error:
         return json_response({"error": str(error)}, 400)
     except Exception:
-        logging.exception("Cost settings endpoint failed hotel_name=%s", hotel_name)
+        logging.exception("Cost settings endpoint failed enterprise_id=%s", enterprise_id)
         return json_response({"error": "Unable to save cost settings"}, 500)

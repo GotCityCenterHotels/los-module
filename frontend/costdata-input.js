@@ -5,7 +5,7 @@
     const layout = document.getElementById("settingsLayout"), status = document.getElementById("settingsStatus");
     const errorPanel = document.getElementById("settingsError"), save = document.getElementById("saveSettings");
     const dirtyState = document.getElementById("dirtyState");
-    let model = null, dirty = false;
+    let model = null, dirty = false, loadedEnterpriseId = "";
 
     const configs = {
         cleaningCategories: [["categoryName","Category","text"],["minGuests","Min guests","number"],["maxGuests","Max guests","number"],["cleaningMinutes","Minutes","number"],["linenCost","Linen cost","number"]],
@@ -16,13 +16,13 @@
     const defaults = { cleaningCategories:{categoryName:"",minGuests:1,maxGuests:"",cleaningMinutes:0,linenCost:0}, arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0}, fixedCosts:{costName:"",amount:0,cadence:"monthly",active:true}, distributionGroups:{groupName:"",costPercent:0,rules:[]} };
 
     async function loadHotels() {
-        try { const payload = await LosApi.fetchJson(`${API}/hotels`); for (const name of payload.data || []) hotel.add(new Option(name,name)); }
+        try { const payload = await LosApi.fetchJson(`${API}/hotels`); for (const property of payload.data || []) hotel.add(new Option(property.hotelName, property.enterpriseId)); }
         catch (error) { showError(error); }
     }
     async function loadSettings(name) {
         if (!name) { layout.hidden = true; return; }
         setBusy(true); errorPanel.hidden = true;
-        try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}`); model = payload.data; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${name}`; }
+        try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}`); model = payload.data; loadedEnterpriseId = model.enterpriseId; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${model.hotelName}`; }
         catch (error) { showError(error); } finally { setBusy(false); }
     }
     function render() {
@@ -45,12 +45,11 @@
     function removeRow(key,index){model[key].splice(index,1);key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)}
     function escapeHtml(value){return String(value??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;")}
     function collect(){for(const input of form.querySelectorAll("[name]"))model.profile[input.name]=input.value;return model}
-    async function submit(event){event.preventDefault();if(!form.reportValidity())return;setBusy(true);errorPanel.hidden=true;try{const payload=await LosApi.fetchJson(`${API}/${encodeURIComponent(hotel.value)}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(collect())});model=payload.data;render();setDirty(false);status.textContent=`Saved ${hotel.value}`;}catch(error){showError(error)}finally{setBusy(false)}}
+    async function submit(event){event.preventDefault();if(!form.reportValidity())return;setBusy(true);errorPanel.hidden=true;try{const payload=await LosApi.fetchJson(`${API}/${encodeURIComponent(hotel.value)}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(collect())});model=payload.data;loadedEnterpriseId=model.enterpriseId;render();setDirty(false);status.textContent=`Saved ${model.hotelName}`;}catch(error){showError(error)}finally{setBusy(false)}}
     function setDirty(value){dirty=value;dirtyState.textContent=value?"Unsaved changes":"No unsaved changes";dirtyState.classList.toggle("is-dirty",value)}
     function setBusy(value){save.disabled=value;hotel.disabled=value;document.querySelector(".settings-workspace").setAttribute("aria-busy",String(value))}
     function showError(error){errorPanel.textContent=error.message||"Unable to load cost settings.";errorPanel.hidden=false;status.textContent="Something went wrong."}
     document.querySelectorAll(".settings-nav button").forEach(button=>button.onclick=()=>{document.querySelectorAll(".settings-nav button").forEach(x=>x.removeAttribute("aria-current"));button.setAttribute("aria-current","page");document.querySelectorAll("[data-settings-section]").forEach(section=>section.hidden=section.dataset.settingsSection!==button.dataset.section)});
     document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)});
-    document.getElementById("newProperty").onclick=()=>{const name=prompt("Property name");if(!name||!name.trim())return;const clean=name.trim();if(!Array.from(hotel.options).some(x=>x.value===clean))hotel.add(new Option(clean,clean));hotel.value=clean;loadSettings(clean)};
-    hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?"))return;loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});loadHotels();
+    hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?")){hotel.value=loadedEnterpriseId;return}loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});loadHotels();
 }());

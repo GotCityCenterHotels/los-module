@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import patch
 
 
 os.environ.setdefault("DB_HOST", "localhost")
@@ -14,14 +15,42 @@ cost_settings_service.cost_pool.close()
 
 
 class CostSettingsValidationTests(unittest.TestCase):
+    def test_property_list_comes_from_enterprise_current(self):
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql): self.sql = sql
+            def fetchall(self):
+                return [{
+                    "enterprise_id": "00000000-0000-0000-0000-000000000001",
+                    "hotel_name": "Hotel A",
+                }]
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self): self.cursor_instance = Cursor(); return self.cursor_instance
+
+        connection = Connection()
+        with patch.object(cost_settings_service, "get_export_connection", return_value=connection):
+            result = cost_settings_service.list_cost_settings_hotels()
+
+        self.assertEqual(result, [{
+            "enterpriseId": "00000000-0000-0000-0000-000000000001",
+            "hotelName": "Hotel A",
+        }])
+        self.assertIn("FROM enterprise_current", connection.cursor_instance.sql)
+
     def test_defaults_include_two_percent_card_cost(self):
-        result = cost_settings_service.validate_cost_settings("Hotel A", {})
+        result = cost_settings_service.validate_cost_settings(
+            "00000000-0000-0000-0000-000000000001", "Hotel A", {}
+        )
 
         self.assertEqual(result["profile"]["cardCostPercent"], 2)
         self.assertEqual(result["profile"]["breakfastCalculationBasis"], "guests")
 
     def test_complete_property_configuration_is_normalized(self):
-        result = cost_settings_service.validate_cost_settings(" Hotel A ", {
+        result = cost_settings_service.validate_cost_settings("00000000-0000-0000-0000-000000000001", " Hotel A ", {
             "profile": {"currency": "sek", "cardCostPercent": "2.5", "breakfastCalculationBasis": "products"},
             "distributionGroups": [{
                 "groupName": "OTA", "costPercent": "14.5",
@@ -39,7 +68,7 @@ class CostSettingsValidationTests(unittest.TestCase):
 
     def test_overlapping_thresholds_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "ranges cannot overlap"):
-            cost_settings_service.validate_cost_settings("Hotel A", {
+            cost_settings_service.validate_cost_settings("00000000-0000-0000-0000-000000000001", "Hotel A", {
                 "breakfastTiers": [
                     {"minGuests": 0, "maxGuests": 50, "staffHours": 0},
                     {"minGuests": 50, "maxGuests": 70, "staffHours": 4},
@@ -48,7 +77,7 @@ class CostSettingsValidationTests(unittest.TestCase):
 
     def test_percentages_above_one_hundred_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "between 0 and 100"):
-            cost_settings_service.validate_cost_settings("Hotel A", {
+            cost_settings_service.validate_cost_settings("00000000-0000-0000-0000-000000000001", "Hotel A", {
                 "profile": {"cardCostPercent": 101}
             })
 

@@ -1,8 +1,10 @@
 from decimal import Decimal, InvalidOperation
+from uuid import UUID
 
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
+from shared.db import get_export_connection
 
 
 PROFILE_FIELDS = (
@@ -32,26 +34,52 @@ def _json_row(row):
 
 def list_cost_settings_hotels():
     sql = """
-        SELECT DISTINCT hotel_name FROM (
-            SELECT hotel_name FROM functions.cost_property_settings
-            UNION ALL SELECT hotel_name FROM functions.room_revenue_night_data
-            UNION ALL SELECT hotel_name FROM functions.breakfast_data
-            UNION ALL SELECT hotel_name FROM functions.parking_data
-            UNION ALL SELECT hotel_name FROM functions.arr_dep_data
-        ) hotels
-        WHERE hotel_name IS NOT NULL AND trim(hotel_name) <> ''
-        ORDER BY hotel_name
+        SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
+        FROM enterprise_current
+        WHERE tenant_key = 'GCCH'
+          AND name IS NOT NULL
+          AND trim(name) <> ''
+        ORDER BY hotel_name, enterprise_id
     """
-    with cost_pool.connection() as connection:
+    with get_export_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(sql)
-            return [row[0] for row in cursor.fetchall()]
+            return [
+                {"enterpriseId": str(row["enterprise_id"]), "hotelName": row["hotel_name"]}
+                for row in cursor.fetchall()
+            ]
 
 
-def fetch_cost_settings(hotel_name):
+def _get_cost_settings_hotel(enterprise_id):
+    try:
+        enterprise_id = str(UUID(str(enterprise_id)))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("Enterprise ID must be a valid UUID") from None
+
+    with get_export_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id::text AS enterprise_id, trim(name)::text AS hotel_name
+                FROM enterprise_current
+                WHERE tenant_key = 'GCCH' AND id = %s
+                """,
+                (enterprise_id,),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise ValueError("Property was not found in enterprise_current")
+    return {"enterpriseId": str(row["enterprise_id"]), "hotelName": row["hotel_name"]}
+
+
+def fetch_cost_settings(enterprise_id, hotel_name=None):
+    if hotel_name is None:
+        property_record = _get_cost_settings_hotel(enterprise_id)
+        enterprise_id = property_record["enterpriseId"]
+        hotel_name = property_record["hotelName"]
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("SELECT * FROM functions.cost_property_settings WHERE hotel_name = %s", (hotel_name,))
+            cursor.execute("SELECT * FROM functions.cost_property_settings WHERE enterprise_id = %s", (enterprise_id,))
             profile_row = cursor.fetchone()
             profile = dict(DEFAULT_PROFILE)
             if profile_row:
@@ -63,23 +91,25 @@ def fetch_cost_settings(hotel_name):
                         ORDER BY r.distribution_rule_id) FILTER (WHERE r.distribution_rule_id IS NOT NULL), '[]') AS rules
                 FROM functions.cost_distribution_groups g
                 LEFT JOIN functions.cost_distribution_rules r USING (distribution_group_id)
-                WHERE g.hotel_name = %s GROUP BY g.distribution_group_id ORDER BY g.sort_order, g.distribution_group_id
-            """, (hotel_name,))
+                WHERE g.enterprise_id = %s GROUP BY g.distribution_group_id ORDER BY g.sort_order, g.distribution_group_id
+            """, (enterprise_id,))
             distribution = [_json_row(row) for row in cursor.fetchall()]
 
             collections = {}
             for name, query in {
-                "cleaningCategories": "SELECT category_name, min_guests, max_guests, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE hotel_name = %s ORDER BY sort_order, cleaning_category_id",
-                "arrivalTiers": "SELECT min_arrivals, max_arrivals, reception_hours FROM functions.cost_arrival_staffing_tiers WHERE hotel_name = %s ORDER BY sort_order, arrival_tier_id",
-                "breakfastTiers": "SELECT min_guests, max_guests, staff_hours FROM functions.cost_breakfast_staffing_tiers WHERE hotel_name = %s ORDER BY sort_order, breakfast_tier_id",
-                "fixedCosts": "SELECT cost_name, amount, cadence, active FROM functions.cost_fixed_lines WHERE hotel_name = %s ORDER BY sort_order, fixed_cost_line_id",
+                "cleaningCategories": "SELECT category_name, min_guests, max_guests, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE enterprise_id = %s ORDER BY sort_order, cleaning_category_id",
+                "arrivalTiers": "SELECT min_arrivals, max_arrivals, reception_hours FROM functions.cost_arrival_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, arrival_tier_id",
+                "breakfastTiers": "SELECT min_guests, max_guests, staff_hours FROM functions.cost_breakfast_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, breakfast_tier_id",
+                "fixedCosts": "SELECT cost_name, amount, cadence, active FROM functions.cost_fixed_lines WHERE enterprise_id = %s ORDER BY sort_order, fixed_cost_line_id",
             }.items():
-                cursor.execute(query, (hotel_name,))
+                cursor.execute(query, (enterprise_id,))
                 collections[name] = [_json_row(row) for row in cursor.fetchall()]
 
     profile.pop("hotelName", None)
+    profile.pop("enterpriseId", None)
     profile.pop("updatedAt", None)
-    return {"hotelName": hotel_name, "profile": profile, "distributionGroups": distribution, **collections}
+    resolved_name = profile_row["hotel_name"] if profile_row else hotel_name
+    return {"enterpriseId": enterprise_id, "hotelName": resolved_name, "profile": profile, "distributionGroups": distribution, **collections}
 
 
 def _number(value, label, maximum=None, integer=False):
@@ -120,7 +150,8 @@ def _validate_ranges(rows, min_key, max_key, label):
     return ranges
 
 
-def validate_cost_settings(hotel_name, payload):
+def validate_cost_settings(enterprise_id, hotel_name, payload):
+    enterprise_id = _required_text(enterprise_id, "Enterprise ID", 50)
     hotel_name = _required_text(hotel_name, "Hotel", 250)
     profile = payload.get("profile") or {}
     currency = _required_text(profile.get("currency", "SEK"), "Currency", 3).upper()
@@ -138,7 +169,7 @@ def validate_cost_settings(hotel_name, payload):
             continue
         clean_profile[key] = _number(profile.get(key, DEFAULT_PROFILE[key]), key, 100 if key in percent_fields else None)
 
-    result = {"hotelName": hotel_name, "profile": clean_profile}
+    result = {"enterpriseId": enterprise_id, "hotelName": hotel_name, "profile": clean_profile}
     groups = payload.get("distributionGroups") or []
     names = set()
     result["distributionGroups"] = []
@@ -178,19 +209,24 @@ def validate_cost_settings(hotel_name, payload):
     return result
 
 
-def save_cost_settings(hotel_name, payload):
-    data = validate_cost_settings(hotel_name, payload)
+def save_cost_settings(enterprise_id, payload):
+    property_record = _get_cost_settings_hotel(enterprise_id)
+    data = validate_cost_settings(
+        property_record["enterpriseId"],
+        property_record["hotelName"],
+        payload,
+    )
     p = data["profile"]
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("""INSERT INTO functions.cost_property_settings (hotel_name, currency, distribution_default_percent, cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent, breakfast_calculation_basis, breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour, breakfast_rent_percent, parking_rent_percent, card_cost_percent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (hotel_name) DO UPDATE SET currency=EXCLUDED.currency, distribution_default_percent=EXCLUDED.distribution_default_percent, cleaning_cost_per_minute=EXCLUDED.cleaning_cost_per_minute, reception_cost_per_hour=EXCLUDED.reception_cost_per_hour, room_rent_percent=EXCLUDED.room_rent_percent, breakfast_calculation_basis=EXCLUDED.breakfast_calculation_basis, breakfast_food_cost_per_guest=EXCLUDED.breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour=EXCLUDED.breakfast_staff_cost_per_hour, breakfast_rent_percent=EXCLUDED.breakfast_rent_percent, parking_rent_percent=EXCLUDED.parking_rent_percent, card_cost_percent=EXCLUDED.card_cost_percent, updated_at=now()""", (data["hotelName"], p["currency"], p["distributionDefaultPercent"], p["cleaningCostPerMinute"], p["receptionCostPerHour"], p["roomRentPercent"], p["breakfastCalculationBasis"], p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"], p["breakfastRentPercent"], p["parkingRentPercent"], p["cardCostPercent"]))
+            cursor.execute("""INSERT INTO functions.cost_property_settings (enterprise_id, hotel_name, currency, distribution_default_percent, cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent, breakfast_calculation_basis, breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour, breakfast_rent_percent, parking_rent_percent, card_cost_percent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (enterprise_id) DO UPDATE SET hotel_name=EXCLUDED.hotel_name, currency=EXCLUDED.currency, distribution_default_percent=EXCLUDED.distribution_default_percent, cleaning_cost_per_minute=EXCLUDED.cleaning_cost_per_minute, reception_cost_per_hour=EXCLUDED.reception_cost_per_hour, room_rent_percent=EXCLUDED.room_rent_percent, breakfast_calculation_basis=EXCLUDED.breakfast_calculation_basis, breakfast_food_cost_per_guest=EXCLUDED.breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour=EXCLUDED.breakfast_staff_cost_per_hour, breakfast_rent_percent=EXCLUDED.breakfast_rent_percent, parking_rent_percent=EXCLUDED.parking_rent_percent, card_cost_percent=EXCLUDED.card_cost_percent, updated_at=now()""", (data["enterpriseId"], data["hotelName"], p["currency"], p["distributionDefaultPercent"], p["cleaningCostPerMinute"], p["receptionCostPerHour"], p["roomRentPercent"], p["breakfastCalculationBasis"], p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"], p["breakfastRentPercent"], p["parkingRentPercent"], p["cardCostPercent"]))
             for table in ("cost_distribution_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers", "cost_fixed_lines"):
-                cursor.execute(f"DELETE FROM functions.{table} WHERE hotel_name = %s", (data["hotelName"],))
+                cursor.execute(f"DELETE FROM functions.{table} WHERE enterprise_id = %s", (data["enterpriseId"],))
             for order, group in enumerate(data["distributionGroups"]):
-                cursor.execute("INSERT INTO functions.cost_distribution_groups (hotel_name, group_name, cost_percent, sort_order) VALUES (%s,%s,%s,%s) RETURNING distribution_group_id", (data["hotelName"], group["groupName"], group["costPercent"], order)); group_id = cursor.fetchone()[0]
+                cursor.execute("INSERT INTO functions.cost_distribution_groups (enterprise_id, group_name, cost_percent, sort_order) VALUES (%s,%s,%s,%s) RETURNING distribution_group_id", (data["enterpriseId"], group["groupName"], group["costPercent"], order)); group_id = cursor.fetchone()[0]
                 cursor.executemany("INSERT INTO functions.cost_distribution_rules (distribution_group_id, match_type, match_value) VALUES (%s,%s,%s)", [(group_id, r["matchType"], r["matchValue"]) for r in group["rules"]])
-            cursor.executemany("INSERT INTO functions.cost_cleaning_categories (hotel_name, category_name, min_guests, max_guests, cleaning_minutes, linen_cost, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s)", [(data["hotelName"], r["categoryName"], r["minGuests"], r["maxGuests"], r["cleaningMinutes"], r["linenCost"], i) for i,r in enumerate(data["cleaningCategories"])])
-            cursor.executemany("INSERT INTO functions.cost_arrival_staffing_tiers (hotel_name, min_arrivals, max_arrivals, reception_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["hotelName"], r["minArrivals"], r["maxArrivals"], r["receptionHours"], i) for i,r in enumerate(data["arrivalTiers"])])
-            cursor.executemany("INSERT INTO functions.cost_breakfast_staffing_tiers (hotel_name, min_guests, max_guests, staff_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["hotelName"], r["minGuests"], r["maxGuests"], r["staffHours"], i) for i,r in enumerate(data["breakfastTiers"])])
-            cursor.executemany("INSERT INTO functions.cost_fixed_lines (hotel_name, cost_name, amount, cadence, active, sort_order) VALUES (%s,%s,%s,%s,%s,%s)", [(data["hotelName"], r["costName"], r["amount"], r["cadence"], r["active"], i) for i,r in enumerate(data["fixedCosts"])])
-    return fetch_cost_settings(data["hotelName"])
+            cursor.executemany("INSERT INTO functions.cost_cleaning_categories (enterprise_id, category_name, min_guests, max_guests, cleaning_minutes, linen_cost, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["categoryName"], r["minGuests"], r["maxGuests"], r["cleaningMinutes"], r["linenCost"], i) for i,r in enumerate(data["cleaningCategories"])])
+            cursor.executemany("INSERT INTO functions.cost_arrival_staffing_tiers (enterprise_id, min_arrivals, max_arrivals, reception_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minArrivals"], r["maxArrivals"], r["receptionHours"], i) for i,r in enumerate(data["arrivalTiers"])])
+            cursor.executemany("INSERT INTO functions.cost_breakfast_staffing_tiers (enterprise_id, min_guests, max_guests, staff_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minGuests"], r["maxGuests"], r["staffHours"], i) for i,r in enumerate(data["breakfastTiers"])])
+            cursor.executemany("INSERT INTO functions.cost_fixed_lines (enterprise_id, cost_name, amount, cadence, active, sort_order) VALUES (%s,%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["costName"], r["amount"], r["cadence"], r["active"], i) for i,r in enumerate(data["fixedCosts"])])
+    return fetch_cost_settings(data["enterpriseId"], data["hotelName"])

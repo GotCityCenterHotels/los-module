@@ -1,7 +1,8 @@
 CREATE SCHEMA IF NOT EXISTS functions;
 
 CREATE TABLE IF NOT EXISTS functions.cost_property_settings (
-    hotel_name text PRIMARY KEY,
+    enterprise_id uuid PRIMARY KEY,
+    hotel_name text NOT NULL,
     currency text NOT NULL DEFAULT 'SEK',
     distribution_default_percent numeric(7, 4) NOT NULL DEFAULT 0,
     cleaning_cost_per_minute numeric(18, 4) NOT NULL DEFAULT 0,
@@ -29,11 +30,11 @@ CREATE TABLE IF NOT EXISTS functions.cost_property_settings (
 
 CREATE TABLE IF NOT EXISTS functions.cost_distribution_groups (
     distribution_group_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    hotel_name text NOT NULL REFERENCES functions.cost_property_settings(hotel_name) ON DELETE CASCADE,
+    enterprise_id uuid NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
     group_name text NOT NULL,
     cost_percent numeric(7, 4) NOT NULL,
     sort_order integer NOT NULL DEFAULT 0,
-    UNIQUE (hotel_name, group_name),
+    UNIQUE (enterprise_id, group_name),
     CHECK (cost_percent BETWEEN 0 AND 100)
 );
 
@@ -47,14 +48,14 @@ CREATE TABLE IF NOT EXISTS functions.cost_distribution_rules (
 
 CREATE TABLE IF NOT EXISTS functions.cost_cleaning_categories (
     cleaning_category_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    hotel_name text NOT NULL REFERENCES functions.cost_property_settings(hotel_name) ON DELETE CASCADE,
+    enterprise_id uuid NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
     category_name text NOT NULL,
     min_guests integer NOT NULL DEFAULT 1,
     max_guests integer,
     cleaning_minutes numeric(10, 2) NOT NULL DEFAULT 0,
     linen_cost numeric(18, 4) NOT NULL DEFAULT 0,
     sort_order integer NOT NULL DEFAULT 0,
-    UNIQUE (hotel_name, category_name),
+    UNIQUE (enterprise_id, category_name),
     CHECK (min_guests >= 0),
     CHECK (max_guests IS NULL OR max_guests >= min_guests),
     CHECK (cleaning_minutes >= 0),
@@ -63,7 +64,7 @@ CREATE TABLE IF NOT EXISTS functions.cost_cleaning_categories (
 
 CREATE TABLE IF NOT EXISTS functions.cost_arrival_staffing_tiers (
     arrival_tier_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    hotel_name text NOT NULL REFERENCES functions.cost_property_settings(hotel_name) ON DELETE CASCADE,
+    enterprise_id uuid NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
     min_arrivals integer NOT NULL,
     max_arrivals integer,
     reception_hours numeric(10, 2) NOT NULL,
@@ -75,7 +76,7 @@ CREATE TABLE IF NOT EXISTS functions.cost_arrival_staffing_tiers (
 
 CREATE TABLE IF NOT EXISTS functions.cost_breakfast_staffing_tiers (
     breakfast_tier_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    hotel_name text NOT NULL REFERENCES functions.cost_property_settings(hotel_name) ON DELETE CASCADE,
+    enterprise_id uuid NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
     min_guests integer NOT NULL,
     max_guests integer,
     staff_hours numeric(10, 2) NOT NULL,
@@ -87,18 +88,19 @@ CREATE TABLE IF NOT EXISTS functions.cost_breakfast_staffing_tiers (
 
 CREATE TABLE IF NOT EXISTS functions.cost_fixed_lines (
     fixed_cost_line_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    hotel_name text NOT NULL REFERENCES functions.cost_property_settings(hotel_name) ON DELETE CASCADE,
+    enterprise_id uuid NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
     cost_name text NOT NULL,
     amount numeric(18, 4) NOT NULL,
     cadence text NOT NULL DEFAULT 'monthly' CHECK (cadence IN ('daily', 'monthly', 'yearly')),
     active boolean NOT NULL DEFAULT true,
     sort_order integer NOT NULL DEFAULT 0,
-    UNIQUE (hotel_name, cost_name),
+    UNIQUE (enterprise_id, cost_name),
     CHECK (amount >= 0)
 );
 
-CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_hotel ON functions.cost_distribution_groups(hotel_name);
-CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_hotel ON functions.cost_cleaning_categories(hotel_name);
-CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_hotel ON functions.cost_arrival_staffing_tiers(hotel_name);
-CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_hotel ON functions.cost_breakfast_staffing_tiers(hotel_name);
-CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_hotel ON functions.cost_fixed_lines(hotel_name);
+CREATE INDEX IF NOT EXISTS ix_cost_property_settings_hotel_name ON functions.cost_property_settings(hotel_name);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_enterprise ON functions.cost_distribution_groups(enterprise_id);
+CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.cost_cleaning_categories(enterprise_id);
+CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);
+CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_enterprise ON functions.cost_breakfast_staffing_tiers(enterprise_id);
+CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_enterprise ON functions.cost_fixed_lines(enterprise_id);
