@@ -2,6 +2,7 @@ from decimal import Decimal, InvalidOperation
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
+from services.cost_schema_service import ensure_cost_settings_schema
 from shared.db import get_export_connection
 
 
@@ -68,6 +69,7 @@ def _get_cost_settings_hotel(enterprise_id):
 
 
 def fetch_cost_settings(enterprise_id, hotel_name=None):
+    ensure_cost_settings_schema()
     if hotel_name is None:
         property_record = _get_cost_settings_hotel(enterprise_id)
         enterprise_id = property_record["enterpriseId"]
@@ -205,6 +207,7 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
 
 
 def save_cost_settings(enterprise_id, payload):
+    ensure_cost_settings_schema()
     property_record = _get_cost_settings_hotel(enterprise_id)
     data = validate_cost_settings(
         property_record["enterpriseId"],

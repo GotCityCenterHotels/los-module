@@ -245,4 +245,5 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
         return json_response({"error": str(error)}, 400)
     except Exception:
         logging.exception("Cost settings endpoint failed enterprise_id=%s", enterprise_id)
-        return json_response({"error": "Unable to save cost settings"}, 500)
+        action = "retrieve" if req.method == "GET" else "save"
+        return json_response({"error": f"Unable to {action} cost settings"}, 500)
