@@ -78,28 +78,36 @@
     function setDirty(value){dirty=value;dirtyState.textContent=value?"Unsaved changes":"No unsaved changes";dirtyState.classList.toggle("is-dirty",value)}
     function setBusy(value){save.disabled=value;hotel.disabled=value;document.querySelector(".settings-workspace").setAttribute("aria-busy",String(value))}
     function showError(error){errorPanel.textContent=error.message||"Unable to load cost settings.";errorPanel.hidden=false;status.textContent="Something went wrong."}
+    // Must match the DATASETS keys in shared/pipeline.py. Imported one at a time
+    // (rather than dataset:"all" in one call) so each request stays inside the
+    // ~45s timeout Static Web Apps enforces on calls to a linked backend.
+    const IMPORT_DATASETS = ["properties","parking","room_revenue","total_payment","arr_dep","breakfast"];
     async function runImport(){
         if(!confirm("Import all cost datasets now? This can take a while.")) return;
-        importButton.disabled=true; errorPanel.hidden=true; status.textContent="Running cost data import...";
+        importButton.disabled=true; errorPanel.hidden=true;
+        const failures = [];
         try {
-            const result = await LosApi.fetchJson("/api/costdata/import", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({dataset: "all"})
-            });
-            const datasetResults = result.results || [];
-            const succeeded = datasetResults.filter(row => row.status === "success").length;
-            if (result.status === "success") {
-                status.textContent = `Import complete (${succeeded}/${datasetResults.length} datasets).`;
+            for (const [index, dataset] of IMPORT_DATASETS.entries()) {
+                status.textContent = `Running cost data import... (${dataset}, ${index + 1}/${IMPORT_DATASETS.length})`;
+                try {
+                    const result = await LosApi.fetchJson("/api/costdata/import", {
+                        method: "POST",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({dataset})
+                    });
+                    const row = (result.results || [])[0];
+                    if (row && row.status !== "success") failures.push(`${dataset}: ${row.error}`);
+                }
+                catch (error) { failures.push(`${dataset}: ${error.message}`); }
+            }
+            if (failures.length) {
+                showError(new Error(`Import finished with failures: ${failures.join("; ")}`));
             }
             else {
-                const failures = datasetResults.filter(row => row.status !== "success")
-                    .map(row => `${row.dataset}: ${row.error}`).join("; ");
-                showError(new Error(`Import finished with failures: ${failures}`));
+                status.textContent = `Import complete (${IMPORT_DATASETS.length}/${IMPORT_DATASETS.length} datasets).`;
             }
             await loadHotels();
         }
-        catch (error) { showError(error); }
         finally { importButton.disabled=false; }
     }
     importButton.onclick=runImport;

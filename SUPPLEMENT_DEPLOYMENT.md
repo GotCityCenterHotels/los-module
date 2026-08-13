@@ -97,6 +97,21 @@ Backfill individual snapshot dates during approved off-peak periods:
 python backfill_supplement.py 2026-08-12
 ```
 
+Backfill an inclusive range with one independently committed snapshot date at a
+time. This is intentionally not one large source query. A small pause can be
+added to reduce sustained load on `integration_db`:
+
+```powershell
+python backfill_supplement.py 2025-08-13 2026-08-14 --pause-seconds 2
+```
+
+The command reports progress and prints the exact command to resume from the
+failed or interrupted date. Re-importing a completed date is safe because its
+published rows are transactionally replaced. Do not run the range backfill in
+parallel. If it overlaps the 02:15 daily timer, the advisory lock permits only
+one synchronization; run a manual delta after the backfill if that daily run was
+skipped.
+
 The command is resumable because every snapshot import transactionally replaces
 that snapshot in Database A. Inventory before 2026-02-27 uses current inventory
 and is published with `inventoryQuality=approximated-current`; inventory on or
