@@ -1,0 +1,89 @@
+import os
+import unittest
+
+from datetime import date
+from unittest.mock import patch
+
+
+os.environ.setdefault("DB_HOST", "localhost")
+os.environ.setdefault("DB_NAME", "integration_db")
+os.environ.setdefault("DB_USER", "test")
+os.environ.setdefault("DB_PASSWORD", "not-used")
+os.environ.setdefault("POSTGRES_HOST", "localhost")
+os.environ.setdefault("POSTGRES_DB", "app-test")
+os.environ.setdefault("POSTGRES_USER", "app-test")
+os.environ.setdefault("POSTGRES_PASSWORD", "not-used")
+
+from services import supplement_service
+from services import supplement_sync_service
+
+
+class SupplementDomainTests(unittest.TestCase):
+    def test_same_weekday_uses_364_day_module_convention(self):
+        source = date(2026, 8, 13)
+        shifted = supplement_service.shift_last_year(source, "sameWeekday")
+        self.assertEqual(shifted, date(2025, 8, 14))
+        self.assertEqual(source.weekday(), shifted.weekday())
+
+    def test_same_date_clamps_leap_day(self):
+        self.assertEqual(
+            supplement_service.shift_last_year(date(2024, 2, 29), "sameDate"),
+            date(2023, 2, 28),
+        )
+
+    def test_grid_range_is_limited_to_366_days(self):
+        self.assertEqual(
+            supplement_service.validate_date_range(date(2024, 1, 1), date(2024, 12, 31)),
+            366,
+        )
+        with self.assertRaisesRegex(ValueError, "366 days"):
+            supplement_service.validate_date_range(date(2024, 1, 1), date(2025, 1, 1))
+
+    def test_metrics_are_weighted_from_additive_facts(self):
+        metrics = supplement_service.calculate_metrics(50, 100000, 80)
+        self.assertEqual(metrics["occ"], 62.5)
+        self.assertEqual(metrics["adr"], 2000)
+        self.assertEqual(metrics["revpar"], 1250)
+
+    def test_sync_horizon_adds_eighteen_months(self):
+        self.assertEqual(
+            supplement_sync_service.add_months(date(2024, 8, 31), 18),
+            date(2026, 2, 28),
+        )
+
+
+class SupplementApiBoundaryTests(unittest.TestCase):
+    def test_all_read_services_use_only_database_a_pool(self):
+        calls = (
+            supplement_service.fetch_supplement_status,
+            supplement_service.list_supplement_hotels,
+            lambda: supplement_service.fetch_supplement_grid(
+                date(2026, 8, 1), date(2026, 8, 7)
+            ),
+            lambda: supplement_service.fetch_supplement_detail(
+                "Hotel A", date(2026, 8, 1), None, "sameDate"
+            ),
+        )
+        for call in calls:
+            with self.subTest(call=call), patch.object(
+                supplement_service,
+                "ensure_supplement_schema",
+            ), patch.object(
+                supplement_service,
+                "stockholm_today",
+                return_value=date(2026, 8, 13),
+            ), patch.object(
+                supplement_service.cost_pool,
+                "connection",
+                side_effect=RuntimeError("database-a-probe"),
+            ), patch(
+                "queries.supplement_source.get_export_connection",
+                side_effect=AssertionError("integration_db must not be opened"),
+            ) as source:
+                with self.assertRaisesRegex(RuntimeError, "database-a-probe"):
+                    call()
+                source.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

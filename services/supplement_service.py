@@ -1,0 +1,607 @@
+import logging
+
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from threading import Lock
+from zoneinfo import ZoneInfo
+
+from psycopg.rows import dict_row
+
+from cost_database import cost_pool
+from services.supplement_schema_service import ensure_supplement_schema
+
+
+MAX_GRID_DAYS = 366
+STALE_AFTER_HOURS = 36
+VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
+
+_grid_cache = {}
+_grid_cache_lock = Lock()
+_detail_cache = {}
+_detail_cache_lock = Lock()
+STOCKHOLM_TIME_ZONE = ZoneInfo("Europe/Stockholm")
+
+
+class SupplementUnavailableError(RuntimeError):
+    pass
+
+
+def shift_last_year(value, basis):
+    if basis == "sameWeekday":
+        return value - timedelta(days=364)
+    target_year = value.year - 1
+    try:
+        return value.replace(year=target_year)
+    except ValueError:
+        return value.replace(year=target_year, day=28)
+
+
+def stockholm_today():
+    return datetime.now(STOCKHOLM_TIME_ZONE).date()
+
+
+def add_months(value, months):
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    last_day = (next_month - timedelta(days=1)).day
+    return date(year, month, min(value.day, last_day))
+
+
+def validate_date_range(start_date, end_date):
+    if start_date > end_date:
+        raise ValueError("startDate cannot be after endDate")
+    day_count = (end_date - start_date).days + 1
+    if day_count > MAX_GRID_DAYS:
+        raise ValueError(f"Supplement ranges are limited to {MAX_GRID_DAYS} days")
+    return day_count
+
+
+def calculate_metrics(assigned_rooms, room_revenue, inventory):
+    assigned = float(assigned_rooms or 0)
+    revenue = float(room_revenue or 0)
+    available = float(inventory or 0)
+    return {
+        "occ": assigned / available * 100 if available > 0 else None,
+        "adr": revenue / assigned if assigned > 0 else None,
+        "revpar": revenue / available if available > 0 else None,
+        "assignedRooms": assigned,
+        "revenue": revenue,
+        "inventory": available,
+    }
+
+
+def _empty_fact():
+    return {"assigned_rooms": Decimal(0), "room_revenue": Decimal(0), "total_space": Decimal(0)}
+
+
+def _add_fact(total, fact):
+    if fact:
+        total["assigned_rooms"] += fact.get("assigned_rooms") or 0
+        total["room_revenue"] += fact.get("room_revenue") or 0
+        total["total_space"] += fact.get("total_space") or 0
+    return total
+
+
+def _metric_fact(fact):
+    fact = fact or _empty_fact()
+    return calculate_metrics(fact["assigned_rooms"], fact["room_revenue"], fact["total_space"])
+
+
+def _publication(cursor, required=True):
+    cursor.execute("""
+        SELECT p.run_id, p.data_as_of, p.published_at,
+               c.minimum_stay_date, c.maximum_stay_date,
+               c.minimum_snapshot_date, c.maximum_snapshot_date
+        FROM functions.supplement_publication p
+        LEFT JOIN functions.supplement_coverage c ON c.singleton
+        WHERE p.singleton
+    """)
+    row = cursor.fetchone()
+    if row is None and required:
+        raise SupplementUnavailableError("Supplement data has not been published yet")
+    return row
+
+
+def _status_payload(publication):
+    if publication is None:
+        return {
+            "status": "unavailable",
+            "dataAsOf": None,
+            "publishedAt": None,
+            "stale": True,
+            "coverage": None,
+        }
+    published_at = publication["published_at"]
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    stale = datetime.now(timezone.utc) - published_at > timedelta(hours=STALE_AFTER_HOURS)
+    coverage = None
+    if publication.get("minimum_stay_date"):
+        coverage = {
+            "minimumStayDate": publication["minimum_stay_date"].isoformat(),
+            "maximumStayDate": publication["maximum_stay_date"].isoformat(),
+            "minimumSnapshotDate": publication["minimum_snapshot_date"].isoformat(),
+            "maximumSnapshotDate": publication["maximum_snapshot_date"].isoformat(),
+        }
+    return {
+        "status": "stale" if stale else "available",
+        "runId": publication["run_id"],
+        "dataAsOf": publication["data_as_of"].isoformat(),
+        "publishedAt": published_at.isoformat(),
+        "stale": stale,
+        "coverage": coverage,
+    }
+
+
+def fetch_supplement_status():
+    ensure_supplement_schema()
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            return _status_payload(_publication(cursor, required=False))
+
+
+def list_supplement_hotels():
+    ensure_supplement_schema()
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            publication = _publication(cursor, required=False)
+            cursor.execute("""
+                SELECT hotel_code, hotel_name
+                FROM functions.supplement_hotels
+                WHERE active
+                ORDER BY hotel_name, hotel_code
+            """)
+            hotels = [
+                {"code": row["hotel_code"], "name": row["hotel_name"]}
+                for row in cursor.fetchall()
+            ]
+            cursor.execute("""
+                SELECT hotel_code, space_room_name, short_name, sort_order
+                FROM functions.supplement_room_categories
+                ORDER BY hotel_code, sort_order, space_room_name
+            """)
+            categories = defaultdict(list)
+            for row in cursor.fetchall():
+                categories[row["hotel_code"]].append({
+                    "code": row["space_room_name"],
+                    "name": row["space_room_name"],
+                    "shortName": row["short_name"],
+                    "order": row["sort_order"],
+                })
+            return {
+                **_status_payload(publication),
+                "hotels": hotels,
+                "categoriesByHotel": dict(categories),
+            }
+
+
+def _load_latest_facts(cursor, minimum_date, maximum_date, hotel_codes):
+    cursor.execute("""
+        SELECT i.stay_date, i.hotel_code, i.space_room_name,
+               coalesce(c.assigned_rooms, 0) AS assigned_rooms,
+               coalesce(c.room_revenue, 0) AS room_revenue,
+               i.total_space
+        FROM functions.supplement_latest_inventory i
+        LEFT JOIN functions.supplement_latest_category c
+          USING (stay_date, hotel_code, space_room_name, snapshot_date)
+        WHERE i.stay_date BETWEEN %s AND %s
+          AND i.hotel_code = ANY(%s)
+    """, (minimum_date, maximum_date, hotel_codes))
+    return {
+        (row["hotel_code"], row["stay_date"], row["space_room_name"]): row
+        for row in cursor.fetchall()
+    }
+
+
+def _load_spit_facts(cursor, minimum_date, maximum_date, hotel_codes, as_of_date):
+    cursor.execute("""
+        WITH chosen_stays AS (
+            SELECT stay_date, hotel_code, max(snapshot_date) AS snapshot_date
+            FROM functions.supplement_snapshot_inventory
+            WHERE stay_date BETWEEN %s AND %s
+              AND hotel_code = ANY(%s)
+              AND snapshot_date <= %s
+            GROUP BY stay_date, hotel_code
+        ),
+        chosen_inventory AS (
+            SELECT i.stay_date, i.hotel_code, i.space_room_name,
+                   i.snapshot_date, i.total_space
+            FROM functions.supplement_snapshot_inventory i
+            JOIN chosen_stays s USING (stay_date, hotel_code, snapshot_date)
+        )
+        SELECT i.stay_date, i.hotel_code, i.space_room_name,
+               coalesce(c.assigned_rooms, 0) AS assigned_rooms,
+               coalesce(c.room_revenue, 0) AS room_revenue,
+               i.total_space
+        FROM chosen_inventory i
+        LEFT JOIN functions.supplement_snapshot_category c
+          USING (stay_date, hotel_code, space_room_name, snapshot_date)
+    """, (minimum_date, maximum_date, hotel_codes, as_of_date))
+    return {
+        (row["hotel_code"], row["stay_date"], row["space_room_name"]): row
+        for row in cursor.fetchall()
+    }
+
+
+def _cell_for_categories(source, hotel_code, stay_date, categories):
+    total = _empty_fact()
+    for category in categories:
+        _add_fact(total, source.get((hotel_code, stay_date, category)))
+    return total
+
+
+def _build_dates(start_date, end_date, basis, today):
+    dates = []
+    current = start_date
+    while current <= end_date:
+        dates.append({
+            "date": current.isoformat(),
+            "lyDate": shift_last_year(current, basis).isoformat(),
+            "isPast": current < today,
+            "isWeekend": current.weekday() in {4, 5},
+        })
+        current += timedelta(days=1)
+    return dates
+
+
+def _row_cells(hotel_codes, categories_by_hotel, dates, latest, spit):
+    cells = []
+    for date_info in dates:
+        stay_date = date.fromisoformat(date_info["date"])
+        ly_date = date.fromisoformat(date_info["lyDate"])
+        facts = {"today": _empty_fact(), "ly": _empty_fact(), "spit": _empty_fact()}
+        for hotel_code in hotel_codes:
+            categories = categories_by_hotel.get(hotel_code, [])
+            _add_fact(facts["today"], _cell_for_categories(latest, hotel_code, stay_date, categories))
+            _add_fact(facts["ly"], _cell_for_categories(latest, hotel_code, ly_date, categories))
+            _add_fact(facts["spit"], _cell_for_categories(spit, hotel_code, ly_date, categories))
+        cells.append({key: _metric_fact(value) for key, value in facts.items()})
+    return cells
+
+
+def fetch_supplement_grid(
+    start_date,
+    end_date,
+    mode="single",
+    hotel_codes=None,
+    room_categories=None,
+    ly_comparison_basis="sameDate",
+):
+    validate_date_range(start_date, end_date)
+    today = stockholm_today()
+    minimum_allowed = add_months(today, -36)
+    maximum_allowed = add_months(today, 18)
+    if start_date < minimum_allowed or end_date > maximum_allowed:
+        raise ValueError(
+            f"Supplement stay dates must be between {minimum_allowed} and {maximum_allowed}"
+        )
+    if mode not in {"single", "comparison"}:
+        raise ValueError("mode must be single or comparison")
+    if ly_comparison_basis not in VALID_LY_COMPARISONS:
+        raise ValueError("lyComparisonBasis must be sameDate or sameWeekday")
+    requested_hotels = tuple(sorted(set(hotel_codes or ())))
+    requested_categories = tuple(sorted(set(room_categories or ())))
+    ensure_supplement_schema()
+
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            publication = _publication(cursor)
+            status = _status_payload(publication)
+            coverage = status.get("coverage")
+            if coverage and (
+                start_date < date.fromisoformat(coverage["minimumStayDate"])
+                or end_date > date.fromisoformat(coverage["maximumStayDate"])
+            ):
+                raise SupplementUnavailableError(
+                    "The selected dates have not been backfilled into PostgreSQL"
+                )
+            cache_key = (
+                publication["run_id"], status["status"], start_date, end_date, mode,
+                requested_hotels, requested_categories,
+                ly_comparison_basis,
+            )
+            with _grid_cache_lock:
+                cached = _grid_cache.get(cache_key)
+            if cached is not None:
+                logging.info("Supplement grid cache hit run_id=%s", publication["run_id"])
+                return cached
+            logging.info("Supplement grid cache miss run_id=%s", publication["run_id"])
+            cursor.execute("""
+                SELECT hotel_code, hotel_name
+                FROM functions.supplement_hotels
+                WHERE active ORDER BY hotel_name, hotel_code
+            """)
+            hotel_lookup = {row["hotel_code"]: row["hotel_name"] for row in cursor.fetchall()}
+            requested_hotel_set = set(requested_hotels)
+            selected_hotels = [code for code in hotel_lookup if code in requested_hotel_set]
+            if not selected_hotels and hotel_lookup:
+                selected_hotels = [next(iter(hotel_lookup))] if mode == "single" else list(hotel_lookup)
+            if not selected_hotels:
+                raise SupplementUnavailableError("No Supplement hotels are available")
+            if mode == "single":
+                selected_hotels = selected_hotels[:1]
+
+            cursor.execute("""
+                SELECT hotel_code, space_room_name, short_name, sort_order
+                FROM functions.supplement_room_categories
+                WHERE hotel_code = ANY(%s)
+                ORDER BY hotel_code, sort_order, space_room_name
+            """, (selected_hotels,))
+            category_metadata = defaultdict(list)
+            short_names = {}
+            for row in cursor.fetchall():
+                category_metadata[row["hotel_code"]].append(row["space_room_name"])
+                short_names[(row["hotel_code"], row["space_room_name"])] = row["short_name"]
+            if mode == "single" and requested_categories:
+                allowed = set(requested_categories)
+                category_metadata[selected_hotels[0]] = [
+                    item for item in category_metadata[selected_hotels[0]] if item in allowed
+                ]
+
+            ly_start = shift_last_year(start_date, ly_comparison_basis)
+            ly_end = shift_last_year(end_date, ly_comparison_basis)
+            latest = _load_latest_facts(cursor, min(start_date, ly_start), max(end_date, ly_end), selected_hotels)
+            spit_as_of = shift_last_year(publication["data_as_of"], ly_comparison_basis)
+            spit = _load_spit_facts(cursor, ly_start, ly_end, selected_hotels, spit_as_of)
+            dates = _build_dates(start_date, end_date, ly_comparison_basis, today)
+
+            rows = []
+            if mode == "single":
+                hotel_code = selected_hotels[0]
+                for category in category_metadata[hotel_code]:
+                    rows.append({
+                        "rowType": "category",
+                        "code": category,
+                        "label": category,
+                        "shortLabel": short_names.get((hotel_code, category), category[:8].upper()),
+                        "isTotal": False,
+                        "cells": _row_cells(
+                            [hotel_code], {hotel_code: [category]}, dates, latest, spit
+                        ),
+                    })
+                if category_metadata[hotel_code]:
+                    rows.append({
+                        "rowType": "category",
+                        "code": "total",
+                        "label": "Selected categories",
+                        "shortLabel": "Total",
+                        "isTotal": True,
+                        "cells": _row_cells(
+                            [hotel_code], category_metadata, dates, latest, spit
+                        ),
+                    })
+            else:
+                for hotel_code in selected_hotels:
+                    rows.append({
+                        "rowType": "hotel",
+                        "code": hotel_code,
+                        "label": hotel_lookup[hotel_code],
+                        "shortLabel": hotel_lookup[hotel_code],
+                        "isTotal": False,
+                        "cells": _row_cells(
+                            [hotel_code], category_metadata, dates, latest, spit
+                        ),
+                    })
+                rows.append({
+                    "rowType": "hotel",
+                    "code": "total",
+                    "label": "Selected hotels",
+                    "shortLabel": "Total",
+                    "isTotal": True,
+                    "cells": _row_cells(selected_hotels, category_metadata, dates, latest, spit),
+                })
+
+            payload = {
+                **status,
+                "parameters": {
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                    "mode": mode,
+                    "hotelCodes": selected_hotels,
+                    "lyComparisonBasis": ly_comparison_basis,
+                },
+                "dates": dates,
+                "rows": rows,
+                "totals": next((row for row in reversed(rows) if row["isTotal"]), None),
+            }
+            with _grid_cache_lock:
+                if len(_grid_cache) >= 128:
+                    _grid_cache.clear()
+                _grid_cache[cache_key] = payload
+            return payload
+
+
+def _detail_rows(cursor, table, hotel_code, stay_date, category, as_of=None):
+    category_clause = "AND space_room_name = %(category)s" if category else ""
+    if table == "latest":
+        cursor.execute(f"""
+            SELECT requested_room_name, sum(assigned_rooms) AS assigned_rooms,
+                   sum(room_revenue) AS room_revenue
+            FROM functions.supplement_latest_detail
+            WHERE hotel_code = %(hotel_code)s AND stay_date = %(stay_date)s
+              {category_clause}
+            GROUP BY requested_room_name
+        """, {"hotel_code": hotel_code, "stay_date": stay_date, "category": category})
+    else:
+        detail_category_clause = "AND d.space_room_name = %(category)s" if category else ""
+        cursor.execute(f"""
+            WITH chosen AS (
+                SELECT max(snapshot_date) AS snapshot_date
+                FROM functions.supplement_snapshot_inventory
+                WHERE hotel_code = %(hotel_code)s AND stay_date = %(stay_date)s
+                  AND snapshot_date <= %(as_of)s
+            )
+            SELECT d.requested_room_name, sum(d.assigned_rooms) AS assigned_rooms,
+                   sum(d.room_revenue) AS room_revenue
+            FROM functions.supplement_snapshot_detail d, chosen c
+            WHERE d.hotel_code = %(hotel_code)s AND d.stay_date = %(stay_date)s
+              AND d.snapshot_date = c.snapshot_date {detail_category_clause}
+            GROUP BY d.requested_room_name
+        """, {
+            "hotel_code": hotel_code, "stay_date": stay_date,
+            "category": category, "as_of": as_of,
+        })
+    return cursor.fetchall()
+
+
+def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
+    category_clause = "AND i.space_room_name = %(category)s" if category else ""
+    cursor.execute(f"""
+        SELECT i.snapshot_date, coalesce(sum(c.assigned_rooms), 0) AS assigned_rooms,
+               coalesce(sum(c.room_revenue), 0) AS room_revenue,
+               sum(i.total_space) AS total_space,
+               sum(i.space_to_sell) AS space_to_sell
+        FROM functions.supplement_snapshot_inventory i
+        LEFT JOIN functions.supplement_snapshot_category c
+          USING (snapshot_date, stay_date, hotel_code, space_room_name)
+        WHERE i.hotel_code = %(hotel_code)s AND i.stay_date = %(stay_date)s
+          AND i.snapshot_date BETWEEN (%(stay_date)s - 366) AND (%(stay_date)s + 7)
+          AND i.snapshot_date <= %(maximum_snapshot_date)s
+          {category_clause}
+        GROUP BY i.snapshot_date
+        ORDER BY i.snapshot_date
+    """, {
+        "hotel_code": hotel_code,
+        "stay_date": stay_date,
+        "category": category,
+        "maximum_snapshot_date": maximum_snapshot_date,
+    })
+    return cursor.fetchall()
+
+
+def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis):
+    if ly_comparison_basis not in VALID_LY_COMPARISONS:
+        raise ValueError("lyComparisonBasis must be sameDate or sameWeekday")
+    today = stockholm_today()
+    minimum_allowed = add_months(today, -36)
+    maximum_allowed = add_months(today, 18)
+    if stay_date < minimum_allowed or stay_date > maximum_allowed:
+        raise ValueError(
+            f"Supplement stay dates must be between {minimum_allowed} and {maximum_allowed}"
+        )
+    ensure_supplement_schema()
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            publication = _publication(cursor)
+            status = _status_payload(publication)
+            cache_key = (
+                publication["run_id"], status["status"], hotel_code, stay_date, category,
+                ly_comparison_basis,
+            )
+            with _detail_cache_lock:
+                cached = _detail_cache.get(cache_key)
+            if cached is not None:
+                logging.info("Supplement detail cache hit run_id=%s", publication["run_id"])
+                return cached
+            logging.info("Supplement detail cache miss run_id=%s", publication["run_id"])
+            comparison_date = shift_last_year(stay_date, ly_comparison_basis)
+            coverage = status.get("coverage")
+            if coverage and (
+                comparison_date < date.fromisoformat(coverage["minimumStayDate"])
+                or stay_date > date.fromisoformat(coverage["maximumStayDate"])
+            ):
+                raise SupplementUnavailableError(
+                    "The selected detail date has not been backfilled into PostgreSQL"
+                )
+            cursor.execute(
+                "SELECT 1 FROM functions.supplement_hotels WHERE active AND hotel_code = %s",
+                (hotel_code,),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError("Unknown Supplement hotel")
+            if category:
+                cursor.execute("""
+                    SELECT 1 FROM functions.supplement_room_categories
+                    WHERE hotel_code = %s AND space_room_name = %s
+                """, (hotel_code, category))
+                if cursor.fetchone() is None:
+                    raise ValueError("Unknown Supplement room category")
+            future = stay_date >= today
+            comparison_as_of = shift_last_year(publication["data_as_of"], ly_comparison_basis)
+            current_rows = _detail_rows(cursor, "latest", hotel_code, stay_date, category)
+            comparison_rows = _detail_rows(
+                cursor,
+                "snapshot" if future else "latest",
+                hotel_code,
+                comparison_date,
+                category,
+                comparison_as_of,
+            )
+            comparison_map = {row["requested_room_name"]: row for row in comparison_rows}
+            requested_names = sorted({row["requested_room_name"] for row in current_rows} | set(comparison_map))
+            current_map = {row["requested_room_name"]: row for row in current_rows}
+            breakdown = []
+            for name in requested_names:
+                current = current_map.get(name) or {}
+                comparison = comparison_map.get(name) or {}
+                current_rooms = float(current.get("assigned_rooms") or 0)
+                comparison_rooms = float(comparison.get("assigned_rooms") or 0)
+                breakdown.append({
+                    "requestedRoomName": name,
+                    "assignedRooms": current_rooms,
+                    "averagePrice": float(current.get("room_revenue") or 0) / current_rooms if current_rooms else None,
+                    "comparisonAssignedRooms": comparison_rooms,
+                    "comparisonAveragePrice": float(comparison.get("room_revenue") or 0) / comparison_rooms if comparison_rooms else None,
+                })
+
+            cursor.execute("""
+                SELECT sum(total_space) AS total_space,
+                       sum(space_to_sell) AS space_to_sell
+                FROM functions.supplement_latest_inventory
+                WHERE hotel_code = %s AND stay_date = %s
+                  AND (%s IS NULL OR space_room_name = %s)
+            """, (hotel_code, stay_date, category, category))
+            inventory = cursor.fetchone()
+            pickup = []
+            for row in _pickup_rows(
+                cursor, hotel_code, stay_date, category, publication["data_as_of"]
+            ):
+                rooms = float(row["assigned_rooms"] or 0)
+                pickup.append({
+                    "viewDate": row["snapshot_date"].isoformat(),
+                    "daysBeforeStay": max((stay_date - row["snapshot_date"]).days, 0),
+                    "assignedRooms": rooms,
+                    "averagePrice": float(row["room_revenue"] or 0) / rooms if rooms else None,
+                    "totalSpace": float(row["total_space"] or 0),
+                    "spaceToSell": float(row["space_to_sell"] or 0),
+                })
+            comparison_pickup = []
+            comparison_pickup_cutoff = comparison_as_of if future else comparison_date + timedelta(days=7)
+            for row in _pickup_rows(
+                cursor, hotel_code, comparison_date, category, comparison_pickup_cutoff
+            ):
+                rooms = float(row["assigned_rooms"] or 0)
+                comparison_pickup.append({
+                    "viewDate": row["snapshot_date"].isoformat(),
+                    "daysBeforeStay": max((comparison_date - row["snapshot_date"]).days, 0),
+                    "assignedRooms": rooms,
+                    "averagePrice": float(row["room_revenue"] or 0) / rooms if rooms else None,
+                })
+            total_assigned = sum(float(row.get("assigned_rooms") or 0) for row in current_rows)
+            total_revenue = sum(float(row.get("room_revenue") or 0) for row in current_rows)
+            payload = {
+                **status,
+                "hotelCode": hotel_code,
+                "stayDate": stay_date.isoformat(),
+                "roomCategory": category,
+                "comparison": "SPIT" if future else "LY",
+                "comparisonStayDate": comparison_date.isoformat(),
+                "totalAssignedRooms": total_assigned,
+                "totalAveragePrice": total_revenue / total_assigned if total_assigned else None,
+                "totalSpace": float(inventory.get("total_space") or 0),
+                "spaceToSell": float(inventory.get("space_to_sell") or 0),
+                "breakdown": breakdown,
+                "pickup": pickup,
+                "comparisonPickup": comparison_pickup,
+            }
+            with _detail_cache_lock:
+                if len(_detail_cache) >= 256:
+                    _detail_cache.clear()
+                _detail_cache[cache_key] = payload
+            return payload
