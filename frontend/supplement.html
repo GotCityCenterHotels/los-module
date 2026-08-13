@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supplement Preview</title>
+    <link rel="stylesheet" href="styles.css?v=20260813-3">
+</head>
+<body>
+    <main class="container supplement-container">
+        <nav class="main-nav" aria-label="Primary navigation">
+            <a href="/">Average LOS</a>
+            <a href="/distribution.html">LOS Distribution</a>
+            <a href="/costdata.html">Cost Data</a>
+            <a href="/costdata-input.html">Cost Input</a>
+            <a href="/supplement.html" aria-current="page">Supplement</a>
+        </nav>
+
+        <header class="page-header supplement-header">
+            <div>
+                <span class="supplement-eyebrow">Revenue management</span>
+                <h1>Supplement</h1>
+                <p>Inspect occupancy, ADR, and RevPAR across room categories and properties.</p>
+            </div>
+            <div class="preview-notice" role="status">
+                <strong>Simulated preview data</strong>
+                <span>Values are generated in your browser and are not live reporting.</span>
+            </div>
+        </header>
+
+        <section class="supplement-workspace" aria-labelledby="workspaceTitle">
+            <div class="supplement-toolbar-heading">
+                <div>
+                    <h2 id="workspaceTitle">Revenue grid</h2>
+                    <p id="rangeSummary">Seven-day operational preview</p>
+                </div>
+                <div class="view-switcher" role="group" aria-label="Supplement view">
+                    <button type="button" data-view-mode="single" aria-pressed="true">Single Hotel</button>
+                    <button type="button" data-view-mode="comparison" aria-pressed="false">Hotel Comparison</button>
+                </div>
+            </div>
+
+            <div class="supplement-controls" aria-label="Revenue grid controls">
+                <div class="supplement-control primary-control" id="singleHotelControl">
+                    <label for="supplementHotel">Hotel</label>
+                    <select id="supplementHotel"></select>
+                </div>
+
+                <fieldset class="supplement-control option-control" id="categoryControl">
+                    <legend>Room categories</legend>
+                    <div id="categoryOptions" class="compact-checks"></div>
+                </fieldset>
+
+                <fieldset class="supplement-control option-control" id="hotelVisibilityControl" hidden>
+                    <legend>Visible hotels</legend>
+                    <div id="hotelVisibilityOptions" class="compact-checks"></div>
+                </fieldset>
+
+                <div class="supplement-control date-control">
+                    <label for="supplementStartDate">Start date</label>
+                    <input id="supplementStartDate" type="date">
+                </div>
+                <div class="supplement-control date-control">
+                    <label for="supplementEndDate">End date</label>
+                    <input id="supplementEndDate" type="date">
+                </div>
+                <div class="supplement-control">
+                    <label for="supplementLyBasis">LY comparison</label>
+                    <select id="supplementLyBasis">
+                        <option value="sameDate">Same date</option>
+                        <option value="sameWeekday">Same weekday</option>
+                    </select>
+                </div>
+                <div class="supplement-control">
+                    <label for="supplementDiffMode">Difference</label>
+                    <select id="supplementDiffMode">
+                        <option value="percent">Percent</option>
+                        <option value="currency">Points / currency</option>
+                    </select>
+                </div>
+
+                <fieldset class="supplement-control option-control">
+                    <legend>Highlight change</legend>
+                    <div id="metricHighlightOptions" class="compact-checks">
+                        <label><input type="checkbox" value="occ" checked> OCC</label>
+                        <label><input type="checkbox" value="adr"> ADR</label>
+                        <label><input type="checkbox" value="revpar"> RevPAR</label>
+                    </div>
+                </fieldset>
+
+                <fieldset class="supplement-control option-control comparison-toggles">
+                    <legend>Comparison columns</legend>
+                    <div class="compact-checks">
+                        <label><input id="pastLyDiff" type="checkbox" checked> Past LY diff</label>
+                        <label><input id="futureSpitDiff" type="checkbox"> Future SPIT diff</label>
+                        <label><input id="futureLyDiff" type="checkbox"> Future LY diff</label>
+                    </div>
+                </fieldset>
+            </div>
+
+            <p id="supplementValidation" class="supplement-validation" role="alert" hidden></p>
+
+            <div id="supplementTableRegion" class="supplement-table-region" aria-live="polite">
+                <div id="supplementTableMount"></div>
+            </div>
+        </section>
+    </main>
+
+    <dialog id="supplementDetailDialog" class="supplement-dialog" aria-labelledby="detailTitle">
+        <div class="dialog-heading">
+            <div>
+                <span class="supplement-eyebrow">Simulated detail</span>
+                <h2 id="detailTitle">Metric detail</h2>
+                <p id="detailContext"></p>
+            </div>
+            <button id="closeDetailDialog" class="dialog-close" type="button" aria-label="Close detail">×</button>
+        </div>
+        <div class="detail-layout">
+            <section aria-labelledby="breakdownTitle">
+                <h3 id="breakdownTitle">Booking mix</h3>
+                <div class="detail-table-wrap">
+                    <table class="detail-table">
+                        <thead><tr><th>Segment</th><th>Rooms</th><th>Share</th><th>Avg. price</th></tr></thead>
+                        <tbody id="detailBreakdown"></tbody>
+                    </table>
+                </div>
+            </section>
+            <section aria-labelledby="curveTitle">
+                <div class="detail-section-heading">
+                    <h3 id="curveTitle">Pickup curve</h3>
+                    <div class="pickup-legend"><span><i class="pickup-current"></i>Current</span><span><i class="pickup-comparison"></i>Comparison</span></div>
+                </div>
+                <div id="pickupCurve" class="pickup-curve"></div>
+            </section>
+        </div>
+        <p class="dialog-footnote">Preview only · no live or stored data is used.</p>
+    </dialog>
+
+    <script src="supplement-data.js?v=20260813-3"></script>
+    <script src="supplement.js?v=20260813-3"></script>
+</body>
+</html>
