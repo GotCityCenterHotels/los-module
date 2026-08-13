@@ -4,6 +4,6 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "SUPPLEMENT_LIVE_ENABLED": "false",
-    "WEBSITE_TIME_ZONE": "W. Europe Standard Time"
+    "SUPPLEMENT_TIME_ZONE": "Europe/Stockholm"
   }
 }

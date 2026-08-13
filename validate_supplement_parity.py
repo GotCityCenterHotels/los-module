@@ -7,7 +7,10 @@ from decimal import Decimal
 
 from psycopg.rows import dict_row
 
-from queries.supplement_source import iter_source_snapshot_batches
+from queries.supplement_source import (
+    iter_booking_lifecycle_batches,
+    iter_inventory_batches,
+)
 from services.supplement_sync_service import add_months
 from shared.db import get_import_connection
 
@@ -15,28 +18,51 @@ from shared.db import get_import_connection
 def _source_facts(snapshot_date, hotel_code, stay_date, category):
     requested = defaultdict(lambda: [Decimal(0), Decimal(0)])
     inventory = {}
-    for batch in iter_source_snapshot_batches(
-        snapshot_date,
-        stay_date,
-        minimum_stay_date=stay_date,
+    reservations = defaultdict(lambda: [Decimal(0), Decimal(0), None])
+    for batch in iter_booking_lifecycle_batches(
+        [snapshot_date], stay_date, stay_date,
     ):
         for row in batch:
-            if row["hotel_code"].strip() != hotel_code or row["stay_date"] != stay_date:
+            if str(row["enterprise_id"]) != hotel_code or row["stay_date"] != stay_date:
                 continue
-            if category and row["space_room_name"].strip() != category:
+            if row["reservation_created_date"] > snapshot_date:
                 continue
-            name = row["requested_room_name"].strip()
-            requested[name][0] += row["assigned_rooms"] or 0
-            requested[name][1] += row["room_revenue"] or 0
-            inventory[row["space_room_name"].strip()] = [
-                row["total_space"] or 0,
-                row["space_to_sell"] or 0,
+            if row["reservation_cancelled_date"] and row["reservation_cancelled_date"] <= snapshot_date:
+                continue
+            if row["item_created_date"] > snapshot_date:
+                continue
+            if row["item_cancelled_date"] and row["item_cancelled_date"] <= snapshot_date:
+                continue
+            if category and str(row["space_category_id"]) != category:
+                continue
+            key = (
+                str(row["reservation_id"]), str(row["space_category_id"]),
+                str(row["requested_category_id"]),
+            )
+            reservations[key][0] = Decimal(1)
+            reservations[key][1] += row["gross_revenue"] or 0
+            reservations[key][2] = row["requested_category_name"].strip()
+    for (_reservation_id, _space_category_id, requested_id), values in reservations.items():
+        requested[requested_id][0] += values[0]
+        requested[requested_id][1] += values[1]
+    for batch in iter_inventory_batches([snapshot_date]):
+        for row in batch:
+            if str(row["enterprise_id"]) != hotel_code:
+                continue
+            category_id = str(row["category_id"])
+            if category and category_id != category:
+                continue
+            inventory[category_id] = [
+                row["physical_inventory"], row["sellable_inventory"],
+                row["inventory_quality"],
             ]
     return requested, inventory
 
 
 def _application_facts(snapshot_date, hotel_code, stay_date, category):
-    category_filter = "AND space_room_name = %(category)s" if category else ""
+    category_filter = (
+        "AND space_room_category_id = %(category)s::uuid" if category else ""
+    )
     parameters = {
         "snapshot_date": snapshot_date,
         "hotel_code": hotel_code,
@@ -46,7 +72,8 @@ def _application_facts(snapshot_date, hotel_code, stay_date, category):
     with get_import_connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(f"""
-                SELECT requested_room_name, assigned_rooms, room_revenue
+                SELECT requested_room_category_id::text AS requested_room_category_id,
+                       assigned_rooms, room_revenue
                 FROM functions.supplement_snapshot_detail
                 WHERE snapshot_date = %(snapshot_date)s
                   AND hotel_code = %(hotel_code)s
@@ -54,11 +81,14 @@ def _application_facts(snapshot_date, hotel_code, stay_date, category):
                   {category_filter}
             """, parameters)
             requested = {
-                row["requested_room_name"]: [row["assigned_rooms"], row["room_revenue"]]
+                row["requested_room_category_id"]: [
+                    row["assigned_rooms"], row["room_revenue"]
+                ]
                 for row in cursor.fetchall()
             }
             cursor.execute(f"""
-                SELECT space_room_name, total_space, space_to_sell
+                SELECT space_room_category_id::text AS space_room_category_id,
+                       total_space, space_to_sell, inventory_quality
                 FROM functions.supplement_snapshot_inventory
                 WHERE snapshot_date = %(snapshot_date)s
                   AND hotel_code = %(hotel_code)s
@@ -66,7 +96,9 @@ def _application_facts(snapshot_date, hotel_code, stay_date, category):
                   {category_filter}
             """, parameters)
             inventory = {
-                row["space_room_name"]: [row["total_space"], row["space_to_sell"]]
+                row["space_room_category_id"]: [
+                    row["total_space"], row["space_to_sell"], row["inventory_quality"]
+                ]
                 for row in cursor.fetchall()
             }
     return requested, inventory

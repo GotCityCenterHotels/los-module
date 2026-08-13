@@ -22,6 +22,7 @@ test("Supplement page exposes its controls, table landmark, and accessible dialo
         "supplementStartDate",
         "supplementEndDate",
         "supplementLyBasis",
+        "supplementInventoryBasis",
         "supplementDiffMode",
         "supplementTableRegion",
         "supplementDetailDialog"

@@ -9,22 +9,35 @@ from psycopg.rows import dict_row
 
 from cost_database import cost_pool
 from queries.supplement_source import (
-    fetch_latest_source_snapshot,
-    fetch_source_snapshot_dates,
-    iter_source_snapshot_batches,
+    iter_booking_lifecycle_batches,
+    iter_inventory_batches,
+    snapshot_dates,
+    stockholm_today,
 )
 from services.supplement_schema_service import ensure_supplement_schema
 
 
 SYNC_LOCK_NAME = "functions.supplement_sync"
-SOURCE_OVERLAP_DAYS = 3
+SOURCE_OVERLAP_DAYS = 4
 BATCH_SIZE = 5000
 
-STAGING_INSERT_SQL = """
-    INSERT INTO supplement_snapshot_stage (
-        snapshot_date, stay_date, hotel_code, space_room_name,
-        requested_room_name, assigned_rooms, room_revenue,
-        total_space, space_to_sell
+BOOKING_STAGE_INSERT_SQL = """
+    INSERT INTO supplement_booking_lifecycle_stage (
+        tenant_key, reservation_id, order_item_id, stay_date,
+        reservation_created_date, reservation_cancelled_date,
+        item_created_date, item_cancelled_date,
+        enterprise_id, hotel_name,
+        requested_category_id, requested_category_name,
+        space_category_id, space_category_name,
+        amount_currency, gross_revenue
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+INVENTORY_STAGE_INSERT_SQL = """
+    INSERT INTO supplement_inventory_source_stage (
+        snapshot_date, tenant_key, enterprise_id, hotel_name,
+        category_id, category_name, physical_inventory,
+        sellable_inventory, inventory_quality
     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
@@ -37,129 +50,213 @@ def add_months(value, months):
     return date(year, month, day)
 
 
-def _stage_row(row):
+def _booking_stage_row(row):
     return (
-        row["snapshot_date"],
-        row["stay_date"],
-        (row["hotel_code"] or "").strip(),
-        (row["space_room_name"] or "").strip(),
-        (row["requested_room_name"] or "").strip(),
-        row["assigned_rooms"] or Decimal(0),
-        row["room_revenue"] or Decimal(0),
-        row["total_space"] or Decimal(0),
-        row["space_to_sell"] or Decimal(0),
+        row["tenant_key"], row["reservation_id"], row["order_item_id"],
+        row["stay_date"], row["reservation_created_date"],
+        row["reservation_cancelled_date"], row["item_created_date"],
+        row["item_cancelled_date"], row["enterprise_id"],
+        (row["hotel_name"] or "").strip(), row["requested_category_id"],
+        (row["requested_category_name"] or "").strip(),
+        row["space_category_id"], (row["space_category_name"] or "").strip(),
+        row["amount_currency"], row["gross_revenue"],
     )
 
 
-def _create_stage(cursor):
+def _inventory_stage_row(row):
+    return (
+        row["snapshot_date"], row["tenant_key"], row["enterprise_id"],
+        (row["hotel_name"] or "").strip(), row["category_id"],
+        (row["category_name"] or "").strip(), row["physical_inventory"],
+        row["sellable_inventory"], row["inventory_quality"],
+    )
+
+
+def _create_stages(cursor):
     cursor.execute("""
-        CREATE TEMP TABLE supplement_snapshot_stage (
-            snapshot_date date NOT NULL,
+        CREATE TEMP TABLE supplement_booking_lifecycle_stage (
+            tenant_key text NOT NULL,
+            reservation_id uuid NOT NULL,
+            order_item_id uuid NOT NULL,
             stay_date date NOT NULL,
-            hotel_code text NOT NULL,
-            space_room_name text NOT NULL,
-            requested_room_name text NOT NULL,
-            assigned_rooms numeric NOT NULL,
-            room_revenue numeric NOT NULL,
-            total_space numeric NOT NULL,
-            space_to_sell numeric NOT NULL
+            reservation_created_date date NOT NULL,
+            reservation_cancelled_date date,
+            item_created_date date NOT NULL,
+            item_cancelled_date date,
+            enterprise_id uuid NOT NULL,
+            hotel_name text NOT NULL,
+            requested_category_id uuid,
+            requested_category_name text,
+            space_category_id uuid,
+            space_category_name text,
+            amount_currency text,
+            gross_revenue numeric,
+            PRIMARY KEY (tenant_key, order_item_id)
+        ) ON COMMIT DROP
+    """)
+    cursor.execute("""
+        CREATE TEMP TABLE supplement_inventory_source_stage (
+            snapshot_date date NOT NULL,
+            tenant_key text NOT NULL,
+            enterprise_id uuid NOT NULL,
+            hotel_name text NOT NULL,
+            category_id uuid NOT NULL,
+            category_name text NOT NULL,
+            physical_inventory numeric NOT NULL,
+            sellable_inventory numeric NOT NULL,
+            inventory_quality text NOT NULL,
+            PRIMARY KEY (snapshot_date, tenant_key, enterprise_id, category_id)
         ) ON COMMIT DROP
     """)
 
 
-def _validate_stage(cursor, expected_snapshots):
-    cursor.execute("SELECT count(*) AS row_count FROM supplement_snapshot_stage")
-    row_count = cursor.fetchone()["row_count"]
-    if row_count == 0:
-        raise ValueError("Supplement source returned no rows for the requested snapshots")
+def _materialize_snapshot_facts(cursor, source_snapshots):
+    cursor.execute("""
+        CREATE TEMP TABLE supplement_snapshot_stage ON COMMIT DROP AS
+        WITH requested_snapshots AS (
+            SELECT unnest(%s::date[]) AS snapshot_date
+        ),
+        eligible_items AS (
+            SELECT s.snapshot_date, b.*
+            FROM requested_snapshots s
+            JOIN supplement_booking_lifecycle_stage b
+              ON b.stay_date BETWEEN (s.snapshot_date - 7)
+                                     AND (s.snapshot_date + interval '18 months')::date
+             AND b.reservation_created_date <= s.snapshot_date
+             AND (b.reservation_cancelled_date IS NULL
+                  OR b.reservation_cancelled_date > s.snapshot_date)
+             AND b.item_created_date <= s.snapshot_date
+             AND (b.item_cancelled_date IS NULL
+                  OR b.item_cancelled_date > s.snapshot_date)
+        ),
+        reservation_nights AS (
+            SELECT snapshot_date, stay_date, tenant_key, reservation_id,
+                   enterprise_id, hotel_name,
+                   space_category_id, space_category_name,
+                   requested_category_id, requested_category_name,
+                   1::numeric AS assigned_rooms,
+                   sum(gross_revenue)::numeric AS room_revenue
+            FROM eligible_items
+            GROUP BY snapshot_date, stay_date, tenant_key, reservation_id,
+                     enterprise_id, hotel_name,
+                     space_category_id, space_category_name,
+                     requested_category_id, requested_category_name
+        )
+        SELECT snapshot_date, stay_date, tenant_key, enterprise_id,
+               enterprise_id::text AS hotel_code, hotel_name,
+               space_category_id, space_category_name,
+               requested_category_id, requested_category_name,
+               sum(assigned_rooms)::numeric AS assigned_rooms,
+               sum(room_revenue)::numeric AS room_revenue
+        FROM reservation_nights
+        GROUP BY snapshot_date, stay_date, tenant_key, enterprise_id,
+                 hotel_name, space_category_id, space_category_name,
+                 requested_category_id, requested_category_name
+    """, (source_snapshots,))
+
+
+def _validate_stages(cursor, source_snapshots):
+    cursor.execute("""
+        SELECT count(*) AS invalid_count
+        FROM supplement_booking_lifecycle_stage
+        WHERE nullif(trim(tenant_key), '') IS NULL
+           OR nullif(trim(hotel_name), '') IS NULL
+           OR requested_category_id IS NULL
+           OR space_category_id IS NULL
+           OR nullif(trim(requested_category_name), '') IS NULL
+           OR nullif(trim(space_category_name), '') IS NULL
+           OR amount_currency IS DISTINCT FROM 'SEK'
+           OR gross_revenue IS NULL OR gross_revenue < 0
+    """)
+    invalid_bookings = cursor.fetchone()["invalid_count"]
+    if invalid_bookings:
+        raise ValueError(
+            f"Supplement booking source contains {invalid_bookings} invalid rows"
+        )
 
     cursor.execute("""
         SELECT count(*) AS invalid_count
-        FROM supplement_snapshot_stage
-        WHERE nullif(trim(hotel_code), '') IS NULL
-           OR nullif(trim(space_room_name), '') IS NULL
-           OR nullif(trim(requested_room_name), '') IS NULL
-           OR assigned_rooms < 0
-           OR room_revenue < 0
-           OR total_space < 0
-           OR space_to_sell < 0
+        FROM supplement_inventory_source_stage
+        WHERE nullif(trim(tenant_key), '') IS NULL
+           OR nullif(trim(hotel_name), '') IS NULL
+           OR nullif(trim(category_name), '') IS NULL
+           OR physical_inventory < 0 OR sellable_inventory < 0
+           OR sellable_inventory > physical_inventory
+           OR inventory_quality NOT IN ('exact', 'approximated-current')
     """)
-    invalid_count = cursor.fetchone()["invalid_count"]
-    if invalid_count:
-        raise ValueError(f"Supplement source contains {invalid_count} invalid rows")
-
-    cursor.execute("""
-        SELECT count(*) AS duplicate_groups
-        FROM (
-            SELECT snapshot_date, stay_date, hotel_code, space_room_name,
-                   requested_room_name
-            FROM supplement_snapshot_stage
-            GROUP BY snapshot_date, stay_date, hotel_code, space_room_name,
-                     requested_room_name
-            HAVING count(*) > 1
-        ) duplicates
-    """)
-    duplicate_groups = cursor.fetchone()["duplicate_groups"]
-    if duplicate_groups:
+    invalid_inventory = cursor.fetchone()["invalid_count"]
+    if invalid_inventory:
         raise ValueError(
-            f"Supplement source contains {duplicate_groups} duplicate fact keys"
+            f"Supplement inventory source contains {invalid_inventory} invalid rows"
         )
 
-    cursor.execute("SELECT DISTINCT snapshot_date FROM supplement_snapshot_stage")
-    staged_snapshots = {row["snapshot_date"] for row in cursor.fetchall()}
-    missing = sorted(set(expected_snapshots) - staged_snapshots)
+    cursor.execute("""
+        SELECT count(*) AS invalid_count
+        FROM supplement_booking_lifecycle_stage b
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM supplement_inventory_source_stage i
+            WHERE i.tenant_key = b.tenant_key
+              AND i.enterprise_id = b.enterprise_id
+              AND i.category_id = b.space_category_id
+        )
+    """)
+    missing_inventory_mapping = cursor.fetchone()["invalid_count"]
+    if missing_inventory_mapping:
+        raise ValueError(
+            "Supplement bookings contain "
+            f"{missing_inventory_mapping} effective room-category mappings "
+            "that are absent from inventory"
+        )
+
+    cursor.execute(
+        "SELECT DISTINCT snapshot_date FROM supplement_inventory_source_stage"
+    )
+    inventory_snapshots = {row["snapshot_date"] for row in cursor.fetchall()}
+    missing = sorted(set(source_snapshots) - inventory_snapshots)
     if missing:
         raise ValueError(
-            "Supplement source returned no rows for snapshots: "
+            "Supplement inventory is missing snapshots: "
             + ", ".join(value.isoformat() for value in missing)
         )
 
+    cursor.execute("SELECT count(*) AS row_count FROM supplement_snapshot_stage")
+    fact_count = cursor.fetchone()["row_count"]
+    cursor.execute("SELECT count(*) AS row_count FROM supplement_inventory_source_stage")
+    inventory_count = cursor.fetchone()["row_count"]
     cursor.execute("""
-        SELECT s.snapshot_date,
-               count(DISTINCT (s.stay_date, s.hotel_code, s.space_room_name,
-                               s.requested_room_name)) AS staged_count,
-               coalesce(existing.row_count, 0) AS existing_count
-        FROM supplement_snapshot_stage s
-        LEFT JOIN (
-            SELECT snapshot_date, count(*) AS row_count
-            FROM functions.supplement_snapshot_detail
-            WHERE snapshot_date = ANY(%s)
-            GROUP BY snapshot_date
-        ) existing USING (snapshot_date)
-        GROUP BY s.snapshot_date, existing.row_count
-    """, (list(expected_snapshots),))
-    for row in cursor.fetchall():
-        existing_count = row["existing_count"]
-        if existing_count < 100:
-            continue
-        ratio = row["staged_count"] / existing_count
-        if ratio < 0.5 or ratio > 1.5:
-            raise ValueError(
-                f"Supplement row-count variance is too large for {row['snapshot_date']}: "
-                f"existing={existing_count} staged={row['staged_count']}"
-            )
-    return row_count
+        SELECT count(DISTINCT (snapshot_date, hotel_code, space_room_category_id))
+               AS row_count
+        FROM functions.supplement_snapshot_inventory
+        WHERE snapshot_date = ANY(%s)
+    """, (source_snapshots,))
+    previous_inventory_count = cursor.fetchone()["row_count"]
+    if previous_inventory_count and not (
+        previous_inventory_count * Decimal("0.5")
+        <= inventory_count
+        <= previous_inventory_count * Decimal("1.5")
+    ):
+        raise ValueError(
+            "Supplement inventory row-count variance exceeds 50% "
+            f"({previous_inventory_count} previous, {inventory_count} staged)"
+        )
+    return fact_count, inventory_count
 
 
-def _publish_stage(cursor, run_id, snapshot_dates):
-    first_snapshot = min(snapshot_dates)
-    last_snapshot = max(snapshot_dates)
-    cursor.execute(
-        "SELECT functions.ensure_supplement_month_partitions(%s)",
-        (first_snapshot,),
-    )
-    month_cursor = date(first_snapshot.year, first_snapshot.month, 1)
-    final_month = date(last_snapshot.year, last_snapshot.month, 1)
-    while month_cursor < final_month:
-        month_cursor = add_months(month_cursor, 1)
+def _ensure_partitions(cursor, source_snapshots):
+    months = {
+        date(value.year, value.month, 1)
+        for value in source_snapshots
+    }
+    for month in sorted(months):
         cursor.execute(
-            "SELECT functions.ensure_supplement_month_partitions(%s)",
-            (month_cursor,),
+            "SELECT functions.ensure_supplement_month_partitions(%s)", (month,)
         )
 
-    # A repair range may contain calendar dates that do not exist in the source.
-    # Replace only snapshots that were actually discovered and fully staged.
-    parameters = {"snapshot_dates": list(snapshot_dates)}
+
+def _publish_stage(cursor, run_id, source_snapshots):
+    _ensure_partitions(cursor, source_snapshots)
+    parameters = {"snapshot_dates": source_snapshots}
     for table in (
         "supplement_snapshot_detail",
         "supplement_snapshot_category",
@@ -172,66 +269,90 @@ def _publish_stage(cursor, run_id, snapshot_dates):
         )
 
     cursor.execute("""
-        INSERT INTO functions.supplement_snapshot_detail (
-            snapshot_date, stay_date, hotel_code, space_room_name,
-            requested_room_name, assigned_rooms, room_revenue, currency, run_id
+        INSERT INTO functions.supplement_hotels (
+            hotel_code, tenant_key, enterprise_id, hotel_name, last_seen_at
         )
-        SELECT snapshot_date, stay_date, hotel_code, space_room_name,
-               requested_room_name, sum(assigned_rooms), sum(room_revenue), 'SEK', %s
-        FROM supplement_snapshot_stage
-        GROUP BY snapshot_date, stay_date, hotel_code,
-                 space_room_name, requested_room_name
-    """, (run_id,))
-    cursor.execute("""
-        INSERT INTO functions.supplement_snapshot_category (
-            snapshot_date, stay_date, hotel_code, space_room_name,
-            assigned_rooms, room_revenue, currency, run_id
-        )
-        SELECT snapshot_date, stay_date, hotel_code, space_room_name,
-               sum(assigned_rooms), sum(room_revenue), 'SEK', %s
-        FROM supplement_snapshot_stage
-        GROUP BY snapshot_date, stay_date, hotel_code, space_room_name
-    """, (run_id,))
-    cursor.execute("""
-        INSERT INTO functions.supplement_snapshot_inventory (
-            snapshot_date, stay_date, hotel_code, space_room_name,
-            total_space, space_to_sell, run_id
-        )
-        SELECT snapshot_date, stay_date, hotel_code, space_room_name,
-               max(total_space), max(space_to_sell), %s
-        FROM supplement_snapshot_stage
-        GROUP BY snapshot_date, stay_date, hotel_code, space_room_name
-    """, (run_id,))
-
-    cursor.execute("""
-        INSERT INTO functions.supplement_hotels (hotel_code, hotel_name, last_seen_at)
-        SELECT DISTINCT hotel_code, hotel_code, now()
-        FROM supplement_snapshot_stage
+        SELECT DISTINCT ON (enterprise_id)
+               enterprise_id::text, tenant_key, enterprise_id,
+               hotel_name, now()
+        FROM supplement_inventory_source_stage
+        ORDER BY enterprise_id, snapshot_date DESC
         ON CONFLICT (hotel_code) DO UPDATE SET
+            tenant_key = EXCLUDED.tenant_key,
+            enterprise_id = EXCLUDED.enterprise_id,
+            hotel_name = EXCLUDED.hotel_name,
             active = true,
             last_seen_at = now()
     """)
     cursor.execute("""
         INSERT INTO functions.supplement_room_categories (
-            hotel_code, space_room_name, short_name, sort_order, last_seen_at
+            hotel_code, room_category_id, space_room_name,
+            short_name, sort_order, last_seen_at
         )
-        SELECT DISTINCT hotel_code, space_room_name,
-               left(upper(space_room_name), 8), 0, now()
-        FROM supplement_snapshot_stage
-        ON CONFLICT (hotel_code, space_room_name) DO UPDATE SET last_seen_at = now()
+        SELECT DISTINCT ON (enterprise_id, category_id)
+               enterprise_id::text, category_id, category_name,
+               left(upper(category_name), 8), 0, now()
+        FROM supplement_inventory_source_stage
+        ORDER BY enterprise_id, category_id, snapshot_date DESC
+        ON CONFLICT (hotel_code, room_category_id) DO UPDATE SET
+            space_room_name = EXCLUDED.space_room_name,
+            short_name = EXCLUDED.short_name,
+            last_seen_at = now()
     """)
+
+    cursor.execute("""
+        INSERT INTO functions.supplement_snapshot_detail (
+            snapshot_date, stay_date, hotel_code,
+            space_room_category_id, space_room_name,
+            requested_room_category_id, requested_room_name,
+            assigned_rooms, room_revenue, currency, run_id
+        )
+        SELECT snapshot_date, stay_date, hotel_code,
+               space_category_id, space_category_name,
+               requested_category_id, requested_category_name,
+               assigned_rooms, room_revenue, 'SEK', %s
+        FROM supplement_snapshot_stage
+    """, (run_id,))
+    cursor.execute("""
+        INSERT INTO functions.supplement_snapshot_category (
+            snapshot_date, stay_date, hotel_code,
+            space_room_category_id, space_room_name,
+            assigned_rooms, room_revenue, currency, run_id
+        )
+        SELECT snapshot_date, stay_date, hotel_code,
+               space_category_id, max(space_category_name),
+               sum(assigned_rooms), sum(room_revenue), 'SEK', %s
+        FROM supplement_snapshot_stage
+        GROUP BY snapshot_date, stay_date, hotel_code, space_category_id
+    """, (run_id,))
+    cursor.execute("""
+        INSERT INTO functions.supplement_snapshot_inventory (
+            snapshot_date, stay_date, hotel_code,
+            space_room_category_id, space_room_name,
+            total_space, space_to_sell, inventory_quality, run_id
+        )
+        SELECT i.snapshot_date, stay.day::date, i.enterprise_id::text,
+               i.category_id, i.category_name,
+               i.physical_inventory, i.sellable_inventory,
+               i.inventory_quality, %s
+        FROM supplement_inventory_source_stage i
+        CROSS JOIN LATERAL generate_series(
+            i.snapshot_date - 7,
+            (i.snapshot_date + interval '18 months')::date,
+            interval '1 day'
+        ) AS stay(day)
+    """, (run_id,))
 
     cursor.execute("""
         SELECT min(stay_date) AS minimum_stay_date,
                max(stay_date) AS maximum_stay_date
-        FROM supplement_snapshot_stage
-    """)
+        FROM functions.supplement_snapshot_inventory
+        WHERE snapshot_date = ANY(%s)
+    """, (source_snapshots,))
     staged_range = cursor.fetchone()
-    minimum_stay_date = staged_range["minimum_stay_date"]
-    maximum_stay_date = staged_range["maximum_stay_date"]
-    rebuild_parameters = {
-        "minimum_stay_date": minimum_stay_date,
-        "maximum_stay_date": maximum_stay_date,
+    rebuild = {
+        "minimum_stay_date": staged_range["minimum_stay_date"],
+        "maximum_stay_date": staged_range["maximum_stay_date"],
     }
     for table in (
         "supplement_latest_detail",
@@ -241,55 +362,55 @@ def _publish_stage(cursor, run_id, snapshot_dates):
         cursor.execute(
             f"DELETE FROM functions.{table} "
             "WHERE stay_date BETWEEN %(minimum_stay_date)s AND %(maximum_stay_date)s",
-            rebuild_parameters,
+            rebuild,
         )
 
     cursor.execute("""
         INSERT INTO functions.supplement_latest_inventory (
-            stay_date, hotel_code, space_room_name, snapshot_date,
-            total_space, space_to_sell, run_id
+            stay_date, hotel_code, space_room_category_id, space_room_name,
+            snapshot_date, total_space, space_to_sell,
+            inventory_quality, run_id
         )
-        WITH chosen_stays AS (
+        WITH chosen AS (
             SELECT stay_date, hotel_code, max(snapshot_date) AS snapshot_date
             FROM functions.supplement_snapshot_inventory
             WHERE stay_date BETWEEN %(minimum_stay_date)s AND %(maximum_stay_date)s
             GROUP BY stay_date, hotel_code
         )
-        SELECT i.stay_date, i.hotel_code, i.space_room_name, i.snapshot_date,
-               i.total_space, i.space_to_sell, i.run_id
+        SELECT i.stay_date, i.hotel_code, i.space_room_category_id,
+               i.space_room_name, i.snapshot_date, i.total_space,
+               i.space_to_sell, i.inventory_quality, i.run_id
         FROM functions.supplement_snapshot_inventory i
-        JOIN chosen_stays s USING (stay_date, hotel_code, snapshot_date)
-    """, rebuild_parameters)
+        JOIN chosen c USING (stay_date, hotel_code, snapshot_date)
+    """, rebuild)
     cursor.execute("""
         INSERT INTO functions.supplement_latest_category (
-            stay_date, hotel_code, space_room_name, snapshot_date,
-            assigned_rooms, room_revenue, currency, run_id
-        )
-        SELECT c.stay_date, c.hotel_code, c.space_room_name, c.snapshot_date,
-               c.assigned_rooms, c.room_revenue, c.currency, c.run_id
-        FROM functions.supplement_snapshot_category c
-        JOIN functions.supplement_latest_inventory i
-          ON i.stay_date = c.stay_date
-         AND i.hotel_code = c.hotel_code
-         AND i.space_room_name = c.space_room_name
-         AND i.snapshot_date = c.snapshot_date
-        WHERE c.stay_date BETWEEN %(minimum_stay_date)s AND %(maximum_stay_date)s
-    """, rebuild_parameters)
-    cursor.execute("""
-        INSERT INTO functions.supplement_latest_detail (
-            stay_date, hotel_code, space_room_name, requested_room_name,
+            stay_date, hotel_code, space_room_category_id, space_room_name,
             snapshot_date, assigned_rooms, room_revenue, currency, run_id
         )
-        SELECT d.stay_date, d.hotel_code, d.space_room_name, d.requested_room_name,
-               d.snapshot_date, d.assigned_rooms, d.room_revenue, d.currency, d.run_id
+        SELECT c.stay_date, c.hotel_code, c.space_room_category_id,
+               c.space_room_name, c.snapshot_date, c.assigned_rooms,
+               c.room_revenue, c.currency, c.run_id
+        FROM functions.supplement_snapshot_category c
+        JOIN functions.supplement_latest_inventory i
+          USING (stay_date, hotel_code, space_room_category_id, snapshot_date)
+        WHERE c.stay_date BETWEEN %(minimum_stay_date)s AND %(maximum_stay_date)s
+    """, rebuild)
+    cursor.execute("""
+        INSERT INTO functions.supplement_latest_detail (
+            stay_date, hotel_code, space_room_category_id, space_room_name,
+            requested_room_category_id, requested_room_name,
+            snapshot_date, assigned_rooms, room_revenue, currency, run_id
+        )
+        SELECT d.stay_date, d.hotel_code, d.space_room_category_id,
+               d.space_room_name, d.requested_room_category_id,
+               d.requested_room_name, d.snapshot_date, d.assigned_rooms,
+               d.room_revenue, d.currency, d.run_id
         FROM functions.supplement_snapshot_detail d
         JOIN functions.supplement_latest_inventory i
-          ON i.stay_date = d.stay_date
-         AND i.hotel_code = d.hotel_code
-         AND i.space_room_name = d.space_room_name
-         AND i.snapshot_date = d.snapshot_date
+          USING (stay_date, hotel_code, space_room_category_id, snapshot_date)
         WHERE d.stay_date BETWEEN %(minimum_stay_date)s AND %(maximum_stay_date)s
-    """, rebuild_parameters)
+    """, rebuild)
 
     cursor.execute("""
         INSERT INTO functions.supplement_coverage (
@@ -315,6 +436,8 @@ def _published_snapshot(cursor):
 
 
 def _apply_retention(cursor, reference_date):
+    # Dense pickup snapshots expire; supplement_latest_* remains the permanent
+    # latest/final fact set and is deliberately never deleted here.
     minimum_stay_date = add_months(reference_date, -48)
     maximum_stay_date = add_months(reference_date, 18)
     for table in (
@@ -328,8 +451,6 @@ def _apply_retention(cursor, reference_date):
                OR snapshot_date < (stay_date - 366)
                OR snapshot_date > (stay_date + 7)
         """, (minimum_stay_date, maximum_stay_date))
-    # Latest rows become final facts after departure and are deliberately kept
-    # permanently. Only the denser pickup snapshots are subject to retention.
     cursor.execute("""
         INSERT INTO functions.supplement_coverage (
             singleton, minimum_stay_date, maximum_stay_date,
@@ -355,32 +476,32 @@ def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):
 
     with cost_pool.connection() as app_connection:
         with app_connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS acquired", (SYNC_LOCK_NAME,))
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(hashtext(%s)) AS acquired",
+                (SYNC_LOCK_NAME,),
+            )
             if not cursor.fetchone()["acquired"]:
                 raise RuntimeError("Another Supplement synchronization is already running")
 
             run_id = None
             try:
-                latest_source = fetch_latest_source_snapshot()
-                if latest_source is None:
-                    raise RuntimeError("integration_db has no Supplement snapshots")
-
+                latest_source = stockholm_today()
                 published = _published_snapshot(cursor)
                 if mode == "delta":
                     snapshot_to = latest_source
-                    snapshot_from = (
-                        max(published - timedelta(days=SOURCE_OVERLAP_DAYS - 1), date.min)
-                        if published
-                        else latest_source
+                    correction_start = latest_source - timedelta(
+                        days=SOURCE_OVERLAP_DAYS - 1
                     )
+                    snapshot_from = correction_start
                 else:
                     if snapshot_from is None or snapshot_to is None:
                         raise ValueError("repair and backfill require snapshotFrom and snapshotTo")
                     if snapshot_from > snapshot_to:
                         raise ValueError("snapshotFrom cannot be after snapshotTo")
                     if snapshot_to > latest_source:
-                        raise ValueError("snapshotTo cannot be newer than the source watermark")
+                        raise ValueError("snapshotTo cannot be in the future")
 
+                source_snapshots = snapshot_dates(snapshot_from, snapshot_to)
                 cursor.execute("""
                     INSERT INTO functions.supplement_sync_runs (
                         mode, status, source_snapshot_from, source_snapshot_to
@@ -390,24 +511,38 @@ def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):
                 run_id = cursor.fetchone()["run_id"]
                 app_connection.commit()
 
-                source_snapshots = fetch_source_snapshot_dates(snapshot_from, snapshot_to)
-                if not source_snapshots:
-                    raise RuntimeError("integration_db has no snapshots in the requested range")
+                _create_stages(cursor)
+                minimum_stay_date = min(source_snapshots) - timedelta(days=7)
+                maximum_stay_date = max(
+                    add_months(value, 18) for value in source_snapshots
+                )
+                booking_rows = 0
+                for rows in iter_booking_lifecycle_batches(
+                    source_snapshots,
+                    minimum_stay_date,
+                    maximum_stay_date,
+                    BATCH_SIZE,
+                ):
+                    cursor.executemany(
+                        BOOKING_STAGE_INSERT_SQL,
+                        [_booking_stage_row(row) for row in rows],
+                    )
+                    booking_rows += len(rows)
 
-                _create_stage(cursor)
-                exported_rows = 0
-                for snapshot_date in source_snapshots:
-                    for rows in iter_source_snapshot_batches(
-                        snapshot_date,
-                        add_months(snapshot_date, 18),
-                        BATCH_SIZE,
-                    ):
-                        cursor.executemany(STAGING_INSERT_SQL, [_stage_row(row) for row in rows])
-                        exported_rows += len(rows)
+                inventory_rows = 0
+                for rows in iter_inventory_batches(source_snapshots, BATCH_SIZE):
+                    cursor.executemany(
+                        INVENTORY_STAGE_INSERT_SQL,
+                        [_inventory_stage_row(row) for row in rows],
+                    )
+                    inventory_rows += len(rows)
 
-                imported_rows = _validate_stage(cursor, source_snapshots)
+                _materialize_snapshot_facts(cursor, source_snapshots)
+                fact_rows, staged_inventory_rows = _validate_stages(
+                    cursor, source_snapshots
+                )
                 _publish_stage(cursor, run_id, source_snapshots)
-                publication_date = max(published or snapshot_to, max(source_snapshots))
+                publication_date = max(published or snapshot_to, snapshot_to)
                 if mode == "delta" and publication_date.day == 1:
                     _apply_retention(cursor, publication_date)
                 cursor.execute("""
@@ -419,18 +554,21 @@ def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):
                         data_as_of = EXCLUDED.data_as_of,
                         published_at = now()
                 """, (run_id, publication_date))
+                exported_rows = booking_rows + inventory_rows
+                imported_rows = fact_rows + staged_inventory_rows
                 cursor.execute("""
                     UPDATE functions.supplement_sync_runs
-                    SET status = 'published', exported_rows = %s, imported_rows = %s,
-                        finished_at = now(), published_at = now()
+                    SET status = 'published', exported_rows = %s,
+                        imported_rows = %s, finished_at = now(), published_at = now()
                     WHERE run_id = %s
                 """, (exported_rows, imported_rows, run_id))
                 app_connection.commit()
                 logging.info(
-                    "Supplement sync published run_id=%s mode=%s snapshots=%s..%s "
-                    "source_rows=%s app_rows=%s elapsed_seconds=%.2f",
-                    run_id, mode, snapshot_from, snapshot_to, exported_rows,
-                    imported_rows, perf_counter() - started_at,
+                    "Supplement lifecycle sync published run_id=%s mode=%s "
+                    "snapshots=%s..%s booking_rows=%s inventory_rows=%s "
+                    "fact_rows=%s elapsed_seconds=%.2f",
+                    run_id, mode, snapshot_from, snapshot_to, booking_rows,
+                    inventory_rows, fact_rows, perf_counter() - started_at,
                 )
                 return {
                     "status": "published",
@@ -453,7 +591,9 @@ def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):
                 logging.exception("Supplement synchronization failed mode=%s", mode)
                 raise
             finally:
-                cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (SYNC_LOCK_NAME,))
+                cursor.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s))", (SYNC_LOCK_NAME,)
+                )
 
 
 def run_backfill_partition(snapshot_date):

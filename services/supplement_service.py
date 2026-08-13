@@ -1,4 +1,5 @@
 import logging
+import os
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -15,12 +16,16 @@ from services.supplement_schema_service import ensure_supplement_schema
 MAX_GRID_DAYS = 366
 STALE_AFTER_HOURS = 36
 VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
+VALID_INVENTORY_BASES = {"sellable", "physical"}
+INVENTORY_EXACT_FROM = date(2026, 2, 27)
 
 _grid_cache = {}
 _grid_cache_lock = Lock()
 _detail_cache = {}
 _detail_cache_lock = Lock()
-STOCKHOLM_TIME_ZONE = ZoneInfo("Europe/Stockholm")
+STOCKHOLM_TIME_ZONE = ZoneInfo(
+    os.environ.get("SUPPLEMENT_TIME_ZONE", "Europe/Stockholm")
+)
 
 
 class SupplementUnavailableError(RuntimeError):
@@ -62,10 +67,23 @@ def validate_date_range(start_date, end_date):
     return day_count
 
 
-def calculate_metrics(assigned_rooms, room_revenue, inventory):
+def calculate_metrics(
+    assigned_rooms,
+    room_revenue,
+    physical_inventory,
+    sellable_inventory=None,
+    inventory_basis="sellable",
+    inventory_quality="exact",
+):
+    if inventory_basis not in VALID_INVENTORY_BASES:
+        raise ValueError("inventoryBasis must be sellable or physical")
     assigned = float(assigned_rooms or 0)
     revenue = float(room_revenue or 0)
-    available = float(inventory or 0)
+    physical = float(physical_inventory or 0)
+    sellable = float(
+        physical_inventory if sellable_inventory is None else sellable_inventory or 0
+    )
+    available = sellable if inventory_basis == "sellable" else physical
     return {
         "occ": assigned / available * 100 if available > 0 else None,
         "adr": revenue / assigned if assigned > 0 else None,
@@ -73,11 +91,20 @@ def calculate_metrics(assigned_rooms, room_revenue, inventory):
         "assignedRooms": assigned,
         "revenue": revenue,
         "inventory": available,
+        "physicalInventory": physical,
+        "sellableInventory": sellable,
+        "inventoryQuality": inventory_quality,
     }
 
 
 def _empty_fact():
-    return {"assigned_rooms": Decimal(0), "room_revenue": Decimal(0), "total_space": Decimal(0)}
+    return {
+        "assigned_rooms": Decimal(0),
+        "room_revenue": Decimal(0),
+        "total_space": Decimal(0),
+        "space_to_sell": Decimal(0),
+        "inventory_quality": "exact",
+    }
 
 
 def _add_fact(total, fact):
@@ -85,12 +112,22 @@ def _add_fact(total, fact):
         total["assigned_rooms"] += fact.get("assigned_rooms") or 0
         total["room_revenue"] += fact.get("room_revenue") or 0
         total["total_space"] += fact.get("total_space") or 0
+        total["space_to_sell"] += fact.get("space_to_sell") or 0
+        if fact.get("inventory_quality") == "approximated-current":
+            total["inventory_quality"] = "approximated-current"
     return total
 
 
-def _metric_fact(fact):
+def _metric_fact(fact, inventory_basis):
     fact = fact or _empty_fact()
-    return calculate_metrics(fact["assigned_rooms"], fact["room_revenue"], fact["total_space"])
+    return calculate_metrics(
+        fact["assigned_rooms"],
+        fact["room_revenue"],
+        fact["total_space"],
+        fact["space_to_sell"],
+        inventory_basis,
+        fact["inventory_quality"],
+    )
 
 
 def _publication(cursor, required=True):
@@ -162,14 +199,15 @@ def list_supplement_hotels():
                 for row in cursor.fetchall()
             ]
             cursor.execute("""
-                SELECT hotel_code, space_room_name, short_name, sort_order
+                SELECT hotel_code, room_category_id::text AS room_category_code,
+                       space_room_name, short_name, sort_order
                 FROM functions.supplement_room_categories
                 ORDER BY hotel_code, sort_order, space_room_name
             """)
             categories = defaultdict(list)
             for row in cursor.fetchall():
                 categories[row["hotel_code"]].append({
-                    "code": row["space_room_name"],
+                    "code": row["room_category_code"],
                     "name": row["space_room_name"],
                     "shortName": row["short_name"],
                     "order": row["sort_order"],
@@ -183,18 +221,19 @@ def list_supplement_hotels():
 
 def _load_latest_facts(cursor, minimum_date, maximum_date, hotel_codes):
     cursor.execute("""
-        SELECT i.stay_date, i.hotel_code, i.space_room_name,
+        SELECT i.stay_date, i.hotel_code,
+               i.space_room_category_id::text AS room_category_code,
                coalesce(c.assigned_rooms, 0) AS assigned_rooms,
                coalesce(c.room_revenue, 0) AS room_revenue,
-               i.total_space
+               i.total_space, i.space_to_sell, i.inventory_quality
         FROM functions.supplement_latest_inventory i
         LEFT JOIN functions.supplement_latest_category c
-          USING (stay_date, hotel_code, space_room_name, snapshot_date)
+          USING (stay_date, hotel_code, space_room_category_id, snapshot_date)
         WHERE i.stay_date BETWEEN %s AND %s
           AND i.hotel_code = ANY(%s)
     """, (minimum_date, maximum_date, hotel_codes))
     return {
-        (row["hotel_code"], row["stay_date"], row["space_room_name"]): row
+        (row["hotel_code"], row["stay_date"], row["room_category_code"]): row
         for row in cursor.fetchall()
     }
 
@@ -210,21 +249,23 @@ def _load_spit_facts(cursor, minimum_date, maximum_date, hotel_codes, as_of_date
             GROUP BY stay_date, hotel_code
         ),
         chosen_inventory AS (
-            SELECT i.stay_date, i.hotel_code, i.space_room_name,
-                   i.snapshot_date, i.total_space
+            SELECT i.stay_date, i.hotel_code, i.space_room_category_id,
+                   i.snapshot_date, i.total_space, i.space_to_sell,
+                   i.inventory_quality
             FROM functions.supplement_snapshot_inventory i
             JOIN chosen_stays s USING (stay_date, hotel_code, snapshot_date)
         )
-        SELECT i.stay_date, i.hotel_code, i.space_room_name,
+        SELECT i.stay_date, i.hotel_code,
+               i.space_room_category_id::text AS room_category_code,
                coalesce(c.assigned_rooms, 0) AS assigned_rooms,
                coalesce(c.room_revenue, 0) AS room_revenue,
-               i.total_space
+               i.total_space, i.space_to_sell, i.inventory_quality
         FROM chosen_inventory i
         LEFT JOIN functions.supplement_snapshot_category c
-          USING (stay_date, hotel_code, space_room_name, snapshot_date)
+          USING (stay_date, hotel_code, space_room_category_id, snapshot_date)
     """, (minimum_date, maximum_date, hotel_codes, as_of_date))
     return {
-        (row["hotel_code"], row["stay_date"], row["space_room_name"]): row
+        (row["hotel_code"], row["stay_date"], row["room_category_code"]): row
         for row in cursor.fetchall()
     }
 
@@ -250,7 +291,7 @@ def _build_dates(start_date, end_date, basis, today):
     return dates
 
 
-def _row_cells(hotel_codes, categories_by_hotel, dates, latest, spit):
+def _row_cells(hotel_codes, categories_by_hotel, dates, latest, spit, inventory_basis):
     cells = []
     for date_info in dates:
         stay_date = date.fromisoformat(date_info["date"])
@@ -261,7 +302,9 @@ def _row_cells(hotel_codes, categories_by_hotel, dates, latest, spit):
             _add_fact(facts["today"], _cell_for_categories(latest, hotel_code, stay_date, categories))
             _add_fact(facts["ly"], _cell_for_categories(latest, hotel_code, ly_date, categories))
             _add_fact(facts["spit"], _cell_for_categories(spit, hotel_code, ly_date, categories))
-        cells.append({key: _metric_fact(value) for key, value in facts.items()})
+        cells.append({
+            key: _metric_fact(value, inventory_basis) for key, value in facts.items()
+        })
     return cells
 
 
@@ -272,6 +315,7 @@ def fetch_supplement_grid(
     hotel_codes=None,
     room_categories=None,
     ly_comparison_basis="sameDate",
+    inventory_basis="sellable",
 ):
     validate_date_range(start_date, end_date)
     today = stockholm_today()
@@ -285,6 +329,8 @@ def fetch_supplement_grid(
         raise ValueError("mode must be single or comparison")
     if ly_comparison_basis not in VALID_LY_COMPARISONS:
         raise ValueError("lyComparisonBasis must be sameDate or sameWeekday")
+    if inventory_basis not in VALID_INVENTORY_BASES:
+        raise ValueError("inventoryBasis must be sellable or physical")
     requested_hotels = tuple(sorted(set(hotel_codes or ())))
     requested_categories = tuple(sorted(set(room_categories or ())))
     ensure_supplement_schema()
@@ -304,7 +350,7 @@ def fetch_supplement_grid(
             cache_key = (
                 publication["run_id"], status["status"], start_date, end_date, mode,
                 requested_hotels, requested_categories,
-                ly_comparison_basis,
+                ly_comparison_basis, inventory_basis,
             )
             with _grid_cache_lock:
                 cached = _grid_cache.get(cache_key)
@@ -328,16 +374,20 @@ def fetch_supplement_grid(
                 selected_hotels = selected_hotels[:1]
 
             cursor.execute("""
-                SELECT hotel_code, space_room_name, short_name, sort_order
+                SELECT hotel_code, room_category_id::text AS room_category_code,
+                       space_room_name, short_name, sort_order
                 FROM functions.supplement_room_categories
                 WHERE hotel_code = ANY(%s)
                 ORDER BY hotel_code, sort_order, space_room_name
             """, (selected_hotels,))
             category_metadata = defaultdict(list)
             short_names = {}
+            category_names = {}
             for row in cursor.fetchall():
-                category_metadata[row["hotel_code"]].append(row["space_room_name"])
-                short_names[(row["hotel_code"], row["space_room_name"])] = row["short_name"]
+                code = row["room_category_code"]
+                category_metadata[row["hotel_code"]].append(code)
+                short_names[(row["hotel_code"], code)] = row["short_name"]
+                category_names[(row["hotel_code"], code)] = row["space_room_name"]
             if mode == "single" and requested_categories:
                 allowed = set(requested_categories)
                 category_metadata[selected_hotels[0]] = [
@@ -358,11 +408,12 @@ def fetch_supplement_grid(
                     rows.append({
                         "rowType": "category",
                         "code": category,
-                        "label": category,
+                        "label": category_names.get((hotel_code, category), category),
                         "shortLabel": short_names.get((hotel_code, category), category[:8].upper()),
                         "isTotal": False,
                         "cells": _row_cells(
-                            [hotel_code], {hotel_code: [category]}, dates, latest, spit
+                            [hotel_code], {hotel_code: [category]}, dates, latest, spit,
+                            inventory_basis,
                         ),
                     })
                 if category_metadata[hotel_code]:
@@ -373,7 +424,8 @@ def fetch_supplement_grid(
                         "shortLabel": "Total",
                         "isTotal": True,
                         "cells": _row_cells(
-                            [hotel_code], category_metadata, dates, latest, spit
+                            [hotel_code], category_metadata, dates, latest, spit,
+                            inventory_basis,
                         ),
                     })
             else:
@@ -385,7 +437,8 @@ def fetch_supplement_grid(
                         "shortLabel": hotel_lookup[hotel_code],
                         "isTotal": False,
                         "cells": _row_cells(
-                            [hotel_code], category_metadata, dates, latest, spit
+                            [hotel_code], category_metadata, dates, latest, spit,
+                            inventory_basis,
                         ),
                     })
                 rows.append({
@@ -394,7 +447,10 @@ def fetch_supplement_grid(
                     "label": "Selected hotels",
                     "shortLabel": "Total",
                     "isTotal": True,
-                    "cells": _row_cells(selected_hotels, category_metadata, dates, latest, spit),
+                    "cells": _row_cells(
+                        selected_hotels, category_metadata, dates, latest, spit,
+                        inventory_basis,
+                    ),
                 })
 
             payload = {
@@ -405,7 +461,19 @@ def fetch_supplement_grid(
                     "mode": mode,
                     "hotelCodes": selected_hotels,
                     "lyComparisonBasis": ly_comparison_basis,
+                    "inventoryBasis": inventory_basis,
                 },
+                "inventoryBasis": inventory_basis,
+                "inventoryQuality": (
+                    "approximated-current"
+                    if any(
+                        cell[mode]["inventoryQuality"] == "approximated-current"
+                        for row in rows for cell in row["cells"]
+                        for mode in ("today", "ly", "spit")
+                    ) else "exact"
+                ),
+                "inventoryExactFrom": INVENTORY_EXACT_FROM.isoformat(),
+                "spitMethod": "lifecycle",
                 "dates": dates,
                 "rows": rows,
                 "totals": next((row for row in reversed(rows) if row["isTotal"]), None),
@@ -418,18 +486,22 @@ def fetch_supplement_grid(
 
 
 def _detail_rows(cursor, table, hotel_code, stay_date, category, as_of=None):
-    category_clause = "AND space_room_name = %(category)s" if category else ""
+    category_clause = "AND space_room_category_id = %(category)s::uuid" if category else ""
     if table == "latest":
         cursor.execute(f"""
-            SELECT requested_room_name, sum(assigned_rooms) AS assigned_rooms,
+            SELECT requested_room_category_id::text AS requested_room_category_code,
+                   max(requested_room_name) AS requested_room_name,
+                   sum(assigned_rooms) AS assigned_rooms,
                    sum(room_revenue) AS room_revenue
             FROM functions.supplement_latest_detail
             WHERE hotel_code = %(hotel_code)s AND stay_date = %(stay_date)s
               {category_clause}
-            GROUP BY requested_room_name
+            GROUP BY requested_room_category_id
         """, {"hotel_code": hotel_code, "stay_date": stay_date, "category": category})
     else:
-        detail_category_clause = "AND d.space_room_name = %(category)s" if category else ""
+        detail_category_clause = (
+            "AND d.space_room_category_id = %(category)s::uuid" if category else ""
+        )
         cursor.execute(f"""
             WITH chosen AS (
                 SELECT max(snapshot_date) AS snapshot_date
@@ -437,12 +509,14 @@ def _detail_rows(cursor, table, hotel_code, stay_date, category, as_of=None):
                 WHERE hotel_code = %(hotel_code)s AND stay_date = %(stay_date)s
                   AND snapshot_date <= %(as_of)s
             )
-            SELECT d.requested_room_name, sum(d.assigned_rooms) AS assigned_rooms,
+            SELECT d.requested_room_category_id::text AS requested_room_category_code,
+                   max(d.requested_room_name) AS requested_room_name,
+                   sum(d.assigned_rooms) AS assigned_rooms,
                    sum(d.room_revenue) AS room_revenue
             FROM functions.supplement_snapshot_detail d, chosen c
             WHERE d.hotel_code = %(hotel_code)s AND d.stay_date = %(stay_date)s
               AND d.snapshot_date = c.snapshot_date {detail_category_clause}
-            GROUP BY d.requested_room_name
+            GROUP BY d.requested_room_category_id
         """, {
             "hotel_code": hotel_code, "stay_date": stay_date,
             "category": category, "as_of": as_of,
@@ -451,15 +525,19 @@ def _detail_rows(cursor, table, hotel_code, stay_date, category, as_of=None):
 
 
 def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
-    category_clause = "AND i.space_room_name = %(category)s" if category else ""
+    category_clause = (
+        "AND i.space_room_category_id = %(category)s::uuid" if category else ""
+    )
     cursor.execute(f"""
         SELECT i.snapshot_date, coalesce(sum(c.assigned_rooms), 0) AS assigned_rooms,
                coalesce(sum(c.room_revenue), 0) AS room_revenue,
                sum(i.total_space) AS total_space,
-               sum(i.space_to_sell) AS space_to_sell
+               sum(i.space_to_sell) AS space_to_sell,
+               CASE WHEN bool_or(i.inventory_quality = 'approximated-current')
+                    THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
         FROM functions.supplement_snapshot_inventory i
         LEFT JOIN functions.supplement_snapshot_category c
-          USING (snapshot_date, stay_date, hotel_code, space_room_name)
+          USING (snapshot_date, stay_date, hotel_code, space_room_category_id)
         WHERE i.hotel_code = %(hotel_code)s AND i.stay_date = %(stay_date)s
           AND i.snapshot_date BETWEEN (%(stay_date)s - 366) AND (%(stay_date)s + 7)
           AND i.snapshot_date <= %(maximum_snapshot_date)s
@@ -475,9 +553,17 @@ def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date)
     return cursor.fetchall()
 
 
-def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis):
+def fetch_supplement_detail(
+    hotel_code,
+    stay_date,
+    category,
+    ly_comparison_basis,
+    inventory_basis="sellable",
+):
     if ly_comparison_basis not in VALID_LY_COMPARISONS:
         raise ValueError("lyComparisonBasis must be sameDate or sameWeekday")
+    if inventory_basis not in VALID_INVENTORY_BASES:
+        raise ValueError("inventoryBasis must be sellable or physical")
     today = stockholm_today()
     minimum_allowed = add_months(today, -36)
     maximum_allowed = add_months(today, 18)
@@ -492,7 +578,7 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
             status = _status_payload(publication)
             cache_key = (
                 publication["run_id"], status["status"], hotel_code, stay_date, category,
-                ly_comparison_basis,
+                ly_comparison_basis, inventory_basis,
             )
             with _detail_cache_lock:
                 cached = _detail_cache.get(cache_key)
@@ -518,7 +604,7 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
             if category:
                 cursor.execute("""
                     SELECT 1 FROM functions.supplement_room_categories
-                    WHERE hotel_code = %s AND space_room_name = %s
+                    WHERE hotel_code = %s AND room_category_id = %s::uuid
                 """, (hotel_code, category))
                 if cursor.fetchone() is None:
                     raise ValueError("Unknown Supplement room category")
@@ -533,17 +619,28 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
                 category,
                 comparison_as_of,
             )
-            comparison_map = {row["requested_room_name"]: row for row in comparison_rows}
-            requested_names = sorted({row["requested_room_name"] for row in current_rows} | set(comparison_map))
-            current_map = {row["requested_room_name"]: row for row in current_rows}
+            comparison_map = {
+                row["requested_room_category_code"]: row for row in comparison_rows
+            }
+            requested_codes = sorted({
+                row["requested_room_category_code"] for row in current_rows
+            } | set(comparison_map))
+            current_map = {
+                row["requested_room_category_code"]: row for row in current_rows
+            }
             breakdown = []
-            for name in requested_names:
-                current = current_map.get(name) or {}
-                comparison = comparison_map.get(name) or {}
+            for code in requested_codes:
+                current = current_map.get(code) or {}
+                comparison = comparison_map.get(code) or {}
                 current_rooms = float(current.get("assigned_rooms") or 0)
                 comparison_rooms = float(comparison.get("assigned_rooms") or 0)
                 breakdown.append({
-                    "requestedRoomName": name,
+                    "requestedRoomCategoryId": code,
+                    "requestedRoomName": (
+                        current.get("requested_room_name")
+                        or comparison.get("requested_room_name")
+                        or code
+                    ),
                     "assignedRooms": current_rooms,
                     "averagePrice": float(current.get("room_revenue") or 0) / current_rooms if current_rooms else None,
                     "comparisonAssignedRooms": comparison_rooms,
@@ -552,10 +649,12 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
 
             cursor.execute("""
                 SELECT sum(total_space) AS total_space,
-                       sum(space_to_sell) AS space_to_sell
+                       sum(space_to_sell) AS space_to_sell,
+                       CASE WHEN bool_or(inventory_quality = 'approximated-current')
+                            THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
                 FROM functions.supplement_latest_inventory
                 WHERE hotel_code = %s AND stay_date = %s
-                  AND (%s IS NULL OR space_room_name = %s)
+                  AND (%s IS NULL OR space_room_category_id = %s::uuid)
             """, (hotel_code, stay_date, category, category))
             inventory = cursor.fetchone()
             pickup = []
@@ -565,11 +664,14 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
                 rooms = float(row["assigned_rooms"] or 0)
                 pickup.append({
                     "viewDate": row["snapshot_date"].isoformat(),
-                    "daysBeforeStay": max((stay_date - row["snapshot_date"]).days, 0),
+                    "daysBeforeStay": (stay_date - row["snapshot_date"]).days,
                     "assignedRooms": rooms,
                     "averagePrice": float(row["room_revenue"] or 0) / rooms if rooms else None,
                     "totalSpace": float(row["total_space"] or 0),
                     "spaceToSell": float(row["space_to_sell"] or 0),
+                    "physicalInventory": float(row["total_space"] or 0),
+                    "sellableInventory": float(row["space_to_sell"] or 0),
+                    "inventoryQuality": row["inventory_quality"],
                 })
             comparison_pickup = []
             comparison_pickup_cutoff = comparison_as_of if future else comparison_date + timedelta(days=7)
@@ -579,12 +681,24 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
                 rooms = float(row["assigned_rooms"] or 0)
                 comparison_pickup.append({
                     "viewDate": row["snapshot_date"].isoformat(),
-                    "daysBeforeStay": max((comparison_date - row["snapshot_date"]).days, 0),
+                    "daysBeforeStay": (comparison_date - row["snapshot_date"]).days,
                     "assignedRooms": rooms,
                     "averagePrice": float(row["room_revenue"] or 0) / rooms if rooms else None,
+                    "physicalInventory": float(row["total_space"] or 0),
+                    "sellableInventory": float(row["space_to_sell"] or 0),
+                    "inventoryQuality": row["inventory_quality"],
                 })
             total_assigned = sum(float(row.get("assigned_rooms") or 0) for row in current_rows)
             total_revenue = sum(float(row.get("room_revenue") or 0) for row in current_rows)
+            inventory_quality = (
+                "approximated-current"
+                if inventory.get("inventory_quality") == "approximated-current"
+                or any(
+                    point["inventoryQuality"] == "approximated-current"
+                    for point in pickup + comparison_pickup
+                )
+                else "exact"
+            )
             payload = {
                 **status,
                 "hotelCode": hotel_code,
@@ -596,6 +710,17 @@ def fetch_supplement_detail(hotel_code, stay_date, category, ly_comparison_basis
                 "totalAveragePrice": total_revenue / total_assigned if total_assigned else None,
                 "totalSpace": float(inventory.get("total_space") or 0),
                 "spaceToSell": float(inventory.get("space_to_sell") or 0),
+                "physicalInventory": float(inventory.get("total_space") or 0),
+                "sellableInventory": float(inventory.get("space_to_sell") or 0),
+                "inventoryBasis": inventory_basis,
+                "inventory": float(
+                    inventory.get(
+                        "space_to_sell" if inventory_basis == "sellable" else "total_space"
+                    ) or 0
+                ),
+                "inventoryQuality": inventory_quality,
+                "inventoryExactFrom": INVENTORY_EXACT_FROM.isoformat(),
+                "spitMethod": "lifecycle",
                 "breakdown": breakdown,
                 "pickup": pickup,
                 "comparisonPickup": comparison_pickup,

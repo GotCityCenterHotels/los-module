@@ -45,6 +45,22 @@ class SupplementDomainTests(unittest.TestCase):
         self.assertEqual(metrics["adr"], 2000)
         self.assertEqual(metrics["revpar"], 1250)
 
+    def test_inventory_basis_changes_occ_and_revpar_not_adr(self):
+        sellable = supplement_service.calculate_metrics(50, 100000, 100, 80)
+        physical = supplement_service.calculate_metrics(
+            50, 100000, 100, 80, "physical", "approximated-current"
+        )
+        self.assertEqual(sellable["occ"], 62.5)
+        self.assertEqual(physical["occ"], 50)
+        self.assertEqual(sellable["adr"], physical["adr"])
+        self.assertEqual(physical["physicalInventory"], 100)
+        self.assertEqual(physical["sellableInventory"], 80)
+        self.assertEqual(physical["inventoryQuality"], "approximated-current")
+
+    def test_invalid_inventory_basis_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "inventoryBasis"):
+            supplement_service.calculate_metrics(1, 1, 1, 1, "rooms")
+
     def test_sync_horizon_adds_eighteen_months(self):
         self.assertEqual(
             supplement_sync_service.add_months(date(2024, 8, 31), 18),

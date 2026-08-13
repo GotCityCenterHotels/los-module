@@ -7,8 +7,16 @@ from cost_database import cost_pool
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
-MIGRATION_NAME = "003_supplement_read_model"
-MIGRATION_PATH = APP_ROOT / "sql" / "migrations" / f"{MIGRATION_NAME}.sql"
+MIGRATIONS = (
+    (
+        "003_supplement_read_model",
+        APP_ROOT / "sql" / "migrations" / "003_supplement_read_model.sql",
+    ),
+    (
+        "004_supplement_lifecycle_ids",
+        APP_ROOT / "sql" / "migrations" / "004_supplement_lifecycle_ids.sql",
+    ),
+)
 
 _schema_ready = False
 _schema_lock = Lock()
@@ -41,13 +49,20 @@ def ensure_supplement_schema():
                             applied_at timestamptz NOT NULL DEFAULT now()
                         )
                     """)
-                    cursor.execute(
-                        "SELECT 1 FROM functions.schema_migrations WHERE migration_name = %s",
-                        (MIGRATION_NAME,),
-                    )
-                    if cursor.fetchone() is None:
-                        cursor.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
-                        logging.info("Applied Supplement migration path=%s", MIGRATION_PATH)
+                    for migration_name, migration_path in MIGRATIONS:
+                        cursor.execute(
+                            "SELECT 1 FROM functions.schema_migrations "
+                            "WHERE migration_name = %s",
+                            (migration_name,),
+                        )
+                        if cursor.fetchone() is not None:
+                            continue
+                        cursor.execute(migration_path.read_text(encoding="utf-8"))
+                        logging.info(
+                            "Applied Supplement migration name=%s path=%s",
+                            migration_name,
+                            migration_path,
+                        )
                 except Exception as error:
                     connection.rollback()
                     sqlstate = getattr(error, "sqlstate", None) or "unknown"

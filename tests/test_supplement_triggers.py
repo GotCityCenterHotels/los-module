@@ -3,6 +3,7 @@ import gzip
 import json
 import unittest
 
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 
@@ -50,6 +51,7 @@ class SupplementTriggerTests(unittest.TestCase):
             "mode": "comparison",
             "hotelCodes": "a,b",
             "lyComparisonBasis": "sameWeekday",
+            "inventoryBasis": "physical",
         })
         with patch.dict(os.environ, {"SUPPLEMENT_LIVE_ENABLED": "true"}), patch.object(
             function_app,
@@ -63,6 +65,7 @@ class SupplementTriggerTests(unittest.TestCase):
         arguments = fetch.call_args.kwargs
         self.assertEqual(arguments["hotel_codes"], ["a", "b"])
         self.assertEqual(arguments["ly_comparison_basis"], "sameWeekday")
+        self.assertEqual(arguments["inventory_basis"], "physical")
 
     def test_authenticated_import_forwards_repair_dates(self):
         expected = {"status": "published", "runId": 4}
@@ -87,9 +90,26 @@ class SupplementTriggerTests(unittest.TestCase):
             function_app,
             "sync_supplement",
             return_value={"status": "published"},
-        ) as sync:
+        ) as sync, patch.object(function_app, "supplement_timer_due", return_value=True):
             function_app.supplement_data_timer(FakeTimer())
         sync.assert_called_once_with("delta")
+
+    def test_stockholm_timer_selects_one_utc_candidate_across_dst(self):
+        cases = (
+            (datetime(2026, 1, 15, 1, 15, tzinfo=timezone.utc), True),
+            (datetime(2026, 1, 15, 0, 15, tzinfo=timezone.utc), False),
+            (datetime(2026, 7, 15, 0, 15, tzinfo=timezone.utc), True),
+            (datetime(2026, 7, 15, 1, 15, tzinfo=timezone.utc), False),
+            # First 02:15 wins when the clock repeats during autumn fallback.
+            (datetime(2026, 10, 25, 0, 15, tzinfo=timezone.utc), True),
+            (datetime(2026, 10, 25, 1, 15, tzinfo=timezone.utc), False),
+            # Spring's nonexistent 02:15 runs at the first valid instant after it.
+            (datetime(2026, 3, 29, 1, 15, tzinfo=timezone.utc), True),
+        )
+        with patch.dict(os.environ, {"SUPPLEMENT_TIME_ZONE": "Europe/Stockholm"}):
+            for timestamp, expected in cases:
+                with self.subTest(timestamp=timestamp):
+                    self.assertEqual(function_app.supplement_timer_due(timestamp), expected)
 
     def test_cached_response_compresses_when_requested(self):
         payload = {"runId": 7, "status": "available", "rows": [1, 2, 3]}

@@ -3,9 +3,10 @@ import json
 import logging
 import os
 
-from datetime import date
+from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from time import perf_counter
+from zoneinfo import ZoneInfo
 
 import azure.functions as func
 
@@ -33,6 +34,8 @@ from shared.pipeline import run_all_datasets, run_dataset
 app = func.FunctionApp()
 
 VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
+SUPPLEMENT_TIMER_HOUR = 2
+SUPPLEMENT_TIMER_MINUTE = 15
 
 
 def parse_date(value: str | None) -> date | None:
@@ -58,6 +61,31 @@ def supplement_enabled():
     return os.environ.get("SUPPLEMENT_LIVE_ENABLED", "false").lower() in {
         "1", "true", "yes", "on"
     }
+
+
+def supplement_timer_due(now_utc=None):
+    """Map the Stockholm 02:15 schedule onto the two possible UTC hours.
+
+    Linux Flex Consumption does not support WEBSITE_TIME_ZONE or TZ. The host
+    invokes us at 00:15 and 01:15 UTC; this guard selects exactly one invocation
+    using Stockholm DST rules. On the spring-forward day, nonexistent 02:15 is
+    resolved to the first valid instant afterward (03:15 local).
+    """
+    current_utc = now_utc or datetime.now(timezone.utc)
+    if current_utc.tzinfo is None:
+        current_utc = current_utc.replace(tzinfo=timezone.utc)
+    current_utc = current_utc.astimezone(timezone.utc)
+    time_zone = ZoneInfo(
+        os.environ.get("SUPPLEMENT_TIME_ZONE", "Europe/Stockholm")
+    )
+    local_date = current_utc.astimezone(time_zone).date()
+    target_local = datetime.combine(
+        local_date,
+        time(SUPPLEMENT_TIMER_HOUR, SUPPLEMENT_TIMER_MINUTE),
+        tzinfo=time_zone,
+    )
+    target_utc = target_local.astimezone(timezone.utc)
+    return target_utc <= current_utc < target_utc + timedelta(minutes=45)
 
 
 def supplement_disabled_response():
@@ -409,6 +437,7 @@ def supplement_grid(req: func.HttpRequest) -> func.HttpResponse:
         )
     mode = req.params.get("mode") or "single"
     ly_basis = req.params.get("lyComparisonBasis") or "sameDate"
+    inventory_basis = req.params.get("inventoryBasis") or "sellable"
     hotel_codes = sorted(set(list_parameter(req, "hotelCodes")))
     room_categories = sorted(set(list_parameter(req, "roomCategories")))
     started_at = perf_counter()
@@ -420,9 +449,11 @@ def supplement_grid(req: func.HttpRequest) -> func.HttpResponse:
             hotel_codes=hotel_codes,
             room_categories=room_categories,
             ly_comparison_basis=ly_basis,
+            inventory_basis=inventory_basis,
         )
         request_key = "|".join([
             start_date.isoformat(), end_date.isoformat(), mode, ly_basis,
+            inventory_basis,
             ",".join(hotel_codes), ",".join(room_categories),
         ])
         response = supplement_cached_response(req, payload, request_key)
@@ -453,6 +484,7 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
     stay_date = parse_date(req.params.get("stayDate"))
     category = (req.params.get("roomCategory") or "").strip() or None
     ly_basis = req.params.get("lyComparisonBasis") or "sameDate"
+    inventory_basis = req.params.get("inventoryBasis") or "sellable"
     if not hotel_code or stay_date is None:
         return json_response(
             {"error": "hotelCode and a YYYY-MM-DD stayDate are required"},
@@ -461,10 +493,11 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
     try:
         started_at = perf_counter()
         payload = fetch_supplement_detail(
-            hotel_code, stay_date, category, ly_basis
+            hotel_code, stay_date, category, ly_basis, inventory_basis
         )
         request_key = "|".join([
             hotel_code, stay_date.isoformat(), category or "", ly_basis,
+            inventory_basis,
         ])
         response = supplement_cached_response(req, payload, request_key)
         logging.info(
@@ -531,7 +564,9 @@ def cost_data_timer(mytimer: func.TimerRequest) -> None:
 
 @app.function_name(name="SupplementDataTimer")
 @app.timer_trigger(
-    schedule="0 15 2 * * *",
+    # Flex Consumption timers use UTC. These are the CET and CEST candidates;
+    # supplement_timer_due selects the Stockholm-local 02:15 occurrence.
+    schedule="0 15 0,1 * * *",
     arg_name="mytimer",
     run_on_startup=False,
     use_monitor=True,
@@ -540,6 +575,9 @@ def supplement_data_timer(mytimer: func.TimerRequest) -> None:
     """Copy bounded Supplement snapshots from integration_db into PostgreSQL."""
     if not supplement_enabled():
         logging.info("SupplementDataTimer skipped because live data is disabled")
+        return
+    if not supplement_timer_due():
+        logging.info("SupplementDataTimer skipped non-Stockholm UTC candidate")
         return
     if mytimer.past_due:
         logging.warning("SupplementDataTimer is running later than scheduled")

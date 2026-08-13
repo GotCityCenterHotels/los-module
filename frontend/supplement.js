@@ -15,6 +15,7 @@
         startDate: document.getElementById("supplementStartDate"),
         endDate: document.getElementById("supplementEndDate"),
         lyBasis: document.getElementById("supplementLyBasis"),
+        inventoryBasis: document.getElementById("supplementInventoryBasis"),
         diffMode: document.getElementById("supplementDiffMode"),
         highlights: document.getElementById("metricHighlightOptions"),
         pastLyDiff: document.getElementById("pastLyDiff"),
@@ -50,6 +51,7 @@
         startDate: Data.formatDateKey(new Date(todayUtc.getTime() - 3 * 86_400_000)),
         endDate: Data.formatDateKey(new Date(todayUtc.getTime() + 3 * 86_400_000)),
         lyComparisonType: "sameDate",
+        inventoryBasis: "sellable",
         differenceMode: "percent",
         pastLyDiff: true,
         futureSpitDiff: false,
@@ -75,14 +77,19 @@
     }
 
     function setFreshness(payload) {
-        elements.freshness.classList.toggle("is-stale", Boolean(payload?.stale));
+        const approximate = payload?.inventoryQuality === "approximated-current";
+        elements.freshness.classList.toggle("is-stale", Boolean(payload?.stale || approximate));
         if (!payload?.dataAsOf) {
             elements.freshness.innerHTML = "<strong>Supplement unavailable</strong><span>No PostgreSQL snapshot has been published.</span>";
             return;
         }
-        elements.freshness.innerHTML = payload.stale
-            ? `<strong>Data is stale</strong><span>Last published snapshot: ${escapeHtml(payload.dataAsOf)}.</span>`
-            : `<strong>Published through ${escapeHtml(payload.dataAsOf)}</strong><span>Served from PostgreSQL · integration_db is not queried by this view.</span>`;
+        if (payload.stale) {
+            elements.freshness.innerHTML = `<strong>Data is stale</strong><span>Last published snapshot: ${escapeHtml(payload.dataAsOf)}.</span>`;
+        } else if (approximate) {
+            elements.freshness.innerHTML = `<strong>Historical inventory is approximate</strong><span>Exact inventory history begins ${escapeHtml(payload.inventoryExactFrom)}; booking lifecycle facts remain historical.</span>`;
+        } else {
+            elements.freshness.innerHTML = `<strong>Published through ${escapeHtml(payload.dataAsOf)}</strong><span>Served from PostgreSQL; integration_db is not queried by this view.</span>`;
+        }
     }
 
     function showUnavailable(error) {
@@ -198,6 +205,7 @@
         state.endDate = elements.endDate.value;
         state.hotelCode = elements.hotel.value || state.hotelCode;
         state.lyComparisonType = elements.lyBasis.value;
+        state.inventoryBasis = elements.inventoryBasis.value;
         const validation = Data.validateDateRange(state.startDate, state.endDate);
         elements.validation.hidden = validation.valid;
         elements.validation.textContent = validation.error || "";
@@ -221,13 +229,14 @@
                 mode: state.mode,
                 hotelCodes,
                 roomCategories: state.mode === "single" ? [...state.enabledCategories] : [],
-                lyComparisonBasis: state.lyComparisonType
+                lyComparisonBasis: state.lyComparisonType,
+                inventoryBasis: state.inventoryBasis
             }, API_BASE_URL);
             if (requestId !== state.requestId) return;
             state.payload = payload;
             state.windowStart = 0;
             setFreshness(payload);
-            elements.rangeSummary.textContent = `${validation.dayCount}-day view · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
+            elements.rangeSummary.textContent = `${validation.dayCount}-day view · ${state.inventoryBasis === "sellable" ? "sellable" : "physical"} inventory · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
             renderTable(payload);
         } catch (error) {
             if (requestId === state.requestId) showUnavailable(error);
@@ -284,15 +293,20 @@
                 hotelCode: button.dataset.detailHotel,
                 stayDate: button.dataset.detailDate,
                 roomCategory: button.dataset.detailCategory || "",
-                lyComparisonBasis: state.lyComparisonType
+                lyComparisonBasis: state.lyComparisonType,
+                inventoryBasis: state.inventoryBasis
             }, API_BASE_URL);
             const hotelName = state.hotels.find(({ code }) => code === payload.hotelCode)?.name || payload.hotelCode;
-            elements.detailContext.textContent = `${hotelName} · ${payload.roomCategory || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
+            const categoryName = (state.categoriesByHotel[payload.hotelCode] || [])
+                .find(({ code }) => code === payload.roomCategory)?.name;
+            elements.detailContext.textContent = `${hotelName} · ${categoryName || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
             elements.detailBreakdown.innerHTML = payload.breakdown.length
                 ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${Data.formatMetric(row.comparisonAssignedRooms, "adr")}</td><td>${Data.formatMetric(row.comparisonAveragePrice, "adr")}</td></tr>`).join("")
                 : '<tr><td colspan="5">No assigned rooms for this stay date.</td></tr>';
             elements.pickupCurve.innerHTML = curveSvg(payload.pickup, payload.comparisonPickup);
-            elements.dialogFootnote.textContent = `Published through ${payload.dataAsOf} · served from PostgreSQL.`;
+            elements.dialogFootnote.textContent = payload.inventoryQuality === "approximated-current"
+                ? `Published through ${payload.dataAsOf} · inventory is approximated from current rooms before ${payload.inventoryExactFrom}.`
+                : `Published through ${payload.dataAsOf} · served from PostgreSQL.`;
         } catch (error) {
             elements.detailContext.textContent = error.message || "Detail data is unavailable.";
         }
@@ -320,6 +334,7 @@
     elements.startDate.addEventListener("change", loadGrid);
     elements.endDate.addEventListener("change", loadGrid);
     elements.lyBasis.addEventListener("change", loadGrid);
+    elements.inventoryBasis.addEventListener("change", loadGrid);
     elements.diffMode.addEventListener("change", renderLocalChange);
     elements.pastLyDiff.addEventListener("change", renderLocalChange);
     elements.futureSpitDiff.addEventListener("change", renderLocalChange);

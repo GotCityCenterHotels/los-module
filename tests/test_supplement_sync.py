@@ -66,36 +66,39 @@ class FakeConnection:
 
 
 class SupplementSyncOrchestrationTests(unittest.TestCase):
-    def _patches(self, connection, snapshots, validate_side_effect=None):
+    def _patches(self, connection, validate_side_effect=None):
         validate = patch.object(
             sync_service,
-            "_validate_stage",
-            return_value=12,
+            "_validate_stages",
+            return_value=(12, 4),
             side_effect=validate_side_effect,
         )
         return (
             patch.object(sync_service, "ensure_supplement_schema"),
             patch.object(sync_service.cost_pool, "connection", return_value=nullcontext(connection)),
-            patch.object(sync_service, "fetch_latest_source_snapshot", return_value=date(2026, 8, 13)),
-            patch.object(sync_service, "fetch_source_snapshot_dates", return_value=snapshots),
-            patch.object(sync_service, "iter_source_snapshot_batches", return_value=iter(())),
-            patch.object(sync_service, "_create_stage"),
+            patch.object(sync_service, "stockholm_today", return_value=date(2026, 8, 13)),
+            patch.object(sync_service, "iter_booking_lifecycle_batches", return_value=iter(())),
+            patch.object(sync_service, "iter_inventory_batches", return_value=iter(())),
+            patch.object(sync_service, "_create_stages"),
+            patch.object(sync_service, "_materialize_snapshot_facts"),
             validate,
         )
 
     def test_delta_rereads_latest_and_preceding_three_dates_then_publishes_atomically(self):
         connection = FakeConnection()
         snapshots = [date(2026, 8, day) for day in range(10, 14)]
-        patches = self._patches(connection, snapshots)
-        with patches[0], patches[1], patches[2], patches[3] as discover, \
-                patches[4], patches[5], patches[6], patch.object(
+        patches = self._patches(connection)
+        with patches[0], patches[1], patches[2], patches[3] as booking, \
+                patches[4] as inventory, patches[5], patches[6], patches[7], patch.object(
                     sync_service, "_publish_stage",
                     side_effect=lambda *_args: connection.events.append(("publish-stage",)),
                 ) as publish:
             result = sync_service.sync_supplement("delta")
 
         self.assertEqual(result["status"], "published")
-        discover.assert_called_once_with(date(2026, 8, 10), date(2026, 8, 13))
+        self.assertEqual(booking.call_count, 1)
+        self.assertEqual(booking.call_args.args[0], snapshots)
+        inventory.assert_called_once_with(snapshots, 5000)
         publish.assert_called_once()
         self.assertEqual(publish.call_args.args[2], snapshots)
         event_names = [event[0] for event in connection.events]
@@ -109,13 +112,9 @@ class SupplementSyncOrchestrationTests(unittest.TestCase):
 
     def test_validation_failure_rolls_back_and_does_not_move_publication(self):
         connection = FakeConnection()
-        patches = self._patches(
-            connection,
-            [date(2026, 8, 13)],
-            validate_side_effect=ValueError("bad source"),
-        )
+        patches = self._patches(connection, validate_side_effect=ValueError("bad source"))
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
-                patches[5], patches[6], patch.object(sync_service, "_publish_stage"):
+                patches[5], patches[6], patches[7], patch.object(sync_service, "_publish_stage"):
             with self.assertRaisesRegex(ValueError, "bad source"):
                 sync_service.sync_supplement("delta")
 
@@ -131,7 +130,7 @@ class SupplementSyncOrchestrationTests(unittest.TestCase):
             sync_service.cost_pool,
             "connection",
             return_value=nullcontext(connection),
-        ), patch.object(sync_service, "fetch_latest_source_snapshot") as source:
+        ), patch.object(sync_service, "stockholm_today") as source:
             with self.assertRaisesRegex(RuntimeError, "already running"):
                 sync_service.sync_supplement("delta")
         source.assert_not_called()

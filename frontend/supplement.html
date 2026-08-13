@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Supplement Revenue Management</title>
-    <link rel="stylesheet" href="styles.css?v=20260813-4">
+    <link rel="stylesheet" href="styles.css?v=20260813-5">
 </head>
 <body>
     <main class="container supplement-container">
@@ -78,6 +78,13 @@
                     </select>
                 </div>
                 <div class="supplement-control">
+                    <label for="supplementInventoryBasis">Inventory</label>
+                    <select id="supplementInventoryBasis">
+                        <option value="sellable">Sellable rooms</option>
+                        <option value="physical">Physical rooms</option>
+                    </select>
+                </div>
+                <div class="supplement-control">
                     <label for="supplementDiffMode">Difference</label>
                     <select id="supplementDiffMode">
                         <option value="percent">Percent</option>
@@ -142,7 +149,7 @@
         <p id="dialogFootnote" class="dialog-footnote">Loaded from the latest published PostgreSQL snapshot.</p>
     </dialog>
 
-    <script src="supplement-data.js?v=20260813-4"></script>
-    <script src="supplement.js?v=20260813-4"></script>
+    <script src="supplement-data.js?v=20260813-5"></script>
+    <script src="supplement.js?v=20260813-5"></script>
 </body>
 </html>
