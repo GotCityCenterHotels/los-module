@@ -28,6 +28,8 @@ test("Supplement page exposes its controls, table landmark, and accessible dialo
     ];
     for (const id of requiredIds) assert.match(html, new RegExp(`id="${id}"`));
     assert.match(html, /aria-current="page">Supplement/);
-    assert.match(html, /Simulated preview data/);
+    assert.match(html, /Loading Supplement data/);
+    assert.doesNotMatch(html, /Simulated preview data/);
     assert.match(html, /<dialog[^>]+aria-labelledby="detailTitle"/);
+    assert.match(html, /id="dateWindowNav"/);
 });

@@ -9,6 +9,10 @@ os.environ.setdefault("DB_HOST", "localhost")
 os.environ.setdefault("DB_NAME", "los-test")
 os.environ.setdefault("DB_USER", "los-test")
 os.environ.setdefault("DB_PASSWORD", "not-used")
+os.environ.setdefault("POSTGRES_HOST", "localhost")
+os.environ.setdefault("POSTGRES_DB", "app-test")
+os.environ.setdefault("POSTGRES_USER", "app-test")
+os.environ.setdefault("POSTGRES_PASSWORD", "not-used")
 
 from services import cost_data_service
 

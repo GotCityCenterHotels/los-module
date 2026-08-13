@@ -14,19 +14,21 @@ def _setting(*names, default=None):
     raise KeyError(names[0])
 
 
-# Cost data is stored in a separate PostgreSQL database. Dedicated COST_DB_*
-# settings allow it to live on another server, while the fallbacks keep local
-# and same-server deployments concise.
+# Database A is the writable PostgreSQL application database. It intentionally
+# never falls back to DB_* because those settings identify integration_db.
+_app_db_name = _setting("COST_DB_NAME", "POSTGRES_DB")
+if _app_db_name.lower() == "integration_db":
+    raise RuntimeError("Database A cannot be integration_db")
+
 connection_string = make_conninfo(
-    host=_setting("COST_DB_HOST", "POSTGRES_HOST", "DB_HOST"),
-    port=_setting("COST_DB_PORT", "POSTGRES_PORT", "DB_PORT", default="5432"),
-    dbname=_setting("COST_DB_NAME", "POSTGRES_DB", default="postgres"),
-    user=_setting("COST_DB_USER", "POSTGRES_USER", "DB_USER"),
-    password=_setting("COST_DB_PASSWORD", "POSTGRES_PASSWORD", "DB_PASSWORD"),
+    host=_setting("COST_DB_HOST", "POSTGRES_HOST"),
+    port=_setting("COST_DB_PORT", "POSTGRES_PORT", default="5432"),
+    dbname=_app_db_name,
+    user=_setting("COST_DB_USER", "POSTGRES_USER"),
+    password=_setting("COST_DB_PASSWORD", "POSTGRES_PASSWORD"),
     sslmode=_setting(
         "COST_DB_SSLMODE",
         "POSTGRES_SSLMODE",
-        "DB_SSLMODE",
         default="require",
     ),
 )

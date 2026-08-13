@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Supplement Preview</title>
-    <link rel="stylesheet" href="styles.css?v=20260813-3">
+    <title>Supplement Revenue Management</title>
+    <link rel="stylesheet" href="styles.css?v=20260813-4">
 </head>
 <body>
     <main class="container supplement-container">
@@ -22,9 +22,9 @@
                 <h1>Supplement</h1>
                 <p>Inspect occupancy, ADR, and RevPAR across room categories and properties.</p>
             </div>
-            <div class="preview-notice" role="status">
-                <strong>Simulated preview data</strong>
-                <span>Values are generated in your browser and are not live reporting.</span>
+            <div id="supplementFreshness" class="preview-notice" role="status">
+                <strong>Loading Supplement data</strong>
+                <span>Checking the latest published PostgreSQL snapshot.</span>
             </div>
         </header>
 
@@ -32,12 +32,18 @@
             <div class="supplement-toolbar-heading">
                 <div>
                     <h2 id="workspaceTitle">Revenue grid</h2>
-                    <p id="rangeSummary">Seven-day operational preview</p>
+                    <p id="rangeSummary">Seven-day operational view</p>
                 </div>
                 <div class="view-switcher" role="group" aria-label="Supplement view">
                     <button type="button" data-view-mode="single" aria-pressed="true">Single Hotel</button>
                     <button type="button" data-view-mode="comparison" aria-pressed="false">Hotel Comparison</button>
                 </div>
+            </div>
+
+            <div id="dateWindowNav" class="date-window-nav" hidden>
+                <button id="previousDateWindow" type="button" aria-label="Previous date window">←</button>
+                <span id="dateWindowLabel"></span>
+                <button id="nextDateWindow" type="button" aria-label="Next date window">→</button>
             </div>
 
             <div class="supplement-controls" aria-label="Revenue grid controls">
@@ -109,7 +115,7 @@
     <dialog id="supplementDetailDialog" class="supplement-dialog" aria-labelledby="detailTitle">
         <div class="dialog-heading">
             <div>
-                <span class="supplement-eyebrow">Simulated detail</span>
+                <span class="supplement-eyebrow">Published detail</span>
                 <h2 id="detailTitle">Metric detail</h2>
                 <p id="detailContext"></p>
             </div>
@@ -120,7 +126,7 @@
                 <h3 id="breakdownTitle">Booking mix</h3>
                 <div class="detail-table-wrap">
                     <table class="detail-table">
-                        <thead><tr><th>Segment</th><th>Rooms</th><th>Share</th><th>Avg. price</th></tr></thead>
+                        <thead><tr><th>Requested room</th><th>Rooms</th><th>ADR</th><th>Comparison rooms</th><th>Comparison ADR</th></tr></thead>
                         <tbody id="detailBreakdown"></tbody>
                     </table>
                 </div>
@@ -133,10 +139,10 @@
                 <div id="pickupCurve" class="pickup-curve"></div>
             </section>
         </div>
-        <p class="dialog-footnote">Preview only · no live or stored data is used.</p>
+        <p id="dialogFootnote" class="dialog-footnote">Loaded from the latest published PostgreSQL snapshot.</p>
     </dialog>
 
-    <script src="supplement-data.js?v=20260813-3"></script>
-    <script src="supplement.js?v=20260813-3"></script>
+    <script src="supplement-data.js?v=20260813-4"></script>
+    <script src="supplement.js?v=20260813-4"></script>
 </body>
 </html>

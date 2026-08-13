@@ -2,8 +2,9 @@
     "use strict";
 
     const Data = window.SupplementData;
+    const API_BASE_URL = "/api";
+    const DATE_WINDOW_SIZE = 31;
     const metricLabels = { occ: "OCC", adr: "ADR", revpar: "RevPAR" };
-    const modeLabels = { today: "OTB", ly: "LY", spit: "SPIT" };
     const elements = {
         hotel: document.getElementById("supplementHotel"),
         singleHotelControl: document.getElementById("singleHotelControl"),
@@ -22,21 +23,29 @@
         validation: document.getElementById("supplementValidation"),
         tableMount: document.getElementById("supplementTableMount"),
         rangeSummary: document.getElementById("rangeSummary"),
+        freshness: document.getElementById("supplementFreshness"),
+        dateWindowNav: document.getElementById("dateWindowNav"),
+        dateWindowLabel: document.getElementById("dateWindowLabel"),
+        previousDateWindow: document.getElementById("previousDateWindow"),
+        nextDateWindow: document.getElementById("nextDateWindow"),
         dialog: document.getElementById("supplementDetailDialog"),
         detailTitle: document.getElementById("detailTitle"),
         detailContext: document.getElementById("detailContext"),
         detailBreakdown: document.getElementById("detailBreakdown"),
         pickupCurve: document.getElementById("pickupCurve"),
-        closeDialog: document.getElementById("closeDetailDialog")
+        closeDialog: document.getElementById("closeDetailDialog"),
+        dialogFootnote: document.getElementById("dialogFootnote")
     };
 
     const today = new Date();
     const todayUtc = new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()));
     const state = {
         mode: "single",
-        hotelCode: Data.HOTELS[0].code,
-        enabledCategories: new Set(Data.CATEGORIES.map(({ code }) => code)),
-        enabledHotels: new Set(Data.HOTELS.map(({ code }) => code)),
+        hotels: [],
+        categoriesByHotel: {},
+        hotelCode: "",
+        enabledCategories: new Set(),
+        enabledHotels: new Set(),
         highlightedMetrics: new Set(["occ"]),
         startDate: Data.formatDateKey(new Date(todayUtc.getTime() - 3 * 86_400_000)),
         endDate: Data.formatDateKey(new Date(todayUtc.getTime() + 3 * 86_400_000)),
@@ -44,7 +53,10 @@
         differenceMode: "percent",
         pastLyDiff: true,
         futureSpitDiff: false,
-        futureLyDiff: false
+        futureLyDiff: false,
+        requestId: 0,
+        payload: null,
+        windowStart: 0
     };
 
     function escapeHtml(value) {
@@ -53,20 +65,63 @@
     }
 
     function formatDateLabel(dateKey) {
-        const date = Data.parseDateKey(dateKey);
-        return date.toLocaleDateString("en-SE", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
+        return Data.parseDateKey(dateKey).toLocaleDateString("en-SE", {
+            weekday: "short", day: "numeric", month: "short", timeZone: "UTC"
+        });
     }
 
     function makeCheckboxList(items, selected) {
         return items.map((item) => `<label><input type="checkbox" value="${escapeHtml(item.code)}"${selected.has(item.code) ? " checked" : ""}> ${escapeHtml(item.shortName || item.name)}</label>`).join("");
     }
 
-    function initializeControls() {
-        elements.hotel.innerHTML = Data.HOTELS.map((hotel) => `<option value="${hotel.code}">${escapeHtml(hotel.name)}</option>`).join("");
-        elements.categoryOptions.innerHTML = makeCheckboxList(Data.CATEGORIES, state.enabledCategories);
-        elements.hotelVisibilityOptions.innerHTML = makeCheckboxList(Data.HOTELS, state.enabledHotels);
+    function setFreshness(payload) {
+        elements.freshness.classList.toggle("is-stale", Boolean(payload?.stale));
+        if (!payload?.dataAsOf) {
+            elements.freshness.innerHTML = "<strong>Supplement unavailable</strong><span>No PostgreSQL snapshot has been published.</span>";
+            return;
+        }
+        elements.freshness.innerHTML = payload.stale
+            ? `<strong>Data is stale</strong><span>Last published snapshot: ${escapeHtml(payload.dataAsOf)}.</span>`
+            : `<strong>Published through ${escapeHtml(payload.dataAsOf)}</strong><span>Served from PostgreSQL · integration_db is not queried by this view.</span>`;
+    }
+
+    function showUnavailable(error) {
+        state.payload = null;
+        elements.tableMount.innerHTML = `<div class="supplement-empty"><strong>Supplement data unavailable</strong><span>${escapeHtml(error.message || "No published data is available.")}</span></div>`;
+        elements.freshness.classList.add("is-stale");
+        elements.freshness.innerHTML = "<strong>Live data unavailable</strong><span>The last published PostgreSQL snapshot could not be loaded.</span>";
+        elements.rangeSummary.textContent = "No live data loaded";
+        elements.dateWindowNav.hidden = true;
+    }
+
+    function categoriesForHotel() {
+        return state.categoriesByHotel[state.hotelCode] || [];
+    }
+
+    function rebuildCategoryControls(resetSelection) {
+        const categories = categoriesForHotel();
+        if (resetSelection) state.enabledCategories = new Set(categories.map(({ code }) => code));
+        elements.categoryOptions.innerHTML = makeCheckboxList(categories, state.enabledCategories);
+    }
+
+    async function initialize() {
         elements.startDate.value = state.startDate;
         elements.endDate.value = state.endDate;
+        try {
+            const metadata = await Data.fetchMetadata(API_BASE_URL);
+            state.hotels = metadata.hotels || [];
+            state.categoriesByHotel = metadata.categoriesByHotel || {};
+            if (!state.hotels.length) throw new Error("No Supplement hotels have been published.");
+            state.hotelCode = state.hotels[0].code;
+            state.enabledHotels = new Set(state.hotels.map(({ code }) => code));
+            elements.hotel.innerHTML = state.hotels.map((hotel) => `<option value="${escapeHtml(hotel.code)}">${escapeHtml(hotel.name)}</option>`).join("");
+            elements.hotelVisibilityOptions.innerHTML = makeCheckboxList(state.hotels, state.enabledHotels);
+            rebuildCategoryControls(true);
+            setFreshness(metadata);
+            await loadGrid();
+        } catch (error) {
+            showUnavailable(error);
+        }
     }
 
     function columnsForDate(date) {
@@ -83,166 +138,209 @@
     }
 
     function differenceValue(cell, comparison, metric) {
-        return Data.calculateDifference(
-            cell.today.metrics[metric],
-            cell[comparison].metrics[metric],
-            state.differenceMode
-        );
+        return Data.calculateDifference(cell.today?.[metric], cell[comparison]?.[metric], state.differenceMode);
     }
 
     function renderMetricCell(row, date, cell, column, metric) {
         const detailHotel = state.mode === "comparison" ? row.code : state.hotelCode;
         const detailCategory = state.mode === "single" && !row.isTotal ? row.code : "";
-        const detailAttributes = row.isTotal ? " disabled" : ` data-detail-hotel="${detailHotel}" data-detail-category="${detailCategory}" data-detail-date="${date.date}" data-detail-metric="${metric}"`;
+        const detailAttributes = row.isTotal ? " disabled" : ` data-detail-hotel="${escapeHtml(detailHotel)}" data-detail-category="${escapeHtml(detailCategory)}" data-detail-date="${date.date}" data-detail-metric="${metric}"`;
         if (column.comparison) {
             const value = differenceValue(cell, column.comparison, metric);
             const direction = value > 0 ? "is-positive" : value < 0 ? "is-negative" : "";
             const highlight = state.highlightedMetrics.has(metric) ? " is-highlighted" : "";
             return `<td class="metric-difference ${direction}${highlight}"><button type="button"${detailAttributes}>${escapeHtml(Data.formatDifference(value, state.differenceMode, metric))}</button></td>`;
         }
-        const value = cell[column.mode].metrics[metric];
-        return `<td><button type="button"${detailAttributes}>${escapeHtml(Data.formatMetric(value, metric))}</button></td>`;
+        return `<td><button type="button"${detailAttributes}>${escapeHtml(Data.formatMetric(cell[column.mode]?.[metric], metric))}</button></td>`;
     }
 
-    function renderTable(dataset, rows) {
-        if (!rows.length) {
-            elements.tableMount.innerHTML = '<div class="supplement-empty"><strong>No rows selected</strong><span>Select at least one room category or hotel to populate the preview.</span></div>';
+    function visibleWindow(payload) {
+        const maximumStart = Math.max(0, payload.dates.length - DATE_WINDOW_SIZE);
+        state.windowStart = Math.min(state.windowStart, maximumStart);
+        const end = Math.min(payload.dates.length, state.windowStart + DATE_WINDOW_SIZE);
+        elements.dateWindowNav.hidden = payload.dates.length <= DATE_WINDOW_SIZE;
+        elements.dateWindowLabel.textContent = payload.dates.length
+            ? `Days ${state.windowStart + 1}–${end} of ${payload.dates.length}`
+            : "";
+        elements.previousDateWindow.disabled = state.windowStart === 0;
+        elements.nextDateWindow.disabled = end >= payload.dates.length;
+        return { dates: payload.dates.slice(state.windowStart, end), start: state.windowStart };
+    }
+
+    function renderTable(payload) {
+        if (!payload.rows.length) {
+            elements.tableMount.innerHTML = '<div class="supplement-empty"><strong>No rows selected</strong><span>Select at least one room category or hotel.</span></div>';
             return;
         }
-
-        const dateHeaders = dataset.dates.map((date) => {
-            const columns = columnsForDate(date);
-            return `<th colspan="${columns.length}" class="date-group${date.isWeekend ? " is-weekend" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`;
-        }).join("");
-        const modeHeaders = dataset.dates.map((date) => columnsForDate(date)
-            .map((column) => `<th class="mode-column${column.comparison ? " difference-column" : ""}">${column.label}</th>`).join("")).join("");
-
-        const body = rows.map((row) => {
+        const window = visibleWindow(payload);
+        const dateHeaders = window.dates.map((date) => `<th colspan="${columnsForDate(date).length}" class="date-group${date.isWeekend ? " is-weekend" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
+        const modeHeaders = window.dates.map((date) => columnsForDate(date).map((column) => `<th class="mode-column${column.comparison ? " difference-column" : ""}">${column.label}</th>`).join("")).join("");
+        const body = payload.rows.map((row) => {
             const averages = Data.computeRowAverages(row);
             return Data.METRICS.map((metric, metricIndex) => {
                 const rowLabel = metricIndex === 0
                     ? `<th class="row-group-label" rowspan="3" scope="rowgroup"><strong>${escapeHtml(row.shortLabel || row.label)}</strong><span>${escapeHtml(row.label)}</span></th>`
                     : "";
-                const cells = dataset.dates.map((date, index) => columnsForDate(date)
-                    .map((column) => renderMetricCell(row, date, row.cells[index], column, metric)).join("")).join("");
+                const cells = window.dates.map((date, localIndex) => columnsForDate(date).map((column) => renderMetricCell(row, date, row.cells[window.start + localIndex], column, metric)).join("")).join("");
                 const averageCells = ["today", "spit", "ly"].map((mode) => `<td class="average-cell">${escapeHtml(Data.formatMetric(averages[mode][metric], metric))}</td>`).join("");
                 const classes = `${row.isTotal ? " total-metric-row" : ""}${metricIndex === 0 ? " group-start" : ""}`;
                 return `<tr class="${classes.trim()}">${rowLabel}<th class="metric-label" scope="row">${metricLabels[metric]}</th>${cells}${averageCells}</tr>`;
             }).join("");
         }).join("");
-
-        elements.tableMount.innerHTML = `<table class="supplement-table">
-            <thead>
-                <tr><th rowspan="2" class="sticky-label">${state.mode === "single" ? "Category" : "Hotel"}</th><th rowspan="2" class="sticky-metric">Metric</th>${dateHeaders}<th colspan="3" class="average-group">Period average</th></tr>
-                <tr>${modeHeaders}<th class="mode-column average-group">OTB</th><th class="mode-column average-group">SPIT</th><th class="mode-column average-group">LY</th></tr>
-            </thead>
-            <tbody>${body}</tbody>
-        </table>`;
+        elements.tableMount.innerHTML = `<table class="supplement-table"><thead><tr><th rowspan="2" class="sticky-label">${state.mode === "single" ? "Category" : "Hotel"}</th><th rowspan="2" class="sticky-metric">Metric</th>${dateHeaders}<th colspan="3" class="average-group">Period average</th></tr><tr>${modeHeaders}<th class="mode-column average-group">OTB</th><th class="mode-column average-group">SPIT</th><th class="mode-column average-group">LY</th></tr></thead><tbody>${body}</tbody></table>`;
         elements.tableMount.classList.remove("is-refreshing");
         void elements.tableMount.offsetWidth;
         elements.tableMount.classList.add("is-refreshing");
     }
 
-    function render() {
+    async function loadGrid() {
         state.startDate = elements.startDate.value;
         state.endDate = elements.endDate.value;
-        state.hotelCode = elements.hotel.value;
+        state.hotelCode = elements.hotel.value || state.hotelCode;
         state.lyComparisonType = elements.lyBasis.value;
+        const validation = Data.validateDateRange(state.startDate, state.endDate);
+        elements.validation.hidden = validation.valid;
+        elements.validation.textContent = validation.error || "";
+        if (!validation.valid) return;
+        if ((state.mode === "single" && state.enabledCategories.size === 0)
+                || (state.mode === "comparison" && state.enabledHotels.size === 0)) {
+            state.payload = { dates: [], rows: [] };
+            elements.tableMount.innerHTML = '<div class="supplement-empty"><strong>No rows selected</strong><span>Select at least one room category or hotel.</span></div>';
+            elements.rangeSummary.textContent = "No rows selected";
+            elements.dateWindowNav.hidden = true;
+            return;
+        }
+        const requestId = ++state.requestId;
+        elements.tableMount.setAttribute("aria-busy", "true");
+        elements.rangeSummary.textContent = "Loading published revenue facts…";
+        try {
+            const hotelCodes = state.mode === "single" ? [state.hotelCode] : [...state.enabledHotels];
+            const payload = await Data.fetchGrid({
+                startDate: state.startDate,
+                endDate: state.endDate,
+                mode: state.mode,
+                hotelCodes,
+                roomCategories: state.mode === "single" ? [...state.enabledCategories] : [],
+                lyComparisonBasis: state.lyComparisonType
+            }, API_BASE_URL);
+            if (requestId !== state.requestId) return;
+            state.payload = payload;
+            state.windowStart = 0;
+            setFreshness(payload);
+            elements.rangeSummary.textContent = `${validation.dayCount}-day view · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
+            renderTable(payload);
+        } catch (error) {
+            if (requestId === state.requestId) showUnavailable(error);
+        } finally {
+            if (requestId === state.requestId) elements.tableMount.removeAttribute("aria-busy");
+        }
+    }
+
+    function renderLocalChange() {
         state.differenceMode = elements.diffMode.value;
         state.pastLyDiff = elements.pastLyDiff.checked;
         state.futureSpitDiff = elements.futureSpitDiff.checked;
         state.futureLyDiff = elements.futureLyDiff.checked;
-
-        const dataset = Data.generateDataset({
-            startDate: state.startDate,
-            endDate: state.endDate,
-            lyComparisonType: state.lyComparisonType,
-            today: Data.formatDateKey(todayUtc)
-        });
-        elements.validation.hidden = dataset.validation.valid;
-        elements.validation.textContent = dataset.validation.error || "";
-        if (!dataset.validation.valid) {
-            elements.tableMount.innerHTML = "";
-            elements.rangeSummary.textContent = "Adjust the preview range";
-            return;
-        }
-        elements.rangeSummary.textContent = `${dataset.validation.dayCount}-day simulated view · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
-        const rows = Data.buildRows(dataset, {
-            mode: state.mode,
-            hotelCode: state.hotelCode,
-            enabledCategories: [...state.enabledCategories],
-            enabledHotels: [...state.enabledHotels]
-        });
-        renderTable(dataset, rows);
+        if (state.payload) renderTable(state.payload);
     }
 
     function updateViewMode(mode) {
         state.mode = mode;
-        document.querySelectorAll("[data-view-mode]").forEach((button) => {
-            button.setAttribute("aria-pressed", String(button.dataset.viewMode === mode));
-        });
-        const isComparison = mode === "comparison";
-        elements.singleHotelControl.hidden = isComparison;
-        elements.categoryControl.hidden = isComparison;
-        elements.hotelVisibilityControl.hidden = !isComparison;
-        render();
+        document.querySelectorAll("[data-view-mode]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.viewMode === mode)));
+        const comparison = mode === "comparison";
+        elements.singleHotelControl.hidden = comparison;
+        elements.categoryControl.hidden = comparison;
+        elements.hotelVisibilityControl.hidden = !comparison;
+        loadGrid();
     }
 
     function readSelected(container) {
         return new Set(Array.from(container.querySelectorAll('input[type="checkbox"]:checked'), ({ value }) => value));
     }
 
-    function curveSvg(points) {
-        const width = 640;
-        const height = 250;
-        const margin = { top: 18, right: 18, bottom: 42, left: 44 };
-        const plotWidth = width - margin.left - margin.right;
-        const plotHeight = height - margin.top - margin.bottom;
-        const maxValue = Math.max(1, ...points.flatMap((point) => [point.today, point.comparison]));
-        const x = (index) => margin.left + index / (points.length - 1) * plotWidth;
+    function curveSvg(currentPoints, comparisonPoints) {
+        const comparisonMap = new Map(comparisonPoints.map((point) => [point.daysBeforeStay, point.assignedRooms]));
+        const points = currentPoints.map((point) => ({ ...point, comparison: comparisonMap.get(point.daysBeforeStay) ?? null }));
+        if (!points.length) return '<div class="supplement-empty"><span>No pickup history is available.</span></div>';
+        const width = 640, height = 250, margin = { top: 18, right: 18, bottom: 42, left: 44 };
+        const plotWidth = width - margin.left - margin.right, plotHeight = height - margin.top - margin.bottom;
+        const maxValue = Math.max(1, ...points.flatMap((point) => [point.assignedRooms || 0, point.comparison || 0]));
+        const x = (index) => margin.left + index / Math.max(1, points.length - 1) * plotWidth;
         const y = (value) => margin.top + plotHeight - value / maxValue * plotHeight;
-        const line = (key) => points.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point[key]).toFixed(1)}`).join(" ");
-        const grid = [0, 0.5, 1].map((ratio) => `<line x1="${margin.left}" x2="${width - margin.right}" y1="${y(maxValue * ratio)}" y2="${y(maxValue * ratio)}"></line><text x="${margin.left - 8}" y="${y(maxValue * ratio) + 4}">${Math.round(maxValue * ratio)}</text>`).join("");
-        const labels = [0, 6, 12].map((index) => `<text class="pickup-x-label" x="${x(index)}" y="${height - 14}">${points[index].daysBeforeStay}d</text>`).join("");
-        return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Simulated current and comparison pickup curves"><g class="pickup-grid">${grid}${labels}</g><path class="pickup-comparison-line" d="${line("comparison")}"></path><path class="pickup-current-line" d="${line("today")}"></path></svg>`;
+        const line = (key) => points.filter((point) => Number.isFinite(point[key])).map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point[key]).toFixed(1)}`).join(" ");
+        const grid = [0, .5, 1].map((ratio) => `<line x1="${margin.left}" x2="${width - margin.right}" y1="${y(maxValue * ratio)}" y2="${y(maxValue * ratio)}"></line><text x="${margin.left - 8}" y="${y(maxValue * ratio) + 4}">${Math.round(maxValue * ratio)}</text>`).join("");
+        return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Current and comparison pickup curves"><g class="pickup-grid">${grid}</g><path class="pickup-comparison-line" d="${line("comparison")}"></path><path class="pickup-current-line" d="${line("assignedRooms")}"></path></svg>`;
     }
 
-    function openDetail(button) {
+    async function openDetail(button) {
         const metric = button.dataset.detailMetric;
-        const detail = Data.getDetailData({
-            hotelCode: button.dataset.detailHotel,
-            categoryCode: button.dataset.detailCategory || null,
-            date: button.dataset.detailDate,
-            metric
-        });
         elements.detailTitle.textContent = `${metricLabels[metric]} detail`;
-        elements.detailContext.textContent = `${detail.hotel.name} · ${detail.category?.name || "All categories"} · ${formatDateLabel(button.dataset.detailDate)}`;
-        elements.detailBreakdown.innerHTML = detail.breakdown.map((row) => `<tr><td>${escapeHtml(row.name)}</td><td>${row.rooms}</td><td>${row.share.toFixed(1)}%</td><td>${new Intl.NumberFormat("en-SE").format(row.averagePrice)} kr</td></tr>`).join("");
-        elements.pickupCurve.innerHTML = curveSvg(detail.curve);
+        elements.detailContext.textContent = "Loading published detail…";
+        elements.detailBreakdown.innerHTML = "";
+        elements.pickupCurve.innerHTML = "";
         elements.dialog.showModal();
+        try {
+            const payload = await Data.fetchDetail({
+                hotelCode: button.dataset.detailHotel,
+                stayDate: button.dataset.detailDate,
+                roomCategory: button.dataset.detailCategory || "",
+                lyComparisonBasis: state.lyComparisonType
+            }, API_BASE_URL);
+            const hotelName = state.hotels.find(({ code }) => code === payload.hotelCode)?.name || payload.hotelCode;
+            elements.detailContext.textContent = `${hotelName} · ${payload.roomCategory || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
+            elements.detailBreakdown.innerHTML = payload.breakdown.length
+                ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${Data.formatMetric(row.comparisonAssignedRooms, "adr")}</td><td>${Data.formatMetric(row.comparisonAveragePrice, "adr")}</td></tr>`).join("")
+                : '<tr><td colspan="5">No assigned rooms for this stay date.</td></tr>';
+            elements.pickupCurve.innerHTML = curveSvg(payload.pickup, payload.comparisonPickup);
+            elements.dialogFootnote.textContent = `Published through ${payload.dataAsOf} · served from PostgreSQL.`;
+        } catch (error) {
+            elements.detailContext.textContent = error.message || "Detail data is unavailable.";
+        }
+    }
+
+    function closeDetailDialog() {
+        if (!elements.dialog.open) return;
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+            elements.dialog.close();
+            return;
+        }
+        elements.dialog.classList.add("is-closing");
+        elements.dialog.addEventListener("animationend", () => {
+            elements.dialog.close();
+            elements.dialog.classList.remove("is-closing");
+        }, { once: true });
     }
 
     document.querySelectorAll("[data-view-mode]").forEach((button) => button.addEventListener("click", () => updateViewMode(button.dataset.viewMode)));
-    elements.hotel.addEventListener("change", render);
-    elements.startDate.addEventListener("input", render);
-    elements.endDate.addEventListener("input", render);
-    elements.lyBasis.addEventListener("change", render);
-    elements.diffMode.addEventListener("change", render);
-    elements.pastLyDiff.addEventListener("change", render);
-    elements.futureSpitDiff.addEventListener("change", render);
-    elements.futureLyDiff.addEventListener("change", render);
-    elements.categoryOptions.addEventListener("change", () => { state.enabledCategories = readSelected(elements.categoryOptions); render(); });
-    elements.hotelVisibilityOptions.addEventListener("change", () => { state.enabledHotels = readSelected(elements.hotelVisibilityOptions); render(); });
-    elements.highlights.addEventListener("change", () => { state.highlightedMetrics = readSelected(elements.highlights); render(); });
+    elements.hotel.addEventListener("change", () => {
+        state.hotelCode = elements.hotel.value;
+        rebuildCategoryControls(true);
+        loadGrid();
+    });
+    elements.startDate.addEventListener("change", loadGrid);
+    elements.endDate.addEventListener("change", loadGrid);
+    elements.lyBasis.addEventListener("change", loadGrid);
+    elements.diffMode.addEventListener("change", renderLocalChange);
+    elements.pastLyDiff.addEventListener("change", renderLocalChange);
+    elements.futureSpitDiff.addEventListener("change", renderLocalChange);
+    elements.futureLyDiff.addEventListener("change", renderLocalChange);
+    elements.categoryOptions.addEventListener("change", () => { state.enabledCategories = readSelected(elements.categoryOptions); loadGrid(); });
+    elements.hotelVisibilityOptions.addEventListener("change", () => { state.enabledHotels = readSelected(elements.hotelVisibilityOptions); loadGrid(); });
+    elements.highlights.addEventListener("change", () => { state.highlightedMetrics = readSelected(elements.highlights); renderLocalChange(); });
+    elements.previousDateWindow.addEventListener("click", () => { state.windowStart = Math.max(0, state.windowStart - DATE_WINDOW_SIZE); renderTable(state.payload); });
+    elements.nextDateWindow.addEventListener("click", () => { state.windowStart += DATE_WINDOW_SIZE; renderTable(state.payload); });
     elements.tableMount.addEventListener("click", (event) => {
         const button = event.target.closest("button[data-detail-metric]");
         if (button) openDetail(button);
     });
-    elements.closeDialog.addEventListener("click", () => elements.dialog.close());
+    elements.closeDialog.addEventListener("click", closeDetailDialog);
+    elements.dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        closeDetailDialog();
+    });
     elements.dialog.addEventListener("click", (event) => {
-        if (event.target === elements.dialog) elements.dialog.close();
+        if (event.target === elements.dialog) closeDetailDialog();
     });
 
-    initializeControls();
-    render();
+    initialize();
 }());

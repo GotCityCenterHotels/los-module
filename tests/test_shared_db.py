@@ -28,6 +28,30 @@ class SharedDatabaseConfigurationTests(unittest.TestCase):
         self.assertEqual(connection_options["host"], "database-b-host")
         self.assertEqual(connection_options["dbname"], "database-b")
         self.assertEqual(connection_options["user"], "database-b-user")
+        self.assertIn("default_transaction_read_only=on", connection_options["options"])
+
+    def test_export_connection_prefers_integration_db_settings(self):
+        settings = {
+            "DB_HOST": "legacy-host",
+            "DB_USER": "legacy-user",
+            "DB_PASSWORD": "legacy-password",
+            "INTEGRATION_DB_HOST": "integration-host",
+            "INTEGRATION_DB_NAME": "integration_db",
+            "INTEGRATION_DB_USER": "readonly-user",
+            "INTEGRATION_DB_PASSWORD": "readonly-password",
+        }
+
+        with patch.dict(os.environ, settings, clear=True), patch.object(
+            db.psycopg,
+            "connect",
+        ) as connect:
+            db.get_export_connection()
+
+        options = connect.call_args.kwargs
+        self.assertEqual(options["host"], "integration-host")
+        self.assertEqual(options["dbname"], "integration_db")
+        self.assertEqual(options["user"], "readonly-user")
+        self.assertIn("default_transaction_read_only=on", options["options"])
 
     def test_export_connection_falls_back_to_deployed_db_settings(self):
         settings = {
@@ -71,7 +95,7 @@ class SharedDatabaseConfigurationTests(unittest.TestCase):
         self.assertEqual(connection_options["dbname"], "database-a")
         self.assertEqual(connection_options["user"], "database-a-user")
 
-    def test_import_connection_falls_back_to_deployed_db_settings(self):
+    def test_import_connection_never_falls_back_to_integration_settings(self):
         settings = {
             "DB_HOST": "database-a-host",
             "DB_NAME": "database-a",
@@ -79,16 +103,8 @@ class SharedDatabaseConfigurationTests(unittest.TestCase):
             "DB_PASSWORD": "database-a-password",
         }
 
-        with patch.dict(os.environ, settings, clear=True), patch.object(
-            db.psycopg,
-            "connect",
-        ) as connect:
+        with patch.dict(os.environ, settings, clear=True), self.assertRaises(KeyError):
             db.get_import_connection()
-
-        connection_options = connect.call_args.kwargs
-        self.assertEqual(connection_options["host"], "database-a-host")
-        self.assertEqual(connection_options["dbname"], "database-a")
-        self.assertEqual(connection_options["user"], "database-a-user")
 
 
 if __name__ == "__main__":
