@@ -91,14 +91,16 @@ def ensure_cost_settings_schema():
                     # session-level advisory lock back to the connection pool.
                     connection.rollback()
                     sqlstate = getattr(error, "sqlstate", None) or "unknown"
+                    error_type = type(error).__name__
+                    error_detail = str(error).splitlines()[0][:240]
                     logging.exception(
-                        "Cost settings schema bootstrap failed sqlstate=%s",
+                        "Cost settings schema bootstrap failed sqlstate=%s error_type=%s",
                         sqlstate,
+                        error_type,
                     )
                     raise CostSettingsSchemaError(
                         f"Cost settings database schema is not ready (SQLSTATE {sqlstate}). "
-                        "Apply the pending scripts in sql/migrations "
-                        "with a database owner account."
+                        f"{error_type}: {error_detail}"
                     ) from error
                 finally:
                     cursor.execute(

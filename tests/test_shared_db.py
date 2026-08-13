@@ -29,6 +29,25 @@ class SharedDatabaseConfigurationTests(unittest.TestCase):
         self.assertEqual(connection_options["dbname"], "database-b")
         self.assertEqual(connection_options["user"], "database-b-user")
 
+    def test_export_connection_falls_back_to_deployed_db_settings(self):
+        settings = {
+            "DB_HOST": "shared-host",
+            "DB_USER": "shared-user",
+            "DB_PASSWORD": "shared-password",
+            "EXPORT_POSTGRES_DB": "database-b",
+        }
+
+        with patch.dict(os.environ, settings, clear=True), patch.object(
+            db.psycopg,
+            "connect",
+        ) as connect:
+            db.get_export_connection()
+
+        connection_options = connect.call_args.kwargs
+        self.assertEqual(connection_options["host"], "shared-host")
+        self.assertEqual(connection_options["dbname"], "database-b")
+        self.assertEqual(connection_options["user"], "shared-user")
+
     def test_import_connection_uses_database_a_cost_settings(self):
         settings = {
             "POSTGRES_HOST": "shared-host",
@@ -39,6 +58,25 @@ class SharedDatabaseConfigurationTests(unittest.TestCase):
             "COST_DB_NAME": "database-a",
             "COST_DB_USER": "database-a-user",
             "COST_DB_PASSWORD": "database-a-password",
+        }
+
+        with patch.dict(os.environ, settings, clear=True), patch.object(
+            db.psycopg,
+            "connect",
+        ) as connect:
+            db.get_import_connection()
+
+        connection_options = connect.call_args.kwargs
+        self.assertEqual(connection_options["host"], "database-a-host")
+        self.assertEqual(connection_options["dbname"], "database-a")
+        self.assertEqual(connection_options["user"], "database-a-user")
+
+    def test_import_connection_falls_back_to_deployed_db_settings(self):
+        settings = {
+            "DB_HOST": "database-a-host",
+            "DB_NAME": "database-a",
+            "DB_USER": "database-a-user",
+            "DB_PASSWORD": "database-a-password",
         }
 
         with patch.dict(os.environ, settings, clear=True), patch.object(

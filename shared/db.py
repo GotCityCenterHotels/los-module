@@ -17,20 +17,26 @@ def _setting(*names, default=None):
 def get_export_connection():
     # Database B: operational/source data such as enterprise_current.
     return psycopg.connect(
-        host=_setting("EXPORT_POSTGRES_HOST", "POSTGRES_HOST"),
+        host=_setting("EXPORT_POSTGRES_HOST", "POSTGRES_HOST", "DB_HOST"),
         dbname=_setting("EXPORT_POSTGRES_DB"),
-        user=_setting("EXPORT_POSTGRES_USER", "POSTGRES_USER"),
-        password=_setting("EXPORT_POSTGRES_PASSWORD", "POSTGRES_PASSWORD"),
+        user=_setting("EXPORT_POSTGRES_USER", "POSTGRES_USER", "DB_USER"),
+        password=_setting(
+            "EXPORT_POSTGRES_PASSWORD",
+            "POSTGRES_PASSWORD",
+            "DB_PASSWORD",
+        ),
         port=int(
             _setting(
                 "EXPORT_POSTGRES_PORT",
                 "POSTGRES_PORT",
+                "DB_PORT",
                 default="5432",
             )
         ),
         sslmode=_setting(
             "EXPORT_POSTGRES_SSLMODE",
             "POSTGRES_SSLMODE",
+            "DB_SSLMODE",
             default="require",
         ),
         row_factory=dict_row,
@@ -40,16 +46,26 @@ def get_export_connection():
 def get_import_connection():
     # Database A: the same cost/functions database used by cost_database.py.
     return psycopg.connect(
-        host=_setting("COST_DB_HOST", "POSTGRES_HOST"),
-        dbname=_setting("COST_DB_NAME", "POSTGRES_DB"),
-        user=_setting("COST_DB_USER", "POSTGRES_USER"),
-        password=_setting("COST_DB_PASSWORD", "POSTGRES_PASSWORD"),
+        host=_setting("COST_DB_HOST", "POSTGRES_HOST", "DB_HOST"),
+        dbname=_setting("COST_DB_NAME", "POSTGRES_DB", "DB_NAME"),
+        user=_setting("COST_DB_USER", "POSTGRES_USER", "DB_USER"),
+        password=_setting(
+            "COST_DB_PASSWORD",
+            "POSTGRES_PASSWORD",
+            "DB_PASSWORD",
+        ),
         port=int(
-            _setting("COST_DB_PORT", "POSTGRES_PORT", default="5432")
+            _setting(
+                "COST_DB_PORT",
+                "POSTGRES_PORT",
+                "DB_PORT",
+                default="5432",
+            )
         ),
         sslmode=_setting(
             "COST_DB_SSLMODE",
             "POSTGRES_SSLMODE",
+            "DB_SSLMODE",
             default="require",
         ),
     )
