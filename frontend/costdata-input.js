@@ -4,7 +4,7 @@
     const hotel = document.getElementById("settingsHotel"), form = document.getElementById("settingsForm");
     const layout = document.getElementById("settingsLayout"), status = document.getElementById("settingsStatus");
     const errorPanel = document.getElementById("settingsError"), save = document.getElementById("saveSettings");
-    const dirtyState = document.getElementById("dirtyState");
+    const dirtyState = document.getElementById("dirtyState"), importButton = document.getElementById("runImportButton");
     let model = null, dirty = false, loadedEnterpriseId = "";
 
     const configs = {
@@ -78,6 +78,31 @@
     function setDirty(value){dirty=value;dirtyState.textContent=value?"Unsaved changes":"No unsaved changes";dirtyState.classList.toggle("is-dirty",value)}
     function setBusy(value){save.disabled=value;hotel.disabled=value;document.querySelector(".settings-workspace").setAttribute("aria-busy",String(value))}
     function showError(error){errorPanel.textContent=error.message||"Unable to load cost settings.";errorPanel.hidden=false;status.textContent="Something went wrong."}
+    async function runImport(){
+        if(!confirm("Import all cost datasets now? This can take a while.")) return;
+        importButton.disabled=true; errorPanel.hidden=true; status.textContent="Running cost data import...";
+        try {
+            const result = await LosApi.fetchJson("/api/costdata/import", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({dataset: "all"})
+            });
+            const datasetResults = result.results || [];
+            const succeeded = datasetResults.filter(row => row.status === "success").length;
+            if (result.status === "success") {
+                status.textContent = `Import complete (${succeeded}/${datasetResults.length} datasets).`;
+            }
+            else {
+                const failures = datasetResults.filter(row => row.status !== "success")
+                    .map(row => `${row.dataset}: ${row.error}`).join("; ");
+                showError(new Error(`Import finished with failures: ${failures}`));
+            }
+            await loadHotels();
+        }
+        catch (error) { showError(error); }
+        finally { importButton.disabled=false; }
+    }
+    importButton.onclick=runImport;
     document.querySelectorAll(".settings-nav button").forEach(button=>button.onclick=()=>{document.querySelectorAll(".settings-nav button").forEach(x=>x.removeAttribute("aria-current"));button.setAttribute("aria-current","page");document.querySelectorAll("[data-settings-section]").forEach(section=>section.hidden=section.dataset.settingsSection!==button.dataset.section)});
     document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)});
     hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?")){hotel.value=loadedEnterpriseId;return}loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});loadHotels();
