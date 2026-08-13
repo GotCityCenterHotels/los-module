@@ -11,7 +11,9 @@
         categoryControl: document.getElementById("categoryControl"),
         hotelVisibilityControl: document.getElementById("hotelVisibilityControl"),
         categoryOptions: document.getElementById("categoryOptions"),
+        categorySelectionSummary: document.getElementById("categorySelectionSummary"),
         hotelVisibilityOptions: document.getElementById("hotelVisibilityOptions"),
+        hotelSelectionSummary: document.getElementById("hotelSelectionSummary"),
         startDate: document.getElementById("supplementStartDate"),
         endDate: document.getElementById("supplementEndDate"),
         lyBasis: document.getElementById("supplementLyBasis"),
@@ -32,14 +34,30 @@
         dialog: document.getElementById("supplementDetailDialog"),
         detailTitle: document.getElementById("detailTitle"),
         detailContext: document.getElementById("detailContext"),
+        detailError: document.getElementById("detailError"),
+        detailRooms: document.getElementById("detailRooms"),
+        detailAdr: document.getElementById("detailAdr"),
+        detailInventory: document.getElementById("detailInventory"),
+        detailInventoryLabel: document.getElementById("detailInventoryLabel"),
+        detailOccupancy: document.getElementById("detailOccupancy"),
         detailBreakdown: document.getElementById("detailBreakdown"),
         pickupCurve: document.getElementById("pickupCurve"),
+        pickupCoverage: document.getElementById("pickupCoverage"),
+        pickupCurrentLabel: document.getElementById("pickupCurrentLabel"),
+        pickupComparisonLabel: document.getElementById("pickupComparisonLabel"),
         closeDialog: document.getElementById("closeDetailDialog"),
         dialogFootnote: document.getElementById("dialogFootnote")
     };
 
-    const today = new Date();
-    const todayUtc = new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()));
+    const stockholmDateParts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Europe/Stockholm",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).formatToParts(new Date());
+    const datePart = (type) => stockholmDateParts.find((part) => part.type === type)?.value;
+    const todayKey = `${datePart("year")}-${datePart("month")}-${datePart("day")}`;
+    const todayUtc = Data.parseDateKey(todayKey);
     const state = {
         mode: "single",
         hotels: [],
@@ -109,6 +127,8 @@
         const categories = categoriesForHotel();
         if (resetSelection) state.enabledCategories = new Set(categories.map(({ code }) => code));
         elements.categoryOptions.innerHTML = makeCheckboxList(categories, state.enabledCategories);
+        elements.categorySelectionSummary.textContent = state.enabledCategories.size === categories.length
+            ? `All ${categories.length}` : `${state.enabledCategories.size} of ${categories.length}`;
     }
 
     async function initialize() {
@@ -123,6 +143,7 @@
             state.enabledHotels = new Set(state.hotels.map(({ code }) => code));
             elements.hotel.innerHTML = state.hotels.map((hotel) => `<option value="${escapeHtml(hotel.code)}">${escapeHtml(hotel.name)}</option>`).join("");
             elements.hotelVisibilityOptions.innerHTML = makeCheckboxList(state.hotels, state.enabledHotels);
+            elements.hotelSelectionSummary.textContent = `All ${state.hotels.length}`;
             rebuildCategoryControls(true);
             setFreshness(metadata);
             await loadGrid();
@@ -152,13 +173,14 @@
         const detailHotel = state.mode === "comparison" ? row.code : state.hotelCode;
         const detailCategory = state.mode === "single" && !row.isTotal ? row.code : "";
         const detailAttributes = row.isTotal ? " disabled" : ` data-detail-hotel="${escapeHtml(detailHotel)}" data-detail-category="${escapeHtml(detailCategory)}" data-detail-date="${date.date}" data-detail-metric="${metric}"`;
+        const todayClass = date.date === todayKey ? " is-today-column" : "";
         if (column.comparison) {
             const value = differenceValue(cell, column.comparison, metric);
             const direction = value > 0 ? "is-positive" : value < 0 ? "is-negative" : "";
             const highlight = state.highlightedMetrics.has(metric) ? " is-highlighted" : "";
-            return `<td class="metric-difference ${direction}${highlight}"><button type="button"${detailAttributes}>${escapeHtml(Data.formatDifference(value, state.differenceMode, metric))}</button></td>`;
+            return `<td class="metric-difference ${direction}${highlight}${todayClass}"><button type="button"${detailAttributes}>${escapeHtml(Data.formatDifference(value, state.differenceMode, metric))}</button></td>`;
         }
-        return `<td><button type="button"${detailAttributes}>${escapeHtml(Data.formatMetric(cell[column.mode]?.[metric], metric))}</button></td>`;
+        return `<td class="${todayClass.trim()}"><button type="button"${detailAttributes}>${escapeHtml(Data.formatMetric(cell[column.mode]?.[metric], metric))}</button></td>`;
     }
 
     function visibleWindow(payload) {
@@ -180,8 +202,8 @@
             return;
         }
         const window = visibleWindow(payload);
-        const dateHeaders = window.dates.map((date) => `<th colspan="${columnsForDate(date).length}" class="date-group${date.isWeekend ? " is-weekend" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
-        const modeHeaders = window.dates.map((date) => columnsForDate(date).map((column) => `<th class="mode-column${column.comparison ? " difference-column" : ""}">${column.label}</th>`).join("")).join("");
+        const dateHeaders = window.dates.map((date) => `<th colspan="${columnsForDate(date).length}" class="date-group${date.isWeekend ? " is-weekend" : ""}${date.date === todayKey ? " is-today" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
+        const modeHeaders = window.dates.map((date) => columnsForDate(date).map((column) => `<th class="mode-column${column.comparison ? " difference-column" : ""}${date.date === todayKey ? " is-today-column" : ""}">${column.label}</th>`).join("")).join("");
         const body = payload.rows.map((row) => {
             const averages = Data.computeRowAverages(row);
             return Data.METRICS.map((metric, metricIndex) => {
@@ -268,25 +290,73 @@
     }
 
     function curveSvg(currentPoints, comparisonPoints) {
-        const comparisonMap = new Map(comparisonPoints.map((point) => [point.daysBeforeStay, point.assignedRooms]));
-        const points = currentPoints.map((point) => ({ ...point, comparison: comparisonMap.get(point.daysBeforeStay) ?? null }));
-        if (!points.length) return '<div class="supplement-empty"><span>No pickup history is available.</span></div>';
-        const width = 640, height = 250, margin = { top: 18, right: 18, bottom: 42, left: 44 };
-        const plotWidth = width - margin.left - margin.right, plotHeight = height - margin.top - margin.bottom;
-        const maxValue = Math.max(1, ...points.flatMap((point) => [point.assignedRooms || 0, point.comparison || 0]));
-        const x = (index) => margin.left + index / Math.max(1, points.length - 1) * plotWidth;
-        const y = (value) => margin.top + plotHeight - value / maxValue * plotHeight;
-        const line = (key) => points.filter((point) => Number.isFinite(point[key])).map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point[key]).toFixed(1)}`).join(" ");
-        const grid = [0, .5, 1].map((ratio) => `<line x1="${margin.left}" x2="${width - margin.right}" y1="${y(maxValue * ratio)}" y2="${y(maxValue * ratio)}"></line><text x="${margin.left - 8}" y="${y(maxValue * ratio) + 4}">${Math.round(maxValue * ratio)}</text>`).join("");
-        return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Current and comparison pickup curves"><g class="pickup-grid">${grid}</g><path class="pickup-comparison-line" d="${line("comparison")}"></path><path class="pickup-current-line" d="${line("assignedRooms")}"></path></svg>`;
+        const current = [...currentPoints].sort((a, b) => b.daysBeforeStay - a.daysBeforeStay);
+        const comparison = [...comparisonPoints].sort((a, b) => b.daysBeforeStay - a.daysBeforeStay);
+        const allPoints = [...current, ...comparison];
+        if (!allPoints.length) {
+            return '<div class="supplement-empty pickup-empty"><strong>No pickup history yet</strong><span>Backfilled daily snapshots will build this curve over time.</span></div>';
+        }
+
+        const width = 880;
+        const height = 330;
+        const margin = { top: 24, right: 28, bottom: 54, left: 54 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        const maximumDay = Math.max(...allPoints.map(({ daysBeforeStay }) => daysBeforeStay));
+        const minimumDay = Math.min(...allPoints.map(({ daysBeforeStay }) => daysBeforeStay));
+        const daySpan = Math.max(1, maximumDay - minimumDay);
+        const maximumRooms = Math.max(1, ...allPoints.map(({ assignedRooms }) => assignedRooms || 0));
+        const roundedMaximum = Math.max(5, Math.ceil(maximumRooms / 5) * 5);
+        const x = (day) => margin.left + (maximumDay - day) / daySpan * plotWidth;
+        const y = (rooms) => margin.top + plotHeight - (rooms || 0) / roundedMaximum * plotHeight;
+        const pathFor = (points) => points.map((point, index) =>
+            `${index ? "L" : "M"}${x(point.daysBeforeStay).toFixed(1)},${y(point.assignedRooms).toFixed(1)}`
+        ).join(" ");
+        const currentPath = pathFor(current);
+        const comparisonPath = pathFor(comparison);
+        const baseline = margin.top + plotHeight;
+        const areaPath = current.length
+            ? `${currentPath} L${x(current.at(-1).daysBeforeStay).toFixed(1)},${baseline} L${x(current[0].daysBeforeStay).toFixed(1)},${baseline} Z`
+            : "";
+
+        const yGrid = [0, .25, .5, .75, 1].map((ratio) => {
+            const value = roundedMaximum * ratio;
+            return `<line x1="${margin.left}" x2="${width - margin.right}" y1="${y(value)}" y2="${y(value)}"></line><text x="${margin.left - 12}" y="${y(value) + 4}">${Math.round(value)}</text>`;
+        }).join("");
+        const xTicks = [...new Set([0, .25, .5, .75, 1].map((ratio) =>
+            Math.round(maximumDay - daySpan * ratio)
+        ))];
+        const dayLabel = (day) => day === 0 ? "Stay" : day < 0
+            ? `+${Math.abs(day)}d` : `${day}d`;
+        const xGrid = xTicks.map((day) =>
+            `<line class="pickup-x-grid" x1="${x(day)}" x2="${x(day)}" y1="${margin.top}" y2="${baseline}"></line><text class="pickup-x-label" x="${x(day)}" y="${baseline + 25}">${dayLabel(day)}</text>`
+        ).join("");
+        const pointMarks = (points, className) => {
+            const step = Math.max(1, Math.ceil(points.length / 24));
+            return points.filter((_point, index) => index % step === 0 || index === points.length - 1)
+                .map((point) => `<circle class="${className}" cx="${x(point.daysBeforeStay)}" cy="${y(point.assignedRooms)}" r="3"><title>${escapeHtml(point.viewDate)}: ${point.assignedRooms} rooms</title></circle>`).join("");
+        };
+
+        return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Rooms on the books by days before stay"><title>Pickup pace from ${maximumDay} to ${minimumDay} days before stay</title><g class="pickup-grid">${yGrid}${xGrid}</g>${areaPath ? `<path class="pickup-current-area" d="${areaPath}"></path>` : ""}${comparisonPath ? `<path class="pickup-comparison-line" d="${comparisonPath}"></path>` : ""}${currentPath ? `<path class="pickup-current-line" d="${currentPath}"></path>` : ""}<g class="pickup-points">${pointMarks(comparison, "pickup-comparison-point")}${pointMarks(current, "pickup-current-point")}</g><text class="pickup-axis-title" x="${margin.left + plotWidth / 2}" y="${height - 8}">Days before stay</text></svg>`;
     }
 
     async function openDetail(button) {
         const metric = button.dataset.detailMetric;
         elements.detailTitle.textContent = `${metricLabels[metric]} detail`;
         elements.detailContext.textContent = "Loading published detail…";
+        elements.detailError.hidden = true;
+        elements.dialog.classList.remove("has-error");
+        elements.dialog.setAttribute("aria-busy", "true");
+        elements.detailRooms.textContent = "—";
+        elements.detailAdr.textContent = "—";
+        elements.detailInventory.textContent = "—";
+        elements.detailOccupancy.textContent = "—";
         elements.detailBreakdown.innerHTML = "";
-        elements.pickupCurve.innerHTML = "";
+        elements.pickupCurve.innerHTML = '<div class="pickup-loading" aria-hidden="true"></div>';
+        elements.pickupCoverage.textContent = "";
+        elements.pickupCurrentLabel.textContent = "Current · loading";
+        elements.pickupComparisonLabel.textContent = "Comparison · loading";
+        elements.dialogFootnote.textContent = "Loading from the latest published PostgreSQL snapshot.";
         elements.dialog.showModal();
         try {
             const payload = await Data.fetchDetail({
@@ -300,15 +370,56 @@
             const categoryName = (state.categoriesByHotel[payload.hotelCode] || [])
                 .find(({ code }) => code === payload.roomCategory)?.name;
             elements.detailContext.textContent = `${hotelName} · ${categoryName || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
+            const occupancy = payload.inventory > 0
+                ? payload.totalAssignedRooms / payload.inventory * 100 : null;
+            elements.detailRooms.textContent = new Intl.NumberFormat("en-SE", {
+                maximumFractionDigits: 0
+            }).format(payload.totalAssignedRooms || 0);
+            elements.detailAdr.textContent = payload.totalAveragePrice == null
+                ? "—" : `${Data.formatMetric(payload.totalAveragePrice, "adr")} kr`;
+            elements.detailInventoryLabel.textContent = payload.inventoryBasis === "physical"
+                ? "Physical inventory" : "Sellable inventory";
+            elements.detailInventory.textContent = new Intl.NumberFormat("en-SE", {
+                maximumFractionDigits: 0
+            }).format(payload.inventory || 0);
+            elements.detailOccupancy.textContent = Data.formatMetric(occupancy, "occ");
             elements.detailBreakdown.innerHTML = payload.breakdown.length
-                ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${Data.formatMetric(row.comparisonAssignedRooms, "adr")}</td><td>${Data.formatMetric(row.comparisonAveragePrice, "adr")}</td></tr>`).join("")
+                ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAssignedRooms, "adr") : "—"}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAveragePrice, "adr") : "—"}</td></tr>`).join("")
                 : '<tr><td colspan="5">No assigned rooms for this stay date.</td></tr>';
             elements.pickupCurve.innerHTML = curveSvg(payload.pickup, payload.comparisonPickup);
+            const currentLast = payload.pickup.at(-1);
+            const comparisonLast = payload.comparisonPickup.at(-1);
+            elements.pickupCurrentLabel.textContent = currentLast
+                ? `Current · ${currentLast.assignedRooms} rooms` : "Current · no history";
+            elements.pickupComparisonLabel.textContent = comparisonLast
+                ? `${payload.comparison} · ${comparisonLast.assignedRooms} rooms`
+                : payload.comparisonAvailable
+                    ? `${payload.comparison} · no history`
+                    : `${payload.comparison} · backfill needed`;
+            const coverageParts = [];
+            if (payload.pickup.length) {
+                coverageParts.push(`Current: ${payload.pickup.length} snapshot${payload.pickup.length === 1 ? "" : "s"}`);
+            }
+            if (payload.comparisonPickup.length) {
+                coverageParts.push(`${payload.comparison}: ${payload.comparisonPickup.length} snapshot${payload.comparisonPickup.length === 1 ? "" : "s"}`);
+            }
+            if (!payload.comparisonAvailable) {
+                coverageParts.push(`${payload.comparison} comparison is not backfilled yet`);
+            }
+            elements.pickupCoverage.textContent = coverageParts.length
+                ? coverageParts.join(" · ")
+                : "Pickup coverage will appear as daily snapshots are backfilled.";
             elements.dialogFootnote.textContent = payload.inventoryQuality === "approximated-current"
                 ? `Published through ${payload.dataAsOf} · inventory is approximated from current rooms before ${payload.inventoryExactFrom}.`
                 : `Published through ${payload.dataAsOf} · served from PostgreSQL.`;
         } catch (error) {
-            elements.detailContext.textContent = error.message || "Detail data is unavailable.";
+            elements.dialog.classList.add("has-error");
+            elements.detailContext.textContent = "The selected metric could not be opened.";
+            elements.detailError.textContent = error.message || "Detail data is unavailable.";
+            elements.detailError.hidden = false;
+            elements.dialogFootnote.textContent = "No simulated fallback was used.";
+        } finally {
+            elements.dialog.removeAttribute("aria-busy");
         }
     }
 
@@ -339,8 +450,17 @@
     elements.pastLyDiff.addEventListener("change", renderLocalChange);
     elements.futureSpitDiff.addEventListener("change", renderLocalChange);
     elements.futureLyDiff.addEventListener("change", renderLocalChange);
-    elements.categoryOptions.addEventListener("change", () => { state.enabledCategories = readSelected(elements.categoryOptions); loadGrid(); });
-    elements.hotelVisibilityOptions.addEventListener("change", () => { state.enabledHotels = readSelected(elements.hotelVisibilityOptions); loadGrid(); });
+    elements.categoryOptions.addEventListener("change", () => {
+        state.enabledCategories = readSelected(elements.categoryOptions);
+        rebuildCategoryControls(false);
+        loadGrid();
+    });
+    elements.hotelVisibilityOptions.addEventListener("change", () => {
+        state.enabledHotels = readSelected(elements.hotelVisibilityOptions);
+        elements.hotelSelectionSummary.textContent = state.enabledHotels.size === state.hotels.length
+            ? `All ${state.hotels.length}` : `${state.enabledHotels.size} of ${state.hotels.length}`;
+        loadGrid();
+    });
     elements.highlights.addEventListener("change", () => { state.highlightedMetrics = readSelected(elements.highlights); renderLocalChange(); });
     elements.previousDateWindow.addEventListener("click", () => { state.windowStart = Math.max(0, state.windowStart - DATE_WINDOW_SIZE); renderTable(state.payload); });
     elements.nextDateWindow.addEventListener("click", () => { state.windowStart += DATE_WINDOW_SIZE; renderTable(state.payload); });

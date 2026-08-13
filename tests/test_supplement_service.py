@@ -73,6 +73,16 @@ class SupplementDomainTests(unittest.TestCase):
         self.assertNotIn("(%s IS NULL OR space_room_category_id", source)
         self.assertIn("inventory_category_clause", source)
 
+    def test_missing_comparison_coverage_does_not_hide_current_detail(self):
+        source = Path(supplement_service.__file__).read_text(encoding="utf-8")
+        detail_source = source[source.index("def fetch_supplement_detail"):]
+        coverage_guard = detail_source[detail_source.index("if coverage and ("):detail_source.index(
+            "cursor.execute(\n                \"SELECT 1 FROM functions.supplement_hotels",
+            detail_source.index("if coverage and ("),
+        )]
+        self.assertNotIn("comparison_date <", coverage_guard)
+        self.assertIn('"comparisonAvailable"', detail_source)
+
 
 class SupplementApiBoundaryTests(unittest.TestCase):
     def test_all_read_services_use_only_database_a_pool(self):

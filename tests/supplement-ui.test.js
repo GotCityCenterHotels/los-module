@@ -24,8 +24,12 @@ test("Supplement page exposes its controls, table landmark, and accessible dialo
         "supplementLyBasis",
         "supplementInventoryBasis",
         "supplementDiffMode",
+        "categorySelectionSummary",
         "supplementTableRegion",
-        "supplementDetailDialog"
+        "supplementDetailDialog",
+        "detailRooms",
+        "detailInventory",
+        "pickupCoverage"
     ];
     for (const id of requiredIds) assert.match(html, new RegExp(`id="${id}"`));
     assert.match(html, /aria-current="page">Supplement/);
@@ -33,4 +37,6 @@ test("Supplement page exposes its controls, table landmark, and accessible dialo
     assert.doesNotMatch(html, /Simulated preview data/);
     assert.match(html, /<dialog[^>]+aria-labelledby="detailTitle"/);
     assert.match(html, /id="dateWindowNav"/);
+    assert.match(html, /<details class="filter-disclosure"/);
+    assert.match(html, /Pickup pace/);
 });

@@ -589,7 +589,7 @@ def fetch_supplement_detail(
             comparison_date = shift_last_year(stay_date, ly_comparison_basis)
             coverage = status.get("coverage")
             if coverage and (
-                comparison_date < date.fromisoformat(coverage["minimumStayDate"])
+                stay_date < date.fromisoformat(coverage["minimumStayDate"])
                 or stay_date > date.fromisoformat(coverage["maximumStayDate"])
             ):
                 raise SupplementUnavailableError(
@@ -730,6 +730,7 @@ def fetch_supplement_detail(
                 "inventoryQuality": inventory_quality,
                 "inventoryExactFrom": INVENTORY_EXACT_FROM.isoformat(),
                 "spitMethod": "lifecycle",
+                "comparisonAvailable": bool(comparison_rows or comparison_pickup),
                 "breakdown": breakdown,
                 "pickup": pickup,
                 "comparisonPickup": comparison_pickup,
