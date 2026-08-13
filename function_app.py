@@ -351,7 +351,7 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(
     route="costdata/import",
     methods=["POST"],
-    auth_level=func.AuthLevel.FUNCTION,
+    auth_level=func.AuthLevel.ANONYMOUS,
 )
 def cost_data_import(req: func.HttpRequest) -> func.HttpResponse:
     """Manually transfer one cost dataset, or every dataset, to Database A."""
