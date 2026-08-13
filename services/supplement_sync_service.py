@@ -2,7 +2,6 @@ import logging
 
 from calendar import monthrange
 from datetime import date, timedelta
-from decimal import Decimal
 from time import perf_counter
 
 from psycopg.rows import dict_row
@@ -20,6 +19,12 @@ from services.supplement_schema_service import ensure_supplement_schema
 SYNC_LOCK_NAME = "functions.supplement_sync"
 SOURCE_OVERLAP_DAYS = 4
 BATCH_SIZE = 5000
+
+
+def _inventory_variance_exceeds(previous_count, staged_count):
+    if not previous_count:
+        return False
+    return staged_count < previous_count * 0.5 or staged_count > previous_count * 1.5
 
 BOOKING_STAGE_INSERT_SQL = """
     INSERT INTO supplement_booking_lifecycle_stage (
@@ -225,21 +230,34 @@ def _validate_stages(cursor, source_snapshots):
     cursor.execute("SELECT count(*) AS row_count FROM supplement_inventory_source_stage")
     inventory_count = cursor.fetchone()["row_count"]
     cursor.execute("""
-        SELECT count(DISTINCT (snapshot_date, hotel_code, space_room_category_id))
-               AS row_count
-        FROM functions.supplement_snapshot_inventory
-        WHERE snapshot_date = ANY(%s)
-    """, (source_snapshots,))
-    previous_inventory_count = cursor.fetchone()["row_count"]
-    if previous_inventory_count and not (
-        previous_inventory_count * Decimal("0.5")
-        <= inventory_count
-        <= previous_inventory_count * Decimal("1.5")
-    ):
-        raise ValueError(
-            "Supplement inventory row-count variance exceeds 50% "
-            f"({previous_inventory_count} previous, {inventory_count} staged)"
+        WITH staged AS (
+            SELECT snapshot_date, count(*) AS row_count
+            FROM supplement_inventory_source_stage
+            GROUP BY snapshot_date
+        ),
+        previous AS (
+            SELECT snapshot_date,
+                   count(DISTINCT (hotel_code, space_room_category_id)) AS row_count
+            FROM functions.supplement_snapshot_inventory
+            WHERE snapshot_date = ANY(%s)
+            GROUP BY snapshot_date
         )
+        SELECT staged.snapshot_date,
+               previous.row_count AS previous_count,
+               staged.row_count AS staged_count
+        FROM staged
+        JOIN previous USING (snapshot_date)
+        ORDER BY staged.snapshot_date
+    """, (source_snapshots,))
+    for comparison in cursor.fetchall():
+        previous_count = comparison["previous_count"]
+        staged_count = comparison["staged_count"]
+        if _inventory_variance_exceeds(previous_count, staged_count):
+            raise ValueError(
+                "Supplement inventory row-count variance exceeds 50% for "
+                f"{comparison['snapshot_date']} "
+                f"({previous_count} previous, {staged_count} staged)"
+            )
     return fact_count, inventory_count
 
 

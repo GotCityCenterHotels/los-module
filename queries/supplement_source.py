@@ -97,30 +97,54 @@ historical_dates AS (
     FROM snapshot_dates WHERE snapshot_date >= DATE '2026-02-27'
 ),
 resource_asof AS (
-    SELECT DISTINCT ON (d.snapshot_date, h.tenant_key, h.id)
-           d.snapshot_date, h.tenant_key, h.id, h.state, h.is_active
+    SELECT d.snapshot_date, selected.tenant_key, selected.id,
+           selected.state, selected.is_active
     FROM historical_dates d
-    JOIN resource_history h ON h.snapshot_valid_from < d.cutoff
-    ORDER BY d.snapshot_date, h.tenant_key, h.id,
-             h.snapshot_valid_from DESC, h.snapshot_observed_at DESC, h.snapshot_id DESC
+    CROSS JOIN resource_current resource_key
+    CROSS JOIN LATERAL (
+        SELECT h.tenant_key, h.id, h.state, h.is_active
+        FROM resource_history h
+        WHERE h.tenant_key = resource_key.tenant_key
+          AND h.id = resource_key.id
+          AND h.snapshot_valid_from < d.cutoff
+        ORDER BY h.snapshot_valid_from DESC,
+                 h.snapshot_observed_at DESC, h.snapshot_id DESC
+        LIMIT 1
+    ) selected
 ),
 assignment_asof AS (
-    SELECT DISTINCT ON (d.snapshot_date, h.tenant_key, h.id)
-           d.snapshot_date, h.tenant_key, h.id, h.resource_id,
-           h.category_id, h.is_active
+    SELECT d.snapshot_date, selected.tenant_key, selected.id,
+           selected.resource_id, selected.category_id, selected.is_active
     FROM historical_dates d
-    JOIN resource_category_assignment_history h ON h.snapshot_valid_from < d.cutoff
-    ORDER BY d.snapshot_date, h.tenant_key, h.id,
-             h.snapshot_valid_from DESC, h.snapshot_observed_at DESC, h.snapshot_id DESC
+    CROSS JOIN resource_category_assignment_current assignment_key
+    CROSS JOIN LATERAL (
+        SELECT h.tenant_key, h.id, h.resource_id, h.category_id, h.is_active
+        FROM resource_category_assignment_history h
+        WHERE h.tenant_key = assignment_key.tenant_key
+          AND h.id = assignment_key.id
+          AND h.snapshot_valid_from < d.cutoff
+        ORDER BY h.snapshot_valid_from DESC,
+                 h.snapshot_observed_at DESC, h.snapshot_id DESC
+        LIMIT 1
+    ) selected
 ),
 category_asof AS (
-    SELECT DISTINCT ON (d.snapshot_date, h.tenant_key, h.id)
-           d.snapshot_date, h.tenant_key, h.id, h.enterprise_id,
-           h.service_id, h.type, h.is_active, h.space_name
+    SELECT d.snapshot_date, selected.tenant_key, selected.id,
+           selected.enterprise_id, selected.service_id, selected.type,
+           selected.is_active, selected.space_name
     FROM historical_dates d
-    JOIN resource_category_history h ON h.snapshot_valid_from < d.cutoff
-    ORDER BY d.snapshot_date, h.tenant_key, h.id,
-             h.snapshot_valid_from DESC, h.snapshot_observed_at DESC, h.snapshot_id DESC
+    CROSS JOIN resource_category_current category_key
+    CROSS JOIN LATERAL (
+        SELECT h.tenant_key, h.id, h.enterprise_id, h.service_id,
+               h.type, h.is_active, h.space_name
+        FROM resource_category_history h
+        WHERE h.tenant_key = category_key.tenant_key
+          AND h.id = category_key.id
+          AND h.snapshot_valid_from < d.cutoff
+        ORDER BY h.snapshot_valid_from DESC,
+                 h.snapshot_observed_at DESC, h.snapshot_id DESC
+        LIMIT 1
+    ) selected
 ),
 historical_inventory AS (
     SELECT r.snapshot_date, r.tenant_key, c.enterprise_id,

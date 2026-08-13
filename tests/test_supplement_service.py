@@ -2,6 +2,7 @@ import os
 import unittest
 
 from datetime import date
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -66,6 +67,11 @@ class SupplementDomainTests(unittest.TestCase):
             supplement_sync_service.add_months(date(2024, 8, 31), 18),
             date(2026, 2, 28),
         )
+
+    def test_all_category_detail_does_not_bind_an_untyped_null(self):
+        source = Path(supplement_service.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("(%s IS NULL OR space_room_category_id", source)
+        self.assertIn("inventory_category_clause", source)
 
 
 class SupplementApiBoundaryTests(unittest.TestCase):

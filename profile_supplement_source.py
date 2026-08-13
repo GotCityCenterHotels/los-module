@@ -11,6 +11,9 @@ from queries.supplement_source import (
 )
 
 
+MAX_SMALL_SEQUENTIAL_SCAN_ROWS = 10_000
+
+
 def add_months(value, months):
     month_index = value.month - 1 + months
     year = value.year + month_index // 12
@@ -44,13 +47,26 @@ def _uses_index_access(plan):
     )
 
 
-def _has_broad_scan(plan, relation_names):
+def _has_broad_scan(plan, relation_names, include_index_scans=False):
     names = {name.lower() for name in relation_names}
-    return any(
-        node.get("Node Type") == "Seq Scan"
-        and str(node.get("Relation Name", "")).lower() in names
-        for node in _walk_plan(plan[0]["Plan"])
-    )
+    for node in _walk_plan(plan[0]["Plan"]):
+        node_type = node.get("Node Type", "")
+        if include_index_scans:
+            if "Scan" not in node_type:
+                continue
+        elif node_type != "Seq Scan":
+            continue
+        if str(node.get("Relation Name", "")).lower() not in names:
+            continue
+        loops = int(node.get("Actual Loops") or 0)
+        if loops == 0:
+            continue
+        scanned_per_loop = int(node.get("Actual Rows") or 0) + int(
+            node.get("Rows Removed by Filter") or 0
+        ) + int(node.get("Rows Removed by Index Recheck") or 0)
+        if scanned_per_loop * loops > MAX_SMALL_SEQUENTIAL_SCAN_ROWS:
+            return True
+    return False
 
 
 def main():
@@ -74,7 +90,7 @@ def main():
             "resource_history",
             "resource_category_history",
             "resource_category_assignment_history",
-        })
+        }, include_index_scans=True)
     )
     report = {
         "boundedBookingLifecycleRead": booking_plan,

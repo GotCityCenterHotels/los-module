@@ -46,6 +46,10 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         self.assertIn("sellable_inventory", query)
         self.assertIn("r.state <> 'outoforder'", query)
         self.assertIn("'approximated-current'", query)
+        self.assertIn("cross join lateral", query)
+        self.assertIn("h.tenant_key = resource_key.tenant_key", query)
+        self.assertIn("h.id = resource_key.id", query)
+        self.assertIn("limit 1", query)
 
     def test_database_a_rejects_integration_db_name(self):
         settings = {
@@ -108,10 +112,35 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         self.assertTrue(profile_supplement_source._uses_bounded_access(indexed))
         self.assertTrue(profile_supplement_source._uses_bounded_access(pruned))
         broad = [{"Plan": {
-            "Node Type": "Seq Scan", "Relation Name": "order_item_current"
+            "Node Type": "Seq Scan", "Relation Name": "order_item_current",
+            "Actual Rows": 20000, "Actual Loops": 1,
         }}]
         self.assertTrue(profile_supplement_source._has_broad_scan(
             broad, {"order_item_current"}
+        ))
+        small = [{"Plan": {
+            "Node Type": "Seq Scan", "Relation Name": "resource_category_history",
+            "Actual Rows": 66, "Actual Loops": 1,
+        }}]
+        self.assertFalse(profile_supplement_source._has_broad_scan(
+            small, {"resource_category_history"}
+        ))
+        unused = [{"Plan": {
+            "Node Type": "Seq Scan", "Relation Name": "resource_history",
+            "Actual Rows": 0, "Actual Loops": 0,
+        }}]
+        self.assertFalse(profile_supplement_source._has_broad_scan(
+            unused, {"resource_history"}
+        ))
+        broad_index = [{"Plan": {
+            "Node Type": "Index Only Scan", "Relation Name": "resource_history",
+            "Actual Rows": 182311, "Actual Loops": 1,
+        }}]
+        self.assertTrue(profile_supplement_source._has_broad_scan(
+            broad_index, {"resource_history"}, include_index_scans=True
+        ))
+        self.assertFalse(profile_supplement_source._has_broad_scan(
+            broad_index, {"resource_history"}
         ))
 
     def test_migration_contains_partitioned_snapshots_and_publication_pointer(self):
@@ -172,6 +201,8 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         )[0]
         self.assertIn("requested_category_id IS NULL", validation)
         self.assertIn("space_category_id IS NULL", validation)
+        self.assertIn("GROUP BY snapshot_date", validation)
+        self.assertIn("JOIN previous USING (snapshot_date)", validation)
         self.assertIn("ON CONFLICT (hotel_code, room_category_id)", service)
         self.assertIn("snapshot_date DESC", service)
         self.assertNotIn("ORDER BY enterprise_id, snapshot_date", service)

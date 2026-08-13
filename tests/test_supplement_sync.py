@@ -66,6 +66,11 @@ class FakeConnection:
 
 
 class SupplementSyncOrchestrationTests(unittest.TestCase):
+    def test_inventory_variance_is_compared_per_snapshot_not_batch_total(self):
+        self.assertFalse(sync_service._inventory_variance_exceeds(52, 52))
+        self.assertFalse(sync_service._inventory_variance_exceeds(0, 208))
+        self.assertTrue(sync_service._inventory_variance_exceeds(52, 208))
+
     def _patches(self, connection, validate_side_effect=None):
         validate = patch.object(
             sync_service,

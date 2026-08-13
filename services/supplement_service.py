@@ -647,15 +647,24 @@ def fetch_supplement_detail(
                     "comparisonAveragePrice": float(comparison.get("room_revenue") or 0) / comparison_rooms if comparison_rooms else None,
                 })
 
-            cursor.execute("""
+            inventory_category_clause = (
+                "AND space_room_category_id = %(category)s::uuid"
+                if category else ""
+            )
+            cursor.execute(f"""
                 SELECT sum(total_space) AS total_space,
                        sum(space_to_sell) AS space_to_sell,
                        CASE WHEN bool_or(inventory_quality = 'approximated-current')
                             THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
                 FROM functions.supplement_latest_inventory
-                WHERE hotel_code = %s AND stay_date = %s
-                  AND (%s IS NULL OR space_room_category_id = %s::uuid)
-            """, (hotel_code, stay_date, category, category))
+                WHERE hotel_code = %(hotel_code)s
+                  AND stay_date = %(stay_date)s
+                  {inventory_category_clause}
+            """, {
+                "hotel_code": hotel_code,
+                "stay_date": stay_date,
+                "category": category,
+            })
             inventory = cursor.fetchone()
             pickup = []
             for row in _pickup_rows(
