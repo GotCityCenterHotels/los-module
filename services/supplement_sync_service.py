@@ -272,11 +272,11 @@ def _publish_stage(cursor, run_id, source_snapshots):
         INSERT INTO functions.supplement_hotels (
             hotel_code, tenant_key, enterprise_id, hotel_name, last_seen_at
         )
-        SELECT DISTINCT ON (enterprise_id)
-               enterprise_id::text, tenant_key, enterprise_id,
-               hotel_name, now()
-        FROM supplement_inventory_source_stage
-        ORDER BY enterprise_id, snapshot_date DESC
+        SELECT DISTINCT ON (source.enterprise_id)
+               source.enterprise_id::text, source.tenant_key,
+               source.enterprise_id, source.hotel_name, now()
+        FROM supplement_inventory_source_stage AS source
+        ORDER BY source.enterprise_id, source.snapshot_date DESC
         ON CONFLICT (hotel_code) DO UPDATE SET
             tenant_key = EXCLUDED.tenant_key,
             enterprise_id = EXCLUDED.enterprise_id,
@@ -289,11 +289,13 @@ def _publish_stage(cursor, run_id, source_snapshots):
             hotel_code, room_category_id, space_room_name,
             short_name, sort_order, last_seen_at
         )
-        SELECT DISTINCT ON (enterprise_id, category_id)
-               enterprise_id::text, category_id, category_name,
-               left(upper(category_name), 8), 0, now()
-        FROM supplement_inventory_source_stage
-        ORDER BY enterprise_id, category_id, snapshot_date DESC
+        SELECT DISTINCT ON (source.enterprise_id, source.category_id)
+               source.enterprise_id::text, source.category_id,
+               source.category_name, left(upper(source.category_name), 8),
+               0, now()
+        FROM supplement_inventory_source_stage AS source
+        ORDER BY source.enterprise_id, source.category_id,
+                 source.snapshot_date DESC
         ON CONFLICT (hotel_code, room_category_id) DO UPDATE SET
             space_room_name = EXCLUDED.space_room_name,
             short_name = EXCLUDED.short_name,

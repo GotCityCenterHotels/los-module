@@ -174,6 +174,11 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         self.assertIn("space_category_id IS NULL", validation)
         self.assertIn("ON CONFLICT (hotel_code, room_category_id)", service)
         self.assertIn("snapshot_date DESC", service)
+        self.assertNotIn("ORDER BY enterprise_id, snapshot_date", service)
+        self.assertIn(
+            "ORDER BY source.enterprise_id, source.snapshot_date DESC",
+            service,
+        )
 
 
 if __name__ == "__main__":
