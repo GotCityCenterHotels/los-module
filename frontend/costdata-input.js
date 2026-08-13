@@ -19,7 +19,7 @@
         status.textContent = "Loading properties...";
         hotel.disabled = true;
         try {
-            const payload = await LosApi.fetchJson(`${API}/hotels`);
+            const payload = await LosApi.fetchJson(`${API}/hotels`, {cache: "no-store"});
             const properties = (payload.data || []).filter((property) =>
                 property && property.enterpriseId != null && String(property.enterpriseId).trim()
                 && property.hotelName && String(property.hotelName).trim()
@@ -51,7 +51,7 @@
         const parameters = new URLSearchParams({
             hotelName: selectedOption ? selectedOption.textContent : ""
         });
-        try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}?${parameters}`); model = payload.data; loadedEnterpriseId = model.enterpriseId; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${model.hotelName}`; }
+        try { const payload = await LosApi.fetchJson(`${API}/${encodeURIComponent(name)}?${parameters}`, {cache: "no-store"}); model = payload.data; loadedEnterpriseId = model.enterpriseId; render(); layout.hidden = false; setDirty(false); status.textContent = `Editing ${model.hotelName}`; }
         catch (error) { showError(error); } finally { setBusy(false); }
     }
     function render() {
@@ -96,16 +96,17 @@
                         body: JSON.stringify({dataset})
                     });
                     const row = (result.results || [])[0];
-                    if (row && row.status !== "success") failures.push(`${dataset}: ${row.error}`);
+                    if (result.status !== "success" || !row || row.status !== "success") {
+                        failures.push(`${dataset}: ${row?.error || result.error || "Import did not report success"}`);
+                    }
                 }
                 catch (error) { failures.push(`${dataset}: ${error.message}`); }
             }
             if (failures.length) {
                 showError(new Error(`Import finished with failures: ${failures.join("; ")}`));
+                return;
             }
-            else {
-                status.textContent = `Import complete (${IMPORT_DATASETS.length}/${IMPORT_DATASETS.length} datasets).`;
-            }
+            status.textContent = `Import complete (${IMPORT_DATASETS.length}/${IMPORT_DATASETS.length} datasets).`;
             await loadHotels();
         }
         finally { importButton.disabled=false; }

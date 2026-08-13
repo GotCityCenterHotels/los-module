@@ -333,6 +333,22 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
         property_record = _resolve_cost_settings_hotel(enterprise_id)
         enterprise_id = property_record["enterpriseId"]
         hotel_name = property_record["hotelName"]
+    else:
+        # The ID/name pair came from the property-list endpoint. Persist it
+        # locally on first load as well, so a cached list response cannot leave
+        # the subsequent Save request without a Database A property record.
+        property_record = {
+            "enterpriseId": _required_text(
+                enterprise_id,
+                "Enterprise ID",
+                250,
+            ),
+            "hotelName": _required_text(hotel_name, "Hotel", 250),
+        }
+        enterprise_id = property_record["enterpriseId"]
+        hotel_name = property_record["hotelName"]
+        _upsert_mirrored_properties([property_record])
+        _preload_property_settings([property_record])
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute("SELECT * FROM functions.cost_property_settings WHERE enterprise_id = %s", (enterprise_id,))

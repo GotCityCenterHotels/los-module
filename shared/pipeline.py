@@ -57,6 +57,33 @@ def run_dataset(dataset_name):
         batch_size=5000,
     )
 
+    if dataset_name == "properties":
+        if result["export_rows"] == 0:
+            raise RuntimeError(
+                "enterprise_current returned no GCCH properties from Database B"
+            )
+
+        # Verify through the same pool used by the settings API. This catches
+        # configuration drift where the importer writes to a different
+        # Database A than the page reads.
+        from cost_database import cost_pool
+
+        with cost_pool.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT count(*)
+                    FROM functions.cost_properties
+                    WHERE tenant_key = 'GCCH'
+                    """
+                )
+                verified_rows = cursor.fetchone()[0]
+        if verified_rows == 0:
+            raise RuntimeError(
+                "Properties were exported but are not visible to the cost settings API in Database A"
+            )
+        result["verified_rows"] = verified_rows
+
     return {
         "dataset": dataset_name,
         **result,

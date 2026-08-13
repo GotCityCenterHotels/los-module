@@ -46,7 +46,12 @@ class CostDataTriggerTests(unittest.TestCase):
             pipeline,
             "transfer_dataset",
             return_value=expected,
-        ) as transfer:
+        ) as transfer, patch(
+            "cost_database.cost_pool.connection",
+        ) as pool_connection:
+            cursor = pool_connection.return_value.__enter__.return_value.cursor
+            cursor = cursor.return_value.__enter__.return_value
+            cursor.fetchone.return_value = (8,)
             result = pipeline.run_dataset("properties")
 
         ensure_schema.assert_called_once_with()
@@ -55,7 +60,21 @@ class CostDataTriggerTests(unittest.TestCase):
             import_sql_file="import/upsert_cost_properties.sql",
             batch_size=5000,
         )
-        self.assertEqual(result, {"dataset": "properties", **expected})
+        self.assertEqual(result, {
+            "dataset": "properties",
+            **expected,
+            "verified_rows": 8,
+        })
+
+    def test_property_sync_rejects_an_empty_source_result(self):
+        with patch(
+            "services.cost_schema_service.ensure_cost_settings_schema",
+        ), patch.object(
+            pipeline,
+            "transfer_dataset",
+            return_value={"export_rows": 0, "import_rows": 0},
+        ), self.assertRaisesRegex(RuntimeError, "returned no GCCH properties"):
+            pipeline.run_dataset("properties")
 
     def test_timer_runs_every_dataset(self):
         expected = {"status": "success", "results": []}
@@ -84,6 +103,7 @@ class CostDataTriggerTests(unittest.TestCase):
         run_one.assert_called_once_with("parking")
         self.assertEqual(response.status_code, 200)
         self.assertIn('"dataset":"parking"', response.get_body().decode())
+        self.assertIn('"status":"success"', response.get_body().decode())
 
     def test_manual_trigger_defaults_to_all_datasets(self):
         expected = {"status": "success", "results": []}
@@ -97,6 +117,22 @@ class CostDataTriggerTests(unittest.TestCase):
 
         run_all.assert_called_once_with()
         self.assertEqual(response.status_code, 200)
+
+    def test_manual_trigger_returns_property_validation_failure(self):
+        with patch.object(
+            function_app,
+            "run_dataset",
+            side_effect=RuntimeError("enterprise_current returned no GCCH properties"),
+        ):
+            response = function_app.cost_data_import(
+                FakeRequest({"dataset": "properties"})
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn(
+            "enterprise_current returned no GCCH properties",
+            response.get_body().decode(),
+        )
 
     def test_v2_function_app_registers_manual_and_timer_triggers(self):
         function_names = {

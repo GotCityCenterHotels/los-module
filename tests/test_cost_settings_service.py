@@ -270,6 +270,50 @@ class CostSettingsValidationTests(unittest.TestCase):
         self.assertIn("ON CONFLICT (enterprise_id) DO UPDATE", cursor.sql)
         self.assertNotIn("card_cost_percent", cursor.sql)
 
+    def test_settings_load_persists_property_pair_in_database_a(self):
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql, parameters=None): pass
+            def fetchone(self): return None
+            def fetchall(self): return []
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self, **kwargs): return Cursor()
+
+        class Pool:
+            def connection(self): return Connection()
+
+        property_record = {
+            "enterpriseId": "property-42",
+            "hotelName": "Hotel A",
+        }
+        with patch.object(
+            cost_settings_service,
+            "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service,
+            "_upsert_mirrored_properties",
+        ) as mirror, patch.object(
+            cost_settings_service,
+            "_preload_property_settings",
+        ) as preload, patch.object(
+            cost_settings_service,
+            "cost_pool",
+            Pool(),
+        ):
+            result = cost_settings_service.fetch_cost_settings(
+                property_record["enterpriseId"],
+                property_record["hotelName"],
+            )
+
+        mirror.assert_called_once_with([property_record])
+        preload.assert_called_once_with([property_record])
+        self.assertEqual(result["enterpriseId"], "property-42")
+        self.assertEqual(result["hotelName"], "Hotel A")
+
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(
             "00000000-0000-0000-0000-000000000001", "Hotel A", {}

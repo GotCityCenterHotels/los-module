@@ -372,15 +372,24 @@ def cost_data_import(req: func.HttpRequest) -> func.HttpResponse:
         if dataset == "all":
             result = run_all_datasets()
         else:
+            dataset_result = run_dataset(dataset)
             result = {
                 "status": "success",
-                "results": [run_dataset(dataset)],
+                "results": [
+                    {
+                        "status": "success",
+                        **dataset_result,
+                    }
+                ],
             }
 
         status_code = 200 if result.get("status") == "success" else 207
         return json_response(result, status_code)
     except ValueError as error:
         return json_response({"error": str(error)}, 400)
+    except RuntimeError as error:
+        logging.exception("Cost data import validation failed")
+        return json_response({"error": str(error)}, 502)
     except Exception:
         logging.exception("Manual cost data import failed")
         return json_response({"error": "Unable to import cost data"}, 500)
