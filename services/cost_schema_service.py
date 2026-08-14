@@ -25,6 +25,13 @@ MIGRATIONS = (
         "010_cost_fact_tables",
         APP_ROOT / "sql" / "migrations" / "010_cost_fact_tables.sql",
     ),
+    # 011 is deliberately excluded: it drops functions.cost_fixed_lines and is
+    # applied by hand, matching how 007 is handled. Destructive DDL must not run
+    # from an ordinary page request.
+    (
+        "012_cleaning_occupancy",
+        APP_ROOT / "sql" / "migrations" / "012_cleaning_occupancy.sql",
+    ),
 )
 
 _schema_ready = False

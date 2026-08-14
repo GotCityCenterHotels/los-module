@@ -336,15 +336,31 @@ class CostSettingsValidationTests(unittest.TestCase):
                 "groupName": "OTA", "costPercent": "14.5",
                 "rules": [{"matchType": "channel", "matchValue": "Booking.com"}],
             }],
-            "cleaningCategories": [{"categoryName": "Double", "minGuests": 1, "maxGuests": 2, "cleaningMinutes": 30, "linenCost": 75}],
+            # One row per (room category, occupancy).
+            "cleaningCategories": [
+                {"categoryName": "Double", "resourceCategoryId": "cat-1", "occupancy": 1, "cleaningMinutes": 30, "linenCost": 75},
+                {"categoryName": "Double", "resourceCategoryId": "cat-1", "occupancy": 2, "cleaningMinutes": 40, "linenCost": 150},
+            ],
             "arrivalTiers": [{"minArrivals": 30, "maxArrivals": "", "receptionHours": 4}],
             "breakfastTiers": [{"minGuests": 0, "maxGuests": 49, "staffHours": 0}, {"minGuests": 50, "maxGuests": 70, "staffHours": 4}],
-            "fixedCosts": [{"costName": "Electricity", "amount": 10000, "cadence": "monthly", "active": True}],
         })
 
         self.assertEqual(result["hotelName"], "Hotel A")
         self.assertEqual(result["profile"]["currency"], "SEK")
         self.assertEqual(result["arrivalTiers"][0]["maxArrivals"], None)
+        # The same category at two occupancies is valid; it is no longer a
+        # duplicate name clash the way the old guest-band model treated it.
+        self.assertEqual(len(result["cleaningCategories"]), 2)
+        self.assertEqual(result["cleaningCategories"][1]["occupancy"], 2)
+
+    def test_same_category_and_occupancy_twice_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "only appear once"):
+            cost_settings_service.validate_cost_settings("00000000-0000-0000-0000-000000000001", "Hotel A", {
+                "cleaningCategories": [
+                    {"categoryName": "Double", "occupancy": 2, "cleaningMinutes": 30, "linenCost": 75},
+                    {"categoryName": "double", "occupancy": 2, "cleaningMinutes": 45, "linenCost": 90},
+                ],
+            })
 
     def test_overlapping_thresholds_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "ranges cannot overlap"):

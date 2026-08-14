@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data Input</title>
-    <link rel="stylesheet" href="styles.css?v=20260814-6">
+    <link rel="stylesheet" href="styles.css?v=20260815-1">
 </head>
 <body>
 <main class="container cost-workspace settings-workspace">
@@ -31,7 +31,6 @@
             <button type="button" data-section="arrivals"><span>03</span>Arrivals</button>
             <button type="button" data-section="breakfast"><span>04</span>Breakfast</button>
             <button type="button" data-section="rent"><span>05</span>Rent & cards</button>
-            <button type="button" data-section="fixed"><span>06</span>Fixed costs</button>
         </aside>
 
         <form id="settingsForm" class="settings-editor">
@@ -41,8 +40,8 @@
                 <div id="distributionGroups" class="rule-list"></div>
             </section>
             <section data-settings-section="cleaning" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Cleaning labour plus linen cost is selected by the room’s guest category.</p></div><button type="button" class="secondary-button" data-add="cleaningCategories">Add category</button></div>
-                <div class="setting-strip"><label>Cleaning cost / minute<input name="cleaningCostPerMinute" type="number" min="0" step="0.01" required></label><label>Currency<input name="currency" maxlength="3" pattern="[A-Za-z]{3}" required></label></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Every room category in this hotel, with one row per possible occupancy. Set cleaning minutes and linen cost for each.</p></div></div>
+                <div class="setting-strip"><label>Cleaning cost / minute<input name="cleaningCostPerMinute" type="number" min="0" step="0.01" required></label></div>
                 <div id="cleaningCategories" class="rule-list"></div>
             </section>
             <section data-settings-section="arrivals" hidden>
@@ -59,15 +58,11 @@
                 <div class="editor-heading"><div><span class="section-eyebrow">REVENUE & PAYMENTS</span><h2>Rent and card costs</h2><p>Percentages apply to the matching net revenue stream or gross payments.</p></div></div>
                 <div class="setting-grid"><label>Room rent %<input name="roomRentPercent" type="number" min="0" max="100" step="0.01" required><small>Room revenue net</small></label><label>Breakfast rent %<input name="breakfastRentPercent" type="number" min="0" max="100" step="0.01" required><small>Breakfast revenue net</small></label><label>Parking rent %<input name="parkingRentPercent" type="number" min="0" max="100" step="0.01" required><small>Parking revenue net</small></label><label>Card cost %<input name="cardCostPercent" type="number" min="0" max="100" step="0.01" required><small>Gross payments; default 2%</small></label></div>
             </section>
-            <section data-settings-section="fixed" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">OPEN PROPERTY</span><h2>Fixed costs</h2><p>Add recurring costs such as electricity, insurance, or subscriptions.</p></div><button type="button" class="secondary-button" data-add="fixedCosts">Add cost</button></div>
-                <div id="fixedCosts" class="rule-list"></div>
-            </section>
             <div class="settings-savebar"><span id="dirtyState">No unsaved changes</span><button id="saveSettings" type="submit">Save property settings</button></div>
         </form>
     </div>
     <section id="settingsError" class="error-panel" role="alert" hidden></section>
 </main>
-<script src="los-api.js?v=20260811-2"></script><script src="costdata-input.js?v=20260814-4"></script>
+<script src="los-api.js?v=20260811-2"></script><script src="costdata-input.js?v=20260815-1"></script>
 </body>
 </html>

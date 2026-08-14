@@ -25,6 +25,10 @@ from services.cost_settings_service import (
     save_cost_settings,
 )
 from services.cost_schema_service import CostSettingsSchemaError
+from services.cost_source_service import (
+    CostSourceUnavailableError,
+    fetch_cost_sources,
+)
 from services.supplement_schema_service import SupplementSchemaError
 from services.supplement_service import (
     SupplementUnavailableError,
@@ -465,6 +469,35 @@ def cost_settings_hotels(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         logging.exception("Cost settings hotel endpoint failed")
         return json_response({"error": "Unable to retrieve properties"}, 500)
+
+
+@app.route(
+    route="costdata/sources/{enterprise_id}",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def cost_settings_sources(req: func.HttpRequest) -> func.HttpResponse:
+    """Rates, channels and room categories for the Cost Input pickers."""
+    enterprise_id = (req.route_params.get("enterprise_id") or "").strip()
+    if not enterprise_id:
+        return json_response({"error": "Enterprise ID is required"}, 400)
+    try:
+        return compressed_json_response(
+            req,
+            {"data": fetch_cost_sources(enterprise_id)},
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+    except CostSourceUnavailableError as error:
+        # The source column names could not be resolved. Surface the detail:
+        # it names the table and the candidates tried, which is exactly what an
+        # operator needs to fix the mapping.
+        logging.warning("Cost source lookup unavailable: %s", error)
+        return json_response({"error": str(error)}, 503)
+    except Exception:
+        logging.exception(
+            "Cost source endpoint failed enterprise_id=%s", enterprise_id
+        )
+        return json_response({"error": "Unable to retrieve property source data"}, 500)
 
 
 @app.route(

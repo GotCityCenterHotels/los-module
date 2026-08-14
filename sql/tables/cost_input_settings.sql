@@ -99,24 +99,15 @@ CREATE TABLE IF NOT EXISTS functions.cost_breakfast_staffing_tiers (
     CHECK (staff_hours >= 0)
 );
 
-CREATE TABLE IF NOT EXISTS functions.cost_fixed_lines (
-    fixed_cost_line_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    enterprise_id text NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
-    cost_name text NOT NULL,
-    amount numeric(18, 4) NOT NULL,
-    cadence text NOT NULL DEFAULT 'monthly' CHECK (cadence IN ('daily', 'monthly', 'yearly')),
-    active boolean NOT NULL DEFAULT true,
-    sort_order integer NOT NULL DEFAULT 0,
-    UNIQUE (enterprise_id, cost_name),
-    CHECK (amount >= 0)
-);
+-- Fixed costs are intentionally absent: they are applied once at the analysis
+-- stage from a separately maintained roadmap, not per property in the cost
+-- algorithm. Migration 011 drops the table on databases that still have it.
 
 CREATE INDEX IF NOT EXISTS ix_hotels_tenant_active_name ON functions.hotels(tenant_key, active, hotel_name, enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_enterprise ON functions.cost_distribution_groups(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.cost_cleaning_categories(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_enterprise ON functions.cost_breakfast_staffing_tiers(enterprise_id);
-CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_enterprise ON functions.cost_fixed_lines(enterprise_id);
 
 CREATE TABLE IF NOT EXISTS functions.schema_migrations (
     migration_name text PRIMARY KEY,

@@ -360,10 +360,9 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
 
             collections = {}
             for name, query in {
-                "cleaningCategories": "SELECT category_name, min_guests, max_guests, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE enterprise_id = %s ORDER BY sort_order, cleaning_category_id",
+                "cleaningCategories": "SELECT category_name, resource_category_id, occupancy, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE enterprise_id = %s ORDER BY category_name, occupancy, cleaning_category_id",
                 "arrivalTiers": "SELECT min_arrivals, max_arrivals, reception_hours FROM functions.cost_arrival_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, arrival_tier_id",
                 "breakfastTiers": "SELECT min_guests, max_guests, staff_hours FROM functions.cost_breakfast_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, breakfast_tier_id",
-                "fixedCosts": "SELECT cost_name, amount, cadence, active FROM functions.cost_fixed_lines WHERE enterprise_id = %s ORDER BY sort_order, fixed_cost_line_id",
             }.items():
                 cursor.execute(query, (enterprise_id,))
                 collections[name] = [_json_row(row) for row in cursor.fetchall()]
@@ -456,15 +455,23 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
             rules.append({"matchType": match_type, "matchValue": _required_text(rule.get("matchValue"), "Distribution match value")})
         result["distributionGroups"].append({"groupName": name, "costPercent": _number(group.get("costPercent"), f"{name} percent", 100), "rules": rules})
 
+    # Cleaning is keyed by (room category, occupancy): a category serving 2 + 1
+    # extra beds has three rows, because linen and minutes differ per occupancy.
+    # Guest bands are gone, so there are no ranges to check for overlap - only
+    # that the same category/occupancy pair is not entered twice.
     cleaning = payload.get("cleaningCategories") or []
-    _validate_ranges(cleaning, "minGuests", "maxGuests", "Cleaning")
     result["cleaningCategories"] = [{
         "categoryName": _required_text(row.get("categoryName"), "Cleaning category name"),
-        "minGuests": _number(row.get("minGuests"), "Minimum guests", integer=True),
-        "maxGuests": None if row.get("maxGuests") in (None, "") else _number(row.get("maxGuests"), "Maximum guests", integer=True),
+        "resourceCategoryId": (
+            None if row.get("resourceCategoryId") in (None, "")
+            else _required_text(row.get("resourceCategoryId"), "Room category ID", 250)
+        ),
+        "occupancy": _number(row.get("occupancy"), "Occupancy", integer=True),
         "cleaningMinutes": _number(row.get("cleaningMinutes"), "Cleaning minutes"),
         "linenCost": _number(row.get("linenCost"), "Linen cost"),
     } for row in cleaning]
+    if any(row["occupancy"] < 1 for row in result["cleaningCategories"]):
+        raise ValueError("Cleaning occupancy must be at least 1")
 
     for source, target, min_key, max_key, hours_key, label in (
         (payload.get("arrivalTiers") or [], "arrivalTiers", "minArrivals", "maxArrivals", "receptionHours", "Arrival staffing"),
@@ -473,11 +480,14 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
         _validate_ranges(source, min_key, max_key, label)
         result[target] = [{min_key: _number(row.get(min_key), f"{label} minimum", integer=True), max_key: None if row.get(max_key) in (None, "") else _number(row.get(max_key), f"{label} maximum", integer=True), hours_key: _number(row.get(hours_key), f"{label} hours")} for row in source]
 
-    result["fixedCosts"] = [{"costName": _required_text(row.get("costName"), "Fixed cost name"), "amount": _number(row.get("amount"), "Fixed cost amount"), "cadence": row.get("cadence", "monthly"), "active": bool(row.get("active", True))} for row in payload.get("fixedCosts") or []]
-    if any(row["cadence"] not in {"daily", "monthly", "yearly"} for row in result["fixedCosts"]): raise ValueError("Fixed cost cadence must be daily, monthly, or yearly")
-    for collection, field, label in ((result["cleaningCategories"], "categoryName", "Cleaning category"), (result["fixedCosts"], "costName", "Fixed cost")):
-        values = [row[field].casefold() for row in collection]
-        if len(values) != len(set(values)): raise ValueError(f"{label} names must be unique")
+    # Fixed costs are deliberately not part of this model. They are applied once
+    # at the analysis stage, not per-property in the cost algorithm.
+    cleaning_keys = [
+        (row["categoryName"].casefold(), row["occupancy"])
+        for row in result["cleaningCategories"]
+    ]
+    if len(cleaning_keys) != len(set(cleaning_keys)):
+        raise ValueError("Each cleaning category and occupancy may only appear once")
     return result
 
 
@@ -499,13 +509,14 @@ def save_cost_settings(enterprise_id, payload):
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute("""INSERT INTO functions.cost_property_settings (enterprise_id, currency, distribution_default_percent, cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent, breakfast_calculation_basis, breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour, breakfast_rent_percent, parking_rent_percent, card_cost_percent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (enterprise_id) DO UPDATE SET currency=EXCLUDED.currency, distribution_default_percent=EXCLUDED.distribution_default_percent, cleaning_cost_per_minute=EXCLUDED.cleaning_cost_per_minute, reception_cost_per_hour=EXCLUDED.reception_cost_per_hour, room_rent_percent=EXCLUDED.room_rent_percent, breakfast_calculation_basis=EXCLUDED.breakfast_calculation_basis, breakfast_food_cost_per_guest=EXCLUDED.breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour=EXCLUDED.breakfast_staff_cost_per_hour, breakfast_rent_percent=EXCLUDED.breakfast_rent_percent, parking_rent_percent=EXCLUDED.parking_rent_percent, card_cost_percent=EXCLUDED.card_cost_percent, updated_at=now()""", (data["enterpriseId"], p["currency"], p["distributionDefaultPercent"], p["cleaningCostPerMinute"], p["receptionCostPerHour"], p["roomRentPercent"], p["breakfastCalculationBasis"], p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"], p["breakfastRentPercent"], p["parkingRentPercent"], p["cardCostPercent"]))
-            for table in ("cost_distribution_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers", "cost_fixed_lines"):
+            for table in ("cost_distribution_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers"):
                 cursor.execute(f"DELETE FROM functions.{table} WHERE enterprise_id = %s", (data["enterpriseId"],))
             for order, group in enumerate(data["distributionGroups"]):
                 cursor.execute("INSERT INTO functions.cost_distribution_groups (enterprise_id, group_name, cost_percent, sort_order) VALUES (%s,%s,%s,%s) RETURNING distribution_group_id", (data["enterpriseId"], group["groupName"], group["costPercent"], order)); group_id = cursor.fetchone()[0]
                 cursor.executemany("INSERT INTO functions.cost_distribution_rules (distribution_group_id, match_type, match_value) VALUES (%s,%s,%s)", [(group_id, r["matchType"], r["matchValue"]) for r in group["rules"]])
-            cursor.executemany("INSERT INTO functions.cost_cleaning_categories (enterprise_id, category_name, min_guests, max_guests, cleaning_minutes, linen_cost, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["categoryName"], r["minGuests"], r["maxGuests"], r["cleaningMinutes"], r["linenCost"], i) for i,r in enumerate(data["cleaningCategories"])])
+            # min_guests/max_guests are retained by the table's legacy CHECK
+            # constraints; occupancy is the value the algorithm now reads.
+            cursor.executemany("INSERT INTO functions.cost_cleaning_categories (enterprise_id, category_name, resource_category_id, occupancy, min_guests, max_guests, cleaning_minutes, linen_cost, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["categoryName"], r["resourceCategoryId"], r["occupancy"], r["occupancy"], r["occupancy"], r["cleaningMinutes"], r["linenCost"], i) for i,r in enumerate(data["cleaningCategories"])])
             cursor.executemany("INSERT INTO functions.cost_arrival_staffing_tiers (enterprise_id, min_arrivals, max_arrivals, reception_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minArrivals"], r["maxArrivals"], r["receptionHours"], i) for i,r in enumerate(data["arrivalTiers"])])
             cursor.executemany("INSERT INTO functions.cost_breakfast_staffing_tiers (enterprise_id, min_guests, max_guests, staff_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minGuests"], r["maxGuests"], r["staffHours"], i) for i,r in enumerate(data["breakfastTiers"])])
-            cursor.executemany("INSERT INTO functions.cost_fixed_lines (enterprise_id, cost_name, amount, cadence, active, sort_order) VALUES (%s,%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["costName"], r["amount"], r["cadence"], r["active"], i) for i,r in enumerate(data["fixedCosts"])])
     return fetch_cost_settings(data["enterpriseId"], data["hotelName"])
