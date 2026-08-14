@@ -6,6 +6,13 @@ from time import monotonic
 
 from database import pool
 from queries.hotels import HOTELS_SQL
+from services.los_facts_service import (
+    LosReadModelUnavailableError,
+    fetch_los_read_model_status,
+    los_read_model_enabled,
+)
+from services.los_schema_service import ensure_los_schema
+from cost_database import cost_pool
 
 
 HOTEL_CACHE_TTL_SECONDS = 300
@@ -16,6 +23,29 @@ _cache_lock = Lock()
 
 
 def fetch_hotels(start_date, end_date, ly_comparison_basis):
+    if los_read_model_enabled():
+        ensure_los_schema()
+        with cost_pool.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT DISTINCT hotel.hotel_name
+                    FROM functions.los_publication publication
+                    JOIN functions.reservation_los_daily daily
+                      ON daily.run_id = publication.run_id
+                    JOIN functions.hotels hotel
+                      ON hotel.enterprise_id = daily.enterprise_id
+                    WHERE publication.singleton
+                      AND daily.comparison_basis = %s
+                      AND daily.arrival_date BETWEEN %s AND %s
+                    ORDER BY hotel.hotel_name
+                """, (ly_comparison_basis, start_date, end_date))
+                hotels = [row[0] for row in cursor.fetchall()]
+        if not hotels and fetch_los_read_model_status()["runId"] is None:
+            raise LosReadModelUnavailableError(
+                "LOS read model has not been published"
+            )
+        return hotels
+
     cache_key = (start_date, end_date, ly_comparison_basis)
     now = monotonic()
 

@@ -1,4 +1,8 @@
 /*
+SUPERSEDED: use benchmark_los.py, which imports the deployed query directly
+from queries/los_facts.py. This historical pgAdmin candidate is retained only
+for plan comparison.
+
 Optimized canonical LOS facts candidate -- run manually in pgAdmin after the
 matching baseline script. The four cases cover one month/full year and both
 comparison bases.

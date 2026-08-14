@@ -11,7 +11,13 @@ from zoneinfo import ZoneInfo
 import azure.functions as func
 
 from services.hotels_service import fetch_hotels
-from services.los_facts_service import fetch_los_facts
+from services.los_facts_service import (
+    LosReadModelUnavailableError,
+    fetch_los_facts,
+    fetch_los_read_model_status,
+)
+from services.los_schema_service import LosSchemaError
+from services.los_sync_service import sync_los
 from services.cost_data_service import fetch_cost_data
 from services.cost_settings_service import (
     fetch_cost_settings,
@@ -70,6 +76,12 @@ def json_response(payload, status_code=200, headers=None):
 
 def supplement_enabled():
     return os.environ.get("SUPPLEMENT_LIVE_ENABLED", "false").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def los_sync_enabled():
+    return os.environ.get("LOS_SYNC_ENABLED", "false").lower() in {
         "1", "true", "yes", "on"
     }
 
@@ -245,6 +257,8 @@ def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
                 "data": hotels,
             }
         )
+    except (LosReadModelUnavailableError, LosSchemaError) as error:
+        return json_response({"error": str(error)}, 503)
     except Exception:
         logging.exception("LOS hotels endpoint failed")
         return json_response({"error": "Unable to retrieve hotels"}, 500)
@@ -264,6 +278,8 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
 
     try:
         rows = fetch_los_facts(start_date, end_date, ly_comparison_basis)
+    except (LosReadModelUnavailableError, LosSchemaError) as error:
+        return json_response({"error": str(error)}, 503)
     except Exception:
         logging.exception("LOS facts endpoint failed")
         return json_response({"error": "Unable to retrieve LOS facts"}, 500)
@@ -279,6 +295,52 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
             "data": rows,
         }
     )
+
+
+@app.route(
+    route="los/status",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def los_status(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        return json_response(fetch_los_read_model_status())
+    except LosSchemaError as error:
+        return json_response({"error": str(error)}, 503)
+    except Exception:
+        logging.exception("LOS status endpoint failed")
+        return json_response({"error": "Unable to retrieve LOS status"}, 500)
+
+
+@app.function_name(name="LosDataImport")
+@app.route(
+    route="los/import",
+    methods=["POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+@app.queue_output(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def los_import(req: func.HttpRequest, message: func.Out[str]) -> func.HttpResponse:
+    if not los_sync_enabled():
+        return json_response({"error": "LOS synchronization is not enabled"}, 503)
+    try:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        mode = str(body.get("mode") or "delta").strip().lower()
+        if mode not in {"delta", "full"}:
+            raise ValueError("mode must be delta or full")
+        return enqueue_import_job(message, "los", mode, {"mode": mode})
+    except ValueError as error:
+        return json_response({"error": str(error)}, 400)
+    except Exception:
+        logging.exception("Manual LOS synchronization queueing failed")
+        return json_response({"error": "Unable to queue LOS synchronization"}, 500)
 
 
 @app.route(
@@ -671,6 +733,9 @@ def import_job_worker(message: func.QueueMessage) -> None:
                 parse_date(payload.get("snapshotFrom")),
                 parse_date(payload.get("snapshotTo")),
             )
+        elif job["job_type"] == "los":
+            mode = payload.get("mode") or job["operation"]
+            result = sync_los(mode)
         else:
             raise ValueError(f"Unsupported import job type: {job['job_type']}")
 
@@ -725,6 +790,37 @@ def cost_data_timer(mytimer: func.TimerRequest, message: func.Out[str]) -> None:
     logging.info(
         "CostDataTimer queued job_id=%s deduplicated=%s",
         job["jobId"],
+        not created,
+    )
+
+
+@app.function_name(name="LosDataTimer")
+@app.timer_trigger(
+    schedule="0 20 0 * * *",
+    arg_name="mytimer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+@app.queue_output(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def los_data_timer(mytimer: func.TimerRequest, message: func.Out[str]) -> None:
+    """Queue daily LOS deltas and a Sunday full reconciliation."""
+    if not los_sync_enabled():
+        logging.info("LosDataTimer skipped because synchronization is disabled")
+        return
+    if mytimer.past_due:
+        logging.warning("LosDataTimer is running later than scheduled")
+    mode = "full" if datetime.now(timezone.utc).weekday() == 6 else "delta"
+    job, created = create_import_job("los", mode, {"mode": mode})
+    if created or job["status"] == "queued":
+        message.set(json.dumps({"jobId": job["jobId"]}, separators=(",", ":")))
+    logging.info(
+        "LosDataTimer queued job_id=%s mode=%s deduplicated=%s",
+        job["jobId"],
+        mode,
         not created,
     )
 

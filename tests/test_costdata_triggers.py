@@ -200,11 +200,15 @@ class CostDataTriggerTests(unittest.TestCase):
         self.assertIn("CostDataTimer", function_names)
         self.assertIn("SupplementDataImport", function_names)
         self.assertIn("SupplementDataTimer", function_names)
+        self.assertIn("LosDataImport", function_names)
+        self.assertIn("LosDataTimer", function_names)
         self.assertIn("ImportJobWorker", function_names)
         self.assertIn("ImportJobStatus", function_names)
         self.assertIn("costdata/properties", routes)
         self.assertIn("costdata/settings/{enterprise_id}", routes)
         self.assertIn("imports/{job_id}", routes)
+        self.assertIn("los/import", routes)
+        self.assertIn("los/status", routes)
         self.assertNotIn("costdata/settings/hotels", routes)
 
 

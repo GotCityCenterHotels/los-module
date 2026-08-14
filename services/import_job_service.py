@@ -44,9 +44,14 @@ def _job_payload(row):
 
 
 def create_import_job(job_type, operation, payload):
-    if job_type not in {"cost", "supplement"}:
-        raise ValueError("job_type must be cost or supplement")
+    if job_type not in {"cost", "supplement", "los"}:
+        raise ValueError("job_type must be cost, supplement, or los")
     ensure_import_job_schema()
+    if job_type == "los":
+        # Existing databases need migration 009 before inserting this family.
+        from services.los_schema_service import ensure_los_schema
+
+        ensure_los_schema()
     job_id = uuid.uuid4()
     normalized_payload = _json_value(payload)
 

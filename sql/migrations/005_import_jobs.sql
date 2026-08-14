@@ -4,7 +4,7 @@ CREATE SCHEMA IF NOT EXISTS functions;
 
 CREATE TABLE IF NOT EXISTS functions.import_jobs (
     job_id uuid PRIMARY KEY,
-    job_type text NOT NULL CHECK (job_type IN ('cost', 'supplement')),
+    job_type text NOT NULL CHECK (job_type IN ('cost', 'supplement', 'los')),
     operation text NOT NULL,
     payload jsonb NOT NULL DEFAULT '{}'::jsonb,
     status text NOT NULL CHECK (

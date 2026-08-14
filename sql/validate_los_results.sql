@@ -1,4 +1,8 @@
 /*
+SUPERSEDED for deployment parity: use validate_los_read_model.py, which
+compares the deployed raw query with the current Database A publication.
+This script remains useful for exploratory frontend-grain checks.
+
 Canonical-output correctness checks -- run manually in pgAdmin.
 
 Change only the VALUES row to exercise the validation matrix:
