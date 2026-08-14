@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 from cost_database import cost_pool
 from services.supplement_schema_service import ensure_supplement_schema
 
-
+#
 MAX_GRID_DAYS = 366
 STALE_AFTER_HOURS = 36
 VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
