@@ -48,6 +48,12 @@
     // as taken rather than silently allowing a duplicate across groups.
     // The pure logic lives in costdata-match.js so it can be unit tested.
     function assignmentIndex(matchType, exceptGroup, exceptRuleIndex) {
+        if (typeof CostMatch === "undefined") {
+            throw new Error(
+                "costdata-match.js did not load - hard refresh the page, and check "
+                + "that the script deployed alongside costdata-input.js."
+            );
+        }
         return CostMatch.assignmentIndex(
             model.distributionGroups, matchType, exceptGroup, exceptRuleIndex
         );
@@ -95,7 +101,7 @@
                 hotel.disabled = false;
             }
         }
-        catch (error) { hotel.disabled = false; showError(error); }
+        catch (error) { hotel.disabled = false; showError(error, "Loading properties"); }
     }
     async function loadSettings(name) {
         if (!name || name === "undefined" || name === "null") {
@@ -118,11 +124,24 @@
             render();
             layout.hidden = false;
             setDirty(false);
-            status.textContent = sources && sources.error
-                ? `Editing ${model.hotelName} - this hotel's rate and room lists could not be loaded`
-                : `Editing ${model.hotelName}`;
+            if (sources && sources.error) {
+                // Rates, channels and room categories all come from this one
+                // call, so a failure here empties every picker. Say so plainly
+                // instead of leaving empty dropdowns with no explanation.
+                showError(
+                    new Error(
+                        `${sources.error} Rates, channels and room categories are unavailable, `
+                        + "so those fields must be typed manually."
+                    ),
+                    "Loading this hotel's rates and room categories"
+                );
+                status.textContent = `Editing ${model.hotelName} - source lists unavailable`;
+            }
+            else {
+                status.textContent = `Editing ${model.hotelName}`;
+            }
         }
-        catch (error) { showError(error); } finally { setBusy(false); }
+        catch (error) { showError(error, "Loading this property's settings"); } finally { setBusy(false); }
     }
     function render() {
         for (const [key, value] of Object.entries(model.profile)) {
@@ -131,9 +150,28 @@
             input.value = input.type === "number" ? toFixedDecimals(value) : value;
             bindDecimalNormalisation(input, key);
         }
-        renderDistribution();
-        renderCleaning();
-        for (const key of Object.keys(configs)) renderRows(key);
+        // Each section renders independently. One section throwing used to take
+        // down the whole page with a bare "Something went wrong", hiding both
+        // the cause and every section that was fine.
+        const failures = [];
+        const sections = [
+            ["Distribution", renderDistribution],
+            ["Cleaning", renderCleaning],
+            ...Object.keys(configs).map(key => [key, () => renderRows(key)])
+        ];
+        for (const [label, run] of sections) {
+            try { run(); }
+            catch (error) {
+                failures.push(`${label}: ${error.message}`);
+                console.error(`Failed to render the ${label} section`, error);
+            }
+        }
+        if (failures.length) {
+            showError(
+                new Error(`${failures.join(" | ")}. The other sections are still editable.`),
+                "Rendering the editor"
+            );
+        }
     }
 
     // Cleaning rows are one per (room category, occupancy) and come from the
@@ -646,12 +684,29 @@
             setDirty(false);
             status.textContent = `Saved ${model.hotelName}`;
         }
-        catch (error) { showError(error); }
+        catch (error) { showError(error, "Saving property settings"); }
         finally { setBusy(false); }
     }
     function setDirty(value){dirty=value;dirtyState.textContent=value?"Unsaved changes":"No unsaved changes";dirtyState.classList.toggle("is-dirty",value)}
     function setBusy(value){save.disabled=value;hotel.disabled=value;document.querySelector(".settings-workspace").setAttribute("aria-busy",String(value))}
-    function showError(error){errorPanel.textContent=error.message||"Unable to load cost settings.";errorPanel.hidden=false;status.textContent="Something went wrong."}
+    function showError(error, context) {
+        const detail = (error && error.message) || String(error) || "Unknown error.";
+        errorPanel.replaceChildren();
+        const heading = document.createElement("strong");
+        heading.textContent = context ? `${context} failed` : "Something went wrong";
+        const body = document.createElement("span");
+        body.textContent = detail;
+        errorPanel.append(heading, body);
+        errorPanel.hidden = false;
+        // This panel used to sit at the very bottom of the page, below the whole
+        // editor, so the actual message was routinely missed and only the status
+        // line was seen.
+        errorPanel.scrollIntoView({block: "nearest", behavior: "smooth"});
+        status.textContent = context
+            ? `${context} failed - see the message above.`
+            : "Something went wrong - see the message above.";
+        console.error(context || "Cost Input error", error);
+    }
     const IMPORT_POLL_INTERVAL_MS = 2000;
     const IMPORT_POLL_TIMEOUT_MS = 35 * 60 * 1000;
     const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -717,7 +772,7 @@
             status.textContent = `Import complete (${count} datasets, ${job.result?.durationSeconds ?? "?"} seconds).`;
             await loadHotels();
         }
-        catch (error) { showError(error); }
+        catch (error) { showError(error, "Cost data import"); }
         finally { importButton.disabled=false; }
     }
     importButton.onclick=runImport;
