@@ -63,12 +63,19 @@ CREATE TABLE IF NOT EXISTS functions.cost_cleaning_categories (
     cleaning_category_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     enterprise_id text NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
     category_name text NOT NULL,
+    -- One row per (room category, occupancy): a category serving 2 + 1 extra
+    -- beds has three rows, because linen and minutes differ per occupancy.
+    -- Uniqueness therefore MUST include occupancy - keying on category_name
+    -- alone rejects every row after the first.
+    resource_category_id text,
+    occupancy integer NOT NULL DEFAULT 1,
     min_guests integer NOT NULL DEFAULT 1,
     max_guests integer,
     cleaning_minutes numeric(10, 2) NOT NULL DEFAULT 0,
     linen_cost numeric(18, 4) NOT NULL DEFAULT 0,
     sort_order integer NOT NULL DEFAULT 0,
-    UNIQUE (enterprise_id, category_name),
+    UNIQUE (enterprise_id, category_name, occupancy),
+    CHECK (occupancy >= 1),
     CHECK (min_guests >= 0),
     CHECK (max_guests IS NULL OR max_guests >= min_guests),
     CHECK (cleaning_minutes >= 0),

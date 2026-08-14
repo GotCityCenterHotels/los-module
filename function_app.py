@@ -525,10 +525,35 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
         return json_response({"error": str(error)}, 400)
     except CostSettingsSchemaError as error:
         return json_response({"error": str(error)}, 503)
-    except Exception:
+    except Exception as error:
         logging.exception("Cost settings endpoint failed enterprise_id=%s", enterprise_id)
         action = "retrieve" if req.method == "GET" else "save"
-        return json_response({"error": f"Unable to {action} cost settings"}, 500)
+        # A bare "Unable to save cost settings" gave an operator nothing to act
+        # on and nothing to report. Surface the SQLSTATE and, for the failure
+        # modes that are actually the user's to fix, say what to change. The
+        # full exception stays in the logs.
+        sqlstate = getattr(error, "sqlstate", None)
+        if sqlstate == "23505":
+            detail = (
+                "A uniqueness rule rejected these settings (SQLSTATE 23505). "
+                "This usually means the database is missing migration 013, which "
+                "allows one cleaning row per room category AND occupancy."
+            )
+        elif sqlstate == "23514":
+            detail = (
+                "A value fell outside an allowed range (SQLSTATE 23514). Check "
+                "percentages are 0-100 and costs are not negative."
+            )
+        elif sqlstate == "42703":
+            detail = (
+                "The database is missing a column this version expects "
+                "(SQLSTATE 42703). Apply the pending migrations in sql/migrations."
+            )
+        elif sqlstate:
+            detail = f"The database rejected the request (SQLSTATE {sqlstate})."
+        else:
+            detail = f"Unexpected {type(error).__name__}."
+        return json_response({"error": f"Unable to {action} cost settings. {detail}"}, 500)
 
 
 @app.function_name(name="CostDataImport")

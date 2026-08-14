@@ -32,6 +32,10 @@ MIGRATIONS = (
         "012_cleaning_occupancy",
         APP_ROOT / "sql" / "migrations" / "012_cleaning_occupancy.sql",
     ),
+    (
+        "013_cleaning_occupancy_unique_fix",
+        APP_ROOT / "sql" / "migrations" / "013_cleaning_occupancy_unique_fix.sql",
+    ),
 )
 
 _schema_ready = False
