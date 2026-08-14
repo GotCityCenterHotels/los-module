@@ -6,7 +6,7 @@ from time import monotonic
 
 from psycopg.rows import dict_row
 
-from cost_database import cost_pool
+from cost_database import apply_background_timeouts, cost_pool
 from queries.los_sync import (
     AFFECTED_RESERVATIONS_SQL,
     FILTERED_FACT_SOURCE_SQL,
@@ -34,7 +34,16 @@ INSERT INTO functions.reservation_los_daily (
     run_id, comparison_basis, arrival_date, enterprise_id,
     scenario, los, booking_count, night_count
 )
-WITH current_aggregate AS (
+WITH basis AS (
+    SELECT
+        b.comparison_basis,
+        CASE WHEN b.comparison_basis = 'sameWeekday'
+            THEN %(as_of_date)s::date - 364
+            ELSE (%(as_of_date)s::date - INTERVAL '1 year')::date
+        END AS spit_cutoff
+    FROM (VALUES ('sameDate'::text), ('sameWeekday'::text)) b(comparison_basis)
+),
+current_aggregate AS (
     SELECT
         basis.comparison_basis,
         fact.arrival_date,
@@ -43,14 +52,16 @@ WITH current_aggregate AS (
         fact.los,
         count(*)::bigint AS booking_count
     FROM functions.reservation_los_fact fact
-    CROSS JOIN (VALUES ('sameDate'::text), ('sameWeekday'::text))
-        basis(comparison_basis)
+    CROSS JOIN basis
     WHERE fact.fact_kind = 'current'
     GROUP BY
         basis.comparison_basis, fact.arrival_date,
         fact.enterprise_id, fact.los
 ),
-historical_components AS (
+ly_aggregate AS (
+    -- Last year's final state. historical facts are stored one row per distinct
+    -- cancellation date, so the single cancelled_date IS NULL row per
+    -- reservation already carries the surviving length of stay.
     SELECT
         basis.comparison_basis,
         CASE WHEN basis.comparison_basis = 'sameWeekday'
@@ -58,65 +69,67 @@ historical_components AS (
             ELSE (fact.arrival_date + INTERVAL '1 year')::date
         END AS arrival_date,
         fact.enterprise_id,
+        'ly'::text AS scenario,
         fact.los,
-        count(*) FILTER (WHERE fact.cancelled_date IS NULL)::bigint
-            AS ly_booking_count,
-        count(*) FILTER (
-            WHERE fact.created_date <= (
-                CASE WHEN basis.comparison_basis = 'sameWeekday'
-                    THEN %(as_of_date)s::date - 364
-                    ELSE (%(as_of_date)s::date - INTERVAL '1 year')::date
-                END
-            )
-              AND (
-                  fact.cancelled_date IS NULL
-                  OR fact.cancelled_date > (
-                      CASE WHEN basis.comparison_basis = 'sameWeekday'
-                          THEN %(as_of_date)s::date - 364
-                          ELSE (%(as_of_date)s::date - INTERVAL '1 year')::date
-                      END
-                  )
-              )
-        )::bigint AS spit_booking_count
+        count(*)::bigint AS booking_count
     FROM functions.reservation_los_fact fact
-    CROSS JOIN (VALUES ('sameDate'::text), ('sameWeekday'::text))
-        basis(comparison_basis)
+    CROSS JOIN basis
     WHERE fact.fact_kind = 'historical'
-    GROUP BY
+      AND fact.cancelled_date IS NULL
+    GROUP BY 1, 2, 3, 5
+),
+spit_reservation AS (
+    -- Same point in time: rebuild each reservation as it stood at the cutoff.
+    --
+    -- A reservation shortened after the cutoff is stored as several rows (the
+    -- surviving nights, plus one row per cancellation date). Counting those
+    -- rows treated one booking as several and split its length of stay across
+    -- them, so a 3-night stay reported as a 2-night plus a 1-night booking.
+    -- Collapsing back to one row per reservation first restores both the
+    -- booking count and the length-of-stay distribution.
+    SELECT
         basis.comparison_basis,
         CASE WHEN basis.comparison_basis = 'sameWeekday'
             THEN fact.arrival_date + 364
             ELSE (fact.arrival_date + INTERVAL '1 year')::date
-        END,
+        END AS arrival_date,
         fact.enterprise_id,
-        fact.los
+        fact.reservation_number,
+        sum(fact.los)::int AS los
+    FROM functions.reservation_los_fact fact
+    CROSS JOIN basis
+    WHERE fact.fact_kind = 'historical'
+      AND fact.created_date <= basis.spit_cutoff
+      AND (
+          fact.cancelled_date IS NULL
+          OR fact.cancelled_date > basis.spit_cutoff
+      )
+    GROUP BY 1, 2, 3, 4
 ),
-historical_aggregate AS (
+spit_aggregate AS (
     SELECT
-        component.comparison_basis,
-        component.arrival_date,
-        component.enterprise_id,
-        scenario.scenario,
-        component.los,
-        scenario.booking_count
-    FROM historical_components component
-    CROSS JOIN LATERAL (
-        VALUES
-            ('ly'::text, component.ly_booking_count),
-            ('spit'::text, component.spit_booking_count)
-    ) scenario(scenario, booking_count)
-    WHERE scenario.booking_count > 0
+        comparison_basis,
+        arrival_date,
+        enterprise_id,
+        'spit'::text AS scenario,
+        los,
+        count(*)::bigint AS booking_count
+    FROM spit_reservation
+    GROUP BY 1, 2, 3, 5
 ),
 combined AS (
     SELECT * FROM current_aggregate
     UNION ALL
-    SELECT * FROM historical_aggregate
+    SELECT * FROM ly_aggregate
+    UNION ALL
+    SELECT * FROM spit_aggregate
 )
 SELECT
     %(run_id)s, comparison_basis, arrival_date, enterprise_id,
     scenario, los, booking_count,
     (los::bigint * booking_count)::bigint
 FROM combined
+WHERE booking_count > 0
 """
 
 
@@ -260,11 +273,15 @@ def _extract_and_write_identities(target_cursor, reservation_numbers):
         ]
     )
     with get_export_connection() as source_connection:
-        with source_connection.cursor() as source_cursor:
-            for source_sql, chunk in source_queries:
-                parameters = (
-                    None if chunk is None else {"reservation_numbers": chunk}
-                )
+        # Named cursors stream from integration_db instead of buffering the whole
+        # result set into worker memory. One cursor per query: a server-side
+        # cursor is bound to the statement it declares.
+        for index, (source_sql, chunk) in enumerate(source_queries):
+            parameters = (
+                None if chunk is None else {"reservation_numbers": chunk}
+            )
+            with source_connection.cursor(name=f"los_identity_{index}") as source_cursor:
+                source_cursor.itersize = EXTRACT_BATCH_SIZE
                 source_cursor.execute(source_sql, parameters)
                 while True:
                     rows = source_cursor.fetchmany(EXTRACT_BATCH_SIZE)
@@ -313,12 +330,16 @@ def _extract_and_write_facts(target_cursor, reservation_numbers):
         ]
     )
     with get_export_connection() as source_connection:
-        with source_connection.cursor() as source_cursor:
-            source_cursor.execute("SET LOCAL work_mem = '64MB'")
-            for source_sql, chunk in source_queries:
-                parameters = (
-                    None if chunk is None else {"reservation_numbers": chunk}
-                )
+        with source_connection.cursor() as setup_cursor:
+            setup_cursor.execute("SET LOCAL work_mem = '64MB'")
+        # Named cursors stream from integration_db instead of buffering the whole
+        # fact set into worker memory - which on a "full" sync is all history.
+        for index, (source_sql, chunk) in enumerate(source_queries):
+            parameters = (
+                None if chunk is None else {"reservation_numbers": chunk}
+            )
+            with source_connection.cursor(name=f"los_facts_{index}") as source_cursor:
+                source_cursor.itersize = EXTRACT_BATCH_SIZE
                 source_cursor.execute(source_sql, parameters)
                 while True:
                     rows = source_cursor.fetchmany(EXTRACT_BATCH_SIZE)
@@ -393,6 +414,7 @@ def sync_los(mode="delta"):
 
             with cost_pool.connection() as connection:
                 with connection.cursor() as cursor:
+                    apply_background_timeouts(cursor)
                     if effective_mode == "full":
                         cursor.execute("DELETE FROM functions.reservation_los_fact")
                         cursor.execute(

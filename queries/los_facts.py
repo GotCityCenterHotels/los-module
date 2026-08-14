@@ -133,7 +133,9 @@ ly_reservation_los AS (
         reservation.created_date,
         item.canceled_utc::date
 ),
-ly_fact_components AS (
+ly_facts AS (
+    -- Last year's final state: the single cancelled_date IS NULL row per
+    -- reservation already carries its surviving length of stay.
     SELECT
         CASE WHEN %(ly_comparison_basis)s = 'sameWeekday'
             THEN arrival_date + 364
@@ -141,55 +143,67 @@ ly_fact_components AS (
         END AS arrival_date,
         hotel_code,
         hotel_name,
+        'ly'::text AS scenario,
         los,
-        count(*) FILTER (WHERE cancelled_date IS NULL)::bigint
-            AS ly_booking_count,
-        count(*) FILTER (
-            WHERE created_date <= (
-                CASE WHEN %(ly_comparison_basis)s = 'sameWeekday'
-                    THEN CURRENT_DATE - 364
-                    ELSE (CURRENT_DATE - INTERVAL '1 year')::date
-                END
-            )
-              AND (
-                  cancelled_date IS NULL
-                  OR cancelled_date > (
-                      CASE WHEN %(ly_comparison_basis)s = 'sameWeekday'
-                          THEN CURRENT_DATE - 364
-                          ELSE (CURRENT_DATE - INTERVAL '1 year')::date
-                      END
-                  )
-              )
-        )::bigint AS spit_booking_count
+        count(*)::bigint AS booking_count,
+        (los::bigint * count(*))::bigint AS night_count
     FROM ly_reservation_los
-    GROUP BY
+    WHERE cancelled_date IS NULL
+    GROUP BY 1, 2, 3, 5
+),
+spit_reservation AS (
+    -- Same point in time: rebuild each reservation as it stood at the cutoff.
+    --
+    -- ly_reservation_los holds one row per distinct cancellation date, so a
+    -- reservation shortened after the cutoff appears as several rows. Counting
+    -- those rows treated one booking as several and split its length of stay
+    -- across them. Collapse to one row per reservation before counting.
+    --
+    -- Kept deliberately identical in shape to the read model's spit_reservation
+    -- CTE in services/los_sync_service.py, so validate_los_read_model.py
+    -- compares two implementations of the same definition.
+    SELECT
         CASE WHEN %(ly_comparison_basis)s = 'sameWeekday'
             THEN arrival_date + 364
             ELSE (arrival_date + INTERVAL '1 year')::date
-        END,
+        END AS arrival_date,
         hotel_code,
         hotel_name,
-        los
+        reservation_id,
+        sum(los)::int AS los
+    FROM ly_reservation_los
+    WHERE created_date <= (
+            CASE WHEN %(ly_comparison_basis)s = 'sameWeekday'
+                THEN CURRENT_DATE - 364
+                ELSE (CURRENT_DATE - INTERVAL '1 year')::date
+            END
+        )
+      AND (
+          cancelled_date IS NULL
+          OR cancelled_date > (
+              CASE WHEN %(ly_comparison_basis)s = 'sameWeekday'
+                  THEN CURRENT_DATE - 364
+                  ELSE (CURRENT_DATE - INTERVAL '1 year')::date
+              END
+          )
+      )
+    GROUP BY 1, 2, 3, 4
 ),
-ly_facts AS (
+spit_facts AS (
     SELECT
-        component.arrival_date,
-        component.hotel_code,
-        component.hotel_name,
-        scenario_data.scenario,
-        component.los,
-        scenario_data.booking_count,
-        (component.los::bigint * scenario_data.booking_count)::bigint
-            AS night_count
-    FROM ly_fact_components component
-    CROSS JOIN LATERAL (
-        VALUES
-            ('ly'::text, component.ly_booking_count),
-            ('spit'::text, component.spit_booking_count)
-    ) AS scenario_data(scenario, booking_count)
-    WHERE scenario_data.booking_count > 0
+        arrival_date,
+        hotel_code,
+        hotel_name,
+        'spit'::text AS scenario,
+        los,
+        count(*)::bigint AS booking_count,
+        (los::bigint * count(*))::bigint AS night_count
+    FROM spit_reservation
+    GROUP BY 1, 2, 3, 5
 )
 SELECT * FROM current_facts
 UNION ALL
-SELECT * FROM ly_facts;
+SELECT * FROM ly_facts
+UNION ALL
+SELECT * FROM spit_facts;
 """

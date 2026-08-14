@@ -4,7 +4,17 @@ on:
   push:
     branches:
       - main
+  # Without this the backend suite only ran after merge, so a failing Python
+  # test did not block the merge - it just left main broken and undeployed.
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
+
+# Two pushes in quick succession could otherwise deploy out of order.
+concurrency:
+  group: los-functions-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
@@ -60,6 +70,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
+    # Pull requests run the tests above but must never deploy.
+    if: github.event_name != 'pull_request'
 
     steps:
       - name: Download artifact

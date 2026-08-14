@@ -3,9 +3,31 @@
 
     const HOTEL_CACHE_TTL_MS = 5 * 60 * 1000;
     const hotelRequests = new Map();
+    // Static Web Apps gives up on a linked backend at ~45s. Without a client
+    // deadline a stalled connection never settles at all, leaving buttons
+    // disabled and the page stuck until a manual reload.
+    const REQUEST_TIMEOUT_MS = 40000;
 
     async function fetchJson(url, options) {
-        const response = await fetch(url, options);
+        const settings = {...options};
+        if (!settings.signal && typeof AbortSignal !== "undefined" && AbortSignal.timeout) {
+            settings.signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+        }
+
+        let response;
+        try {
+            response = await fetch(url, settings);
+        }
+        catch (error) {
+            if (error.name === "TimeoutError" || error.name === "AbortError") {
+                throw new Error(
+                    `The request took longer than ${REQUEST_TIMEOUT_MS / 1000} seconds and was cancelled. `
+                    + "Try a narrower date range."
+                );
+            }
+            throw new Error(`Could not reach the API: ${error.message}`);
+        }
+
         const raw = await response.text();
         let payload;
 
@@ -13,8 +35,22 @@
             payload = raw ? JSON.parse(raw) : {};
         }
         catch {
-            const preview = raw.replace(/\s+/g, " ").slice(0, 300);
-            throw new Error(`API returned HTTP ${response.status}: ${preview || "empty response"}`);
+            // A short plain-text body ("Function host is not running.") is a
+            // useful diagnostic. An HTML body is a gateway error page - dumping
+            // its markup into the UI helps nobody, so log it and show something
+            // the user can act on instead.
+            console.error(`Non-JSON response from ${url} (HTTP ${response.status}):`, raw.slice(0, 2000));
+            const preview = raw.replace(/\s+/g, " ").trim();
+            const looksLikeMarkup = /^\s*[<{]/.test(raw) || preview.length > 200;
+
+            if (response.status === 504 || response.status === 502) {
+                throw new Error("The server took too long to respond. Try a narrower date range.");
+            }
+            throw new Error(
+                looksLikeMarkup || !preview
+                    ? `API returned HTTP ${response.status}.`
+                    : `API returned HTTP ${response.status}: ${preview}`
+            );
         }
 
         if (!response.ok) {

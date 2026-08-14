@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import uuid
 
 from datetime import date, datetime
@@ -13,6 +14,13 @@ from services.import_job_schema_service import ensure_import_job_schema
 
 ACTIVE_STATUSES = ("queued", "running", "retrying")
 TERMINAL_STATUSES = ("succeeded", "failed")
+
+# A worker killed mid-run (host crash, deploy, Flex scale-in) never reaches its
+# except block, so the row stays 'running' forever. Because one active job per
+# family blocks creation of the next, that single event would otherwise wedge
+# the whole import family permanently. Anything older than this with no progress
+# is treated as abandoned. Must exceed host.json functionTimeout (30 minutes).
+STALE_JOB_MINUTES = int(os.environ.get("IMPORT_JOB_STALE_MINUTES", "45"))
 
 
 def _json_default(value):
@@ -63,6 +71,31 @@ def create_import_job(job_type, operation, payload):
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"functions.import_jobs.{job_type}",),
             )
+            # Reap abandoned jobs first, inside the same lock, so a job stranded
+            # by a killed worker cannot block this family forever.
+            cursor.execute("""
+                UPDATE functions.import_jobs
+                SET status = 'failed',
+                    error_message = coalesce(
+                        error_message,
+                        'Abandoned: no progress before the stale-job threshold. '
+                        'The worker was most likely terminated mid-run.'
+                    ),
+                    updated_at = now(),
+                    finished_at = now()
+                WHERE job_type = %s
+                  AND status = ANY(%s)
+                  AND updated_at < now() - make_interval(mins => %s)
+                RETURNING job_id
+            """, (job_type, list(ACTIVE_STATUSES), STALE_JOB_MINUTES))
+            reaped = cursor.fetchall()
+            if reaped:
+                logging.warning(
+                    "Reaped %s abandoned import job(s) job_type=%s job_ids=%s",
+                    len(reaped),
+                    job_type,
+                    [str(row["job_id"]) for row in reaped],
+                )
             cursor.execute("""
                 SELECT * FROM functions.import_jobs
                 WHERE job_type = %s
@@ -112,10 +145,18 @@ def claim_import_job(job_id, dequeue_count):
                 WHERE job_id = %s
                   AND (
                     status IN ('queued', 'retrying')
-                    OR (status = 'running' AND attempt_count < %s)
+                    OR (
+                      -- Only re-claim a 'running' job once it looks abandoned.
+                      -- attempt_count alone cannot distinguish "crashed" from
+                      -- "still running", so the old predicate let a redelivery
+                      -- start a second worker on a live job - after which
+                      -- whichever finished first stranded the other's result.
+                      status = 'running'
+                      AND updated_at < now() - make_interval(mins => %s)
+                    )
                   )
                 RETURNING *
-            """, (dequeue_count, uuid.UUID(str(job_id)), dequeue_count))
+            """, (dequeue_count, uuid.UUID(str(job_id)), STALE_JOB_MINUTES))
             return cursor.fetchone()
 
 

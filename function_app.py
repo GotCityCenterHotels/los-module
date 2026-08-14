@@ -54,6 +54,28 @@ SUPPLEMENT_TIMER_MINUTE = 15
 IMPORT_QUEUE_NAME = "import-jobs"
 IMPORT_MAX_DEQUEUE_COUNT = int(os.environ.get("IMPORT_MAX_DEQUEUE_COUNT", "3"))
 
+# Static Web Apps aborts a linked-backend call at ~45s, so an unbounded range is
+# not "slow", it is a guaranteed "Backend call failure". 400 days covers a full
+# year plus a comparison window. services/supplement_service.py already enforces
+# the equivalent MAX_GRID_DAYS; this applies the same guard to LOS and cost.
+MAX_RANGE_DAYS = int(os.environ.get("MAX_QUERY_RANGE_DAYS", "400"))
+
+
+def validate_range_span(start_date: date, end_date: date):
+    span_days = (end_date - start_date).days + 1
+    if span_days > MAX_RANGE_DAYS:
+        return json_response(
+            {
+                "error": (
+                    f"Requested range covers {span_days} days, which exceeds the "
+                    f"{MAX_RANGE_DAYS} day maximum. Narrow the date range."
+                ),
+                "maxRangeDays": MAX_RANGE_DAYS,
+            },
+            400,
+        )
+    return None
+
 
 def parse_date(value: str | None) -> date | None:
     if not value:
@@ -71,6 +93,29 @@ def json_response(payload, status_code=200, headers=None):
         status_code=status_code,
         mimetype="application/json",
         headers=headers,
+    )
+
+
+def compressed_json_response(req, payload, status_code=200, headers=None):
+    """JSON, gzipped when the client accepts it.
+
+    The fact payloads are the largest responses in the app - a year of per-hotel,
+    per-LOS rows, or six cost datasets in one body - and this shape of JSON
+    compresses roughly 10:1. Shrinking the transfer is the cheapest way to keep
+    these routes inside the ~45s Static Web Apps proxy budget.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    response_headers = dict(headers or {})
+    response_headers["Vary"] = "Accept-Encoding"
+    # Below roughly one packet, gzip costs more than it saves.
+    if len(body) > 1400 and "gzip" in (req.headers.get("Accept-Encoding") or "").lower():
+        body = gzip.compress(body, compresslevel=5)
+        response_headers["Content-Encoding"] = "gzip"
+    return func.HttpResponse(
+        body=body,
+        status_code=status_code,
+        mimetype="application/json",
+        headers=response_headers,
     )
 
 
@@ -194,6 +239,10 @@ def validate_facts_parameters(req):
             400,
         )
 
+    span_error = validate_range_span(start_date, end_date)
+    if span_error is not None:
+        return None, span_error
+
     if ly_comparison_basis not in VALID_LY_COMPARISONS:
         return None, json_response(
             {
@@ -247,7 +296,8 @@ def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
     try:
         hotels = fetch_hotels(start_date, end_date, ly_comparison_basis)
 
-        return json_response(
+        return compressed_json_response(
+            req,
             {
                 "parameters": {
                     "startDate": start_date.isoformat(),
@@ -255,7 +305,7 @@ def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
                     "lyComparisonBasis": ly_comparison_basis,
                 },
                 "data": hotels,
-            }
+            },
         )
     except (LosReadModelUnavailableError, LosSchemaError) as error:
         return json_response({"error": str(error)}, 503)
@@ -284,7 +334,8 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("LOS facts endpoint failed")
         return json_response({"error": "Unable to retrieve LOS facts"}, 500)
 
-    return json_response(
+    return compressed_json_response(
+        req,
         {
             "parameters": {
                 "startDate": start_date.isoformat(),
@@ -293,7 +344,7 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
             },
             "rowCount": len(rows),
             "data": rows,
-        }
+        },
     )
 
 
@@ -365,6 +416,10 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
     if start_date > end_date:
         return json_response({"error": "startDate cannot be after endDate"}, 400)
 
+    span_error = validate_range_span(start_date, end_date)
+    if span_error is not None:
+        return span_error
+
     try:
         datasets, row_counts = fetch_cost_data(start_date, end_date)
     except Exception:
@@ -380,7 +435,8 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         }
     )
 
-    return json_response(
+    return compressed_json_response(
+        req,
         {
             "parameters": {
                 "startDate": start_date.isoformat(),
@@ -389,7 +445,7 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             "rowCounts": row_counts,
             "hotels": hotels,
             "data": datasets,
-        }
+        },
     )
 
 
@@ -446,7 +502,11 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(
     route="costdata/import",
     methods=["POST"],
-    auth_level=func.AuthLevel.ANONYMOUS,
+    # FUNCTION, matching los/import and supplement/import. The Function App
+    # answers on its own public hostname - Static Web Apps is a proxy, not a
+    # gate - so ANONYMOUS here meant anyone on the internet could trigger a full
+    # cross-database import.
+    auth_level=func.AuthLevel.FUNCTION,
 )
 @app.queue_output(
     arg_name="message",

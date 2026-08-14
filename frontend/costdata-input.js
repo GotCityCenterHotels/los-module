@@ -94,16 +94,51 @@
         }
         throw new Error("The import is still running. Reload this page to check its status.");
     }
+    // costdata/import is a FUNCTION-level route: it triggers a full
+    // cross-database import, and the Function App is reachable on its own public
+    // hostname, so it cannot be left open. Static Web Apps does not attach the
+    // key for us, so the operator supplies it once per browser session.
+    const IMPORT_KEY_STORAGE = "costdata-import-key";
+    function importKey() {
+        let key = "";
+        try { key = sessionStorage.getItem(IMPORT_KEY_STORAGE) || ""; } catch { key = ""; }
+        if (!key) {
+            key = (prompt(
+                "Enter the Function App key for the cost data import.\n\n"
+                + "Azure portal > los-functions > App Keys. Stored for this browser session only."
+            ) || "").trim();
+            if (!key) return "";
+            try { sessionStorage.setItem(IMPORT_KEY_STORAGE, key); } catch { /* session-only */ }
+        }
+        return key;
+    }
+    function forgetImportKey() {
+        try { sessionStorage.removeItem(IMPORT_KEY_STORAGE); } catch { /* nothing cached */ }
+    }
     async function runImport(){
         if(!confirm("Import all cost datasets now? This can take a while.")) return;
+        const key = importKey();
+        if (!key) { status.textContent = "Import cancelled - no Function App key supplied."; return; }
         importButton.disabled=true; errorPanel.hidden=true;
         try {
             status.textContent = "Queueing cost data import...";
-            const accepted = await LosApi.fetchJson("/api/costdata/import", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({dataset:"all"})
-            });
+            let accepted;
+            try {
+                accepted = await LosApi.fetchJson("/api/costdata/import", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json", "x-functions-key": key},
+                    body: JSON.stringify({dataset:"all"})
+                });
+            }
+            catch (error) {
+                // A rejected key must not stay cached, or every later attempt
+                // fails without ever asking again.
+                if (/\b401\b|\b403\b/.test(error.message || "")) {
+                    forgetImportKey();
+                    throw new Error("The Function App key was rejected. Click the button again to re-enter it.");
+                }
+                throw error;
+            }
             const job = await waitForImport(accepted.statusUrl);
             const count = job.result?.results?.length || 0;
             status.textContent = `Import complete (${count} datasets, ${job.result?.durationSeconds ?? "?"} seconds).`;

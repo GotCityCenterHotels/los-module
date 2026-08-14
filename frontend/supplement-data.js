@@ -70,8 +70,29 @@
         return output;
     }
 
+    // Static Web Apps abandons a linked-backend call at ~45s. Without a client
+    // deadline a stalled request never settles and the page waits forever.
+    const REQUEST_TIMEOUT_MS = 40000;
+
     async function fetchJson(url) {
-        const response = await fetch(url, { headers: { Accept: "application/json" } });
+        const settings = { headers: { Accept: "application/json" } };
+        if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) {
+            settings.signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+        }
+
+        let response;
+        try {
+            response = await fetch(url, settings);
+        } catch (networkError) {
+            const error = new Error(
+                networkError.name === "TimeoutError" || networkError.name === "AbortError"
+                    ? `The request took longer than ${REQUEST_TIMEOUT_MS / 1000} seconds and was cancelled. Try a narrower date range.`
+                    : `Could not reach the Supplement API: ${networkError.message}`
+            );
+            error.status = 0;
+            throw error;
+        }
+
         let payload;
         try {
             payload = await response.json();

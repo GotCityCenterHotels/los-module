@@ -6,7 +6,7 @@ from time import perf_counter
 
 from psycopg.rows import dict_row
 
-from cost_database import cost_pool
+from cost_database import apply_background_timeouts, cost_pool
 from queries.supplement_source import (
     iter_booking_lifecycle_batches,
     iter_inventory_batches,
@@ -499,6 +499,7 @@ def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):
 
     with cost_pool.connection() as app_connection:
         with app_connection.cursor(row_factory=dict_row) as cursor:
+            apply_background_timeouts(cursor)
             cursor.execute(
                 "SELECT pg_try_advisory_lock(hashtext(%s)) AS acquired",
                 (SYNC_LOCK_NAME,),

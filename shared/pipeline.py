@@ -41,13 +41,13 @@ def run_dataset(dataset_name):
             f"Unknown dataset '{dataset_name}'. Allowed: {sorted(DATASETS)}"
         )
 
-    if dataset_name == "properties":
-        # The source row lives in Database B, but the import target is the
-        # functions schema in Database A. Ensure that target exists before the
-        # first scheduled/manual sync runs.
-        from services.cost_schema_service import ensure_cost_settings_schema
+    # Every dataset writes into the functions schema in Database A, so the
+    # target must exist before any of them run - not just "properties". The five
+    # fact tables are created by migration 010; without this the other datasets
+    # fail with UndefinedTable on a rebuilt database.
+    from services.cost_schema_service import ensure_cost_settings_schema
 
-        ensure_cost_settings_schema()
+    ensure_cost_settings_schema()
 
     config = DATASETS[dataset_name]
 

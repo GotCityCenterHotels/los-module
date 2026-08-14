@@ -21,6 +21,10 @@ MIGRATIONS = (
         "006_unified_hotels",
         APP_ROOT / "sql" / "migrations" / "006_unified_hotels.sql",
     ),
+    (
+        "010_cost_fact_tables",
+        APP_ROOT / "sql" / "migrations" / "010_cost_fact_tables.sql",
+    ),
 )
 
 _schema_ready = False

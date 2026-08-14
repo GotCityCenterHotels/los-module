@@ -15,27 +15,6 @@ def read_sql(relative_path):
     return sql_path.read_text(encoding="utf-8")
 
 
-def fetch_export_rows(export_sql_file):
-    sql = read_sql(export_sql_file)
-
-    with get_export_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return cur.fetchall()
-
-
-def import_rows(import_sql_file, rows):
-    if not rows:
-        return 0
-
-    sql = read_sql(import_sql_file)
-
-    with get_import_connection() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(sql, rows)
-
-    return len(rows)
-
 def transfer_dataset(export_sql_file, import_sql_file, batch_size=5000):
     export_sql = read_sql(export_sql_file)
     import_sql = read_sql(import_sql_file)
@@ -45,7 +24,15 @@ def transfer_dataset(export_sql_file, import_sql_file, batch_size=5000):
 
     with get_export_connection() as export_conn:
         with get_import_connection() as import_conn:
-            with export_conn.cursor() as export_cur:
+            # A named cursor keeps the result set server-side in integration_db
+            # and streams it in batches. An unnamed psycopg3 cursor buffers the
+            # ENTIRE result into worker memory on execute(), so fetchmany() was
+            # only slicing an already-materialised list and batch_size bounded
+            # nothing. DECLARE CURSOR is a read operation - it does not write to
+            # integration_db, which stays read-only.
+            cursor_name = f"export_{Path(export_sql_file).stem}"
+            with export_conn.cursor(name=cursor_name) as export_cur:
+                export_cur.itersize = batch_size
                 with import_conn.cursor() as import_cur:
                     export_cur.execute(export_sql)
 

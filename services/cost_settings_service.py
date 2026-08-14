@@ -380,6 +380,11 @@ def _number(value, label, maximum=None, integer=False):
         result = Decimal(str(value))
     except (InvalidOperation, ValueError):
         raise ValueError(f"{label} must be a number") from None
+    # Decimal accepts "Infinity" and "NaN". Infinity passes the comparisons
+    # below (it is not < 0, and money fields have no maximum) and PostgreSQL
+    # numeric will store it, so an infinite cost rate would reach the database.
+    if not result.is_finite():
+        raise ValueError(f"{label} must be a finite number")
     if result < 0 or (maximum is not None and result > maximum):
         suffix = f" between 0 and {maximum}" if maximum is not None else " zero or greater"
         raise ValueError(f"{label} must be{suffix}")
@@ -406,7 +411,11 @@ def _validate_ranges(rows, min_key, max_key, label):
         if maximum is not None and maximum < minimum:
             raise ValueError(f"{label} row {index + 1} maximum cannot be below its minimum")
         ranges.append((minimum, maximum))
-    ordered = sorted(ranges)
+    # An open-ended tier stores None as its maximum. Sorting raw (min, max)
+    # tuples compares None with int whenever two tiers share a minimum, raising
+    # TypeError - which surfaced as a 500 instead of a validation message.
+    # Open-ended tiers sort last within the same minimum.
+    ordered = sorted(ranges, key=lambda bounds: (bounds[0], bounds[1] is None, bounds[1] or 0))
     for previous, current in zip(ordered, ordered[1:]):
         if previous[1] is None or current[0] <= previous[1]:
             raise ValueError(f"{label} ranges cannot overlap")

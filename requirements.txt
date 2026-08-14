@@ -1,6 +1,13 @@
 # Uncomment to enable Azure Monitor OpenTelemetry
-# Ref: aka.ms/functions-azure-monitor-python 
-# azure-monitor-opentelemetry 
+# Ref: aka.ms/functions-azure-monitor-python
+# azure-monitor-opentelemetry
 
-azure-functions
-psycopg[binary,pool]
+# Pinned deliberately. The deploy uses remote-build, so an unpinned requirement
+# is resolved on Azure's build agent at deploy time - re-running the same commit
+# next month could install different versions. psycopg-pool is versioned
+# independently of psycopg and can major-bump on its own, and both pools are
+# constructed at module import, so a breaking pool change takes out every route
+# at once. Bump these deliberately, then run the test suite.
+azure-functions==2.2.0
+psycopg[binary,pool]==3.3.4
+psycopg-pool==3.3.1

@@ -362,5 +362,47 @@ class CostSettingsValidationTests(unittest.TestCase):
             })
 
 
+class NumericGuardTests(unittest.TestCase):
+    def test_overlapping_open_ended_tiers_report_a_validation_error(self):
+        # Two tiers sharing a minimum where one is open-ended used to compare
+        # None with int inside sorted(), raising TypeError -> HTTP 500 instead
+        # of a 400 the user could act on.
+        rows = [
+            {"minGuests": 1, "maxGuests": None},
+            {"minGuests": 1, "maxGuests": 5},
+        ]
+        with self.assertRaises(ValueError) as raised:
+            cost_settings_service._validate_ranges(
+                rows, "minGuests", "maxGuests", "Cleaning"
+            )
+        self.assertIn("overlap", str(raised.exception).lower())
+
+    def test_disjoint_open_ended_tier_sorts_last_and_validates(self):
+        rows = [
+            {"minGuests": 5, "maxGuests": None},
+            {"minGuests": 1, "maxGuests": 4},
+        ]
+        self.assertEqual(
+            cost_settings_service._validate_ranges(
+                rows, "minGuests", "maxGuests", "Cleaning"
+            ),
+            [(5, None), (1, 4)],
+        )
+
+    def test_non_finite_amounts_are_rejected(self):
+        # Decimal("Infinity") is not < 0 and money fields have no maximum, so it
+        # passed every guard and PostgreSQL numeric would store it.
+        for value in ("Infinity", "-Infinity", "NaN"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    cost_settings_service._number(value, "Cleaning cost")
+
+    def test_ordinary_amounts_still_pass(self):
+        self.assertEqual(
+            cost_settings_service._number("12.50", "Cleaning cost"),
+            cost_settings_service.Decimal("12.50"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
