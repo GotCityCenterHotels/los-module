@@ -398,7 +398,27 @@ def sync_los(mode="delta"):
                         cursor.execute(
                             "DELETE FROM functions.los_reservation_identity"
                         )
-                        recalculation_numbers = None
+                        # Do not execute the unbounded all-history fact query.
+                        # It can exceed integration_db's enforced statement
+                        # timeout even though date-bounded LOS reads are fast.
+                        # Load the cheap reservation identity set first, then
+                        # calculate facts in bounded reservation-number chunks.
+                        # Chunking on number (rather than reservation id) keeps
+                        # duplicate reservation numbers in the same query and
+                        # therefore preserves the canonical grouping semantics.
+                        identity_rows_written = _extract_and_write_identities(
+                            cursor,
+                            None,
+                        )
+                        cursor.execute("""
+                            SELECT DISTINCT reservation_number
+                            FROM functions.los_reservation_identity
+                            WHERE reservation_number IS NOT NULL
+                            ORDER BY reservation_number
+                        """)
+                        recalculation_numbers = [
+                            row[0] for row in cursor.fetchall()
+                        ]
                     elif affected:
                         affected_ids = [row["reservation_id"] for row in affected]
                         new_numbers = {
@@ -440,10 +460,11 @@ def sync_los(mode="delta"):
                         cursor,
                         recalculation_numbers,
                     )
-                    identity_rows_written = _extract_and_write_identities(
-                        cursor,
-                        recalculation_numbers,
-                    )
+                    if effective_mode != "full":
+                        identity_rows_written = _extract_and_write_identities(
+                            cursor,
+                            recalculation_numbers,
+                        )
                     cursor.execute(
                         AGGREGATE_SQL,
                         {
@@ -463,7 +484,7 @@ def sync_los(mode="delta"):
                     cursor.execute("""
                         INSERT INTO functions.los_publication (
                             singleton, run_id, published_at
-                        ) VALUES (true, %s, now())
+                        ) VALUES (true, %s, clock_timestamp())
                         ON CONFLICT (singleton) DO UPDATE SET
                             run_id = EXCLUDED.run_id,
                             published_at = EXCLUDED.published_at
@@ -477,7 +498,8 @@ def sync_los(mode="delta"):
                                 FROM functions.reservation_los_fact
                             ),
                             aggregate_rows = %s,
-                            finished_at = now(), published_at = now()
+                            finished_at = clock_timestamp(),
+                            published_at = clock_timestamp()
                         WHERE run_id = %s
                     """, (
                             len(affected) if affected is not None else identity_rows_written,
