@@ -302,13 +302,16 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
 
 
 @app.route(
-    route="costdata/settings/hotels",
+    route="costdata/properties",
     methods=["GET"],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
 def cost_settings_hotels(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        return json_response({"data": list_cost_settings_hotels()})
+        return json_response(
+            {"data": list_cost_settings_hotels()},
+            headers={"Cache-Control": "no-store"},
+        )
     except CostSettingsSchemaError as error:
         return json_response({"error": str(error)}, 503)
     except Exception:

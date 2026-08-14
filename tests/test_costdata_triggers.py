@@ -135,15 +135,25 @@ class CostDataTriggerTests(unittest.TestCase):
         )
 
     def test_v2_function_app_registers_manual_and_timer_triggers(self):
+        registered_functions = function_app.app.get_functions()
         function_names = {
             registered.get_function_name()
-            for registered in function_app.app.get_functions()
+            for registered in registered_functions
+        }
+        routes = {
+            binding.get_dict_repr().get("route")
+            for registered in registered_functions
+            for binding in registered.get_bindings()
+            if binding.get_dict_repr().get("type") == "httpTrigger"
         }
 
         self.assertIn("CostDataImport", function_names)
         self.assertIn("CostDataTimer", function_names)
         self.assertIn("SupplementDataImport", function_names)
         self.assertIn("SupplementDataTimer", function_names)
+        self.assertIn("costdata/properties", routes)
+        self.assertIn("costdata/settings/{enterprise_id}", routes)
+        self.assertNotIn("costdata/settings/hotels", routes)
 
 
 if __name__ == "__main__":

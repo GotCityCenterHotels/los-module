@@ -1,6 +1,7 @@
 (function () {
     "use strict";
     const API = "/api/costdata/settings";
+    const PROPERTIES_API = "/api/costdata/properties";
     const hotel = document.getElementById("settingsHotel"), form = document.getElementById("settingsForm");
     const layout = document.getElementById("settingsLayout"), status = document.getElementById("settingsStatus");
     const errorPanel = document.getElementById("settingsError"), save = document.getElementById("saveSettings");
@@ -19,7 +20,7 @@
         status.textContent = "Loading properties...";
         hotel.disabled = true;
         try {
-            const payload = await LosApi.fetchJson(`${API}/hotels`, {cache: "no-store"});
+            const payload = await LosApi.fetchJson(PROPERTIES_API, {cache: "no-store"});
             const properties = (payload.data || []).filter((property) =>
                 property && property.enterpriseId != null && String(property.enterpriseId).trim()
                 && property.hotelName && String(property.hotelName).trim()
