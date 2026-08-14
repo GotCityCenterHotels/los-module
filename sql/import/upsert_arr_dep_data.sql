@@ -1,5 +1,6 @@
 INSERT INTO functions.arr_dep_data (
     arr_dep_data_key,
+    enterprise_id,
     hotel_name,
     stay_date,
     total_arrivals,
@@ -10,6 +11,7 @@ INSERT INTO functions.arr_dep_data (
 )
 VALUES (
     %(arr_dep_data_key)s,
+    %(enterprise_id)s,
     %(hotel_name)s,
     %(stay_date)s,
     %(total_arrivals)s,
@@ -19,6 +21,7 @@ VALUES (
     now()
 )
 ON CONFLICT (arr_dep_data_key) DO UPDATE SET
+    enterprise_id = EXCLUDED.enterprise_id,
     hotel_name = EXCLUDED.hotel_name,
     stay_date = EXCLUDED.stay_date,
     total_arrivals = EXCLUDED.total_arrivals,
@@ -27,11 +30,13 @@ ON CONFLICT (arr_dep_data_key) DO UPDATE SET
     last_updated_at =
         CASE
             WHEN (
+                functions.arr_dep_data.enterprise_id,
                 functions.arr_dep_data.hotel_name,
                 functions.arr_dep_data.stay_date,
                 functions.arr_dep_data.total_arrivals,
                 functions.arr_dep_data.total_departures
             ) IS DISTINCT FROM (
+                EXCLUDED.enterprise_id,
                 EXCLUDED.hotel_name,
                 EXCLUDED.stay_date,
                 EXCLUDED.total_arrivals,

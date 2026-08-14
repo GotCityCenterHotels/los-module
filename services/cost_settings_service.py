@@ -38,13 +38,7 @@ IMPORTED_PROPERTIES_SQL = """
         hotel_name
     FROM (
         SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, -1 AS priority
-        FROM functions.cost_properties
-        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
-
-        UNION ALL
-
-        SELECT enterprise_id::text, trim(hotel_name)::text AS hotel_name, 0 AS priority
-        FROM functions.cost_property_settings
+        FROM functions.hotels
         WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
 
         UNION ALL
@@ -110,8 +104,8 @@ def _list_mirrored_properties():
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute("""
                 SELECT enterprise_id, hotel_name
-                FROM functions.cost_properties
-                WHERE tenant_key = 'GCCH'
+                FROM functions.hotels
+                WHERE tenant_key = 'GCCH' AND active
                 ORDER BY hotel_name, enterprise_id
             """)
             return [_property_json(row) for row in cursor.fetchall()]
@@ -123,7 +117,7 @@ def _get_mirrored_property(enterprise_id):
             cursor.execute(
                 """
                 SELECT enterprise_id, hotel_name
-                FROM functions.cost_properties
+                FROM functions.hotels
                 WHERE enterprise_id = %s
                 """,
                 (enterprise_id,),
@@ -139,19 +133,20 @@ def _upsert_mirrored_properties(properties):
         with connection.cursor() as cursor:
             cursor.executemany(
                 """
-                INSERT INTO functions.cost_properties (
+                INSERT INTO functions.hotels (
                     enterprise_id, tenant_key, hotel_name
                 )
                 VALUES (%s, 'GCCH', %s)
                 ON CONFLICT (enterprise_id) DO UPDATE SET
                     tenant_key = EXCLUDED.tenant_key,
                     hotel_name = EXCLUDED.hotel_name,
+                    active = true,
                     last_seen_at = now(),
                     last_updated_at = CASE
-                        WHEN functions.cost_properties.hotel_name
+                        WHEN functions.hotels.hotel_name
                             IS DISTINCT FROM EXCLUDED.hotel_name
                         THEN now()
-                        ELSE functions.cost_properties.last_updated_at
+                        ELSE functions.hotels.last_updated_at
                     END
                 """,
                 [
@@ -182,9 +177,10 @@ def _get_preloaded_property(enterprise_id):
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 """
-                SELECT enterprise_id, hotel_name
-                FROM functions.cost_property_settings
-                WHERE enterprise_id = %s
+                SELECT settings.enterprise_id, hotel.hotel_name
+                FROM functions.cost_property_settings settings
+                JOIN functions.hotels hotel USING (enterprise_id)
+                WHERE settings.enterprise_id = %s
                 """,
                 (enterprise_id,),
             )
@@ -201,22 +197,12 @@ def _preload_property_settings(properties):
         with connection.cursor() as cursor:
             cursor.executemany(
                 """
-                INSERT INTO functions.cost_property_settings (
-                    enterprise_id,
-                    hotel_name
-                )
-                VALUES (%s, %s)
-                ON CONFLICT (enterprise_id) DO UPDATE SET
-                    hotel_name = EXCLUDED.hotel_name,
-                    updated_at = CASE
-                        WHEN functions.cost_property_settings.hotel_name
-                            IS DISTINCT FROM EXCLUDED.hotel_name
-                        THEN now()
-                        ELSE functions.cost_property_settings.updated_at
-                    END
+                INSERT INTO functions.cost_property_settings (enterprise_id)
+                VALUES (%s)
+                ON CONFLICT (enterprise_id) DO NOTHING
                 """,
                 [
-                    (property_row["enterpriseId"], property_row["hotelName"])
+                    (property_row["enterpriseId"],)
                     for property_row in properties
                 ],
             )
@@ -351,7 +337,12 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
         _preload_property_settings([property_record])
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("SELECT * FROM functions.cost_property_settings WHERE enterprise_id = %s", (enterprise_id,))
+            cursor.execute("""
+                SELECT settings.*, hotel.hotel_name
+                FROM functions.cost_property_settings settings
+                JOIN functions.hotels hotel USING (enterprise_id)
+                WHERE settings.enterprise_id = %s
+            """, (enterprise_id,))
             profile_row = cursor.fetchone()
             profile = dict(DEFAULT_PROFILE)
             if profile_row:
@@ -498,7 +489,7 @@ def save_cost_settings(enterprise_id, payload):
     p = data["profile"]
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("""INSERT INTO functions.cost_property_settings (enterprise_id, hotel_name, currency, distribution_default_percent, cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent, breakfast_calculation_basis, breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour, breakfast_rent_percent, parking_rent_percent, card_cost_percent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (enterprise_id) DO UPDATE SET hotel_name=EXCLUDED.hotel_name, currency=EXCLUDED.currency, distribution_default_percent=EXCLUDED.distribution_default_percent, cleaning_cost_per_minute=EXCLUDED.cleaning_cost_per_minute, reception_cost_per_hour=EXCLUDED.reception_cost_per_hour, room_rent_percent=EXCLUDED.room_rent_percent, breakfast_calculation_basis=EXCLUDED.breakfast_calculation_basis, breakfast_food_cost_per_guest=EXCLUDED.breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour=EXCLUDED.breakfast_staff_cost_per_hour, breakfast_rent_percent=EXCLUDED.breakfast_rent_percent, parking_rent_percent=EXCLUDED.parking_rent_percent, card_cost_percent=EXCLUDED.card_cost_percent, updated_at=now()""", (data["enterpriseId"], data["hotelName"], p["currency"], p["distributionDefaultPercent"], p["cleaningCostPerMinute"], p["receptionCostPerHour"], p["roomRentPercent"], p["breakfastCalculationBasis"], p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"], p["breakfastRentPercent"], p["parkingRentPercent"], p["cardCostPercent"]))
+            cursor.execute("""INSERT INTO functions.cost_property_settings (enterprise_id, currency, distribution_default_percent, cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent, breakfast_calculation_basis, breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour, breakfast_rent_percent, parking_rent_percent, card_cost_percent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (enterprise_id) DO UPDATE SET currency=EXCLUDED.currency, distribution_default_percent=EXCLUDED.distribution_default_percent, cleaning_cost_per_minute=EXCLUDED.cleaning_cost_per_minute, reception_cost_per_hour=EXCLUDED.reception_cost_per_hour, room_rent_percent=EXCLUDED.room_rent_percent, breakfast_calculation_basis=EXCLUDED.breakfast_calculation_basis, breakfast_food_cost_per_guest=EXCLUDED.breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour=EXCLUDED.breakfast_staff_cost_per_hour, breakfast_rent_percent=EXCLUDED.breakfast_rent_percent, parking_rent_percent=EXCLUDED.parking_rent_percent, card_cost_percent=EXCLUDED.card_cost_percent, updated_at=now()""", (data["enterpriseId"], p["currency"], p["distributionDefaultPercent"], p["cleaningCostPerMinute"], p["receptionCostPerHour"], p["roomRentPercent"], p["breakfastCalculationBasis"], p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"], p["breakfastRentPercent"], p["parkingRentPercent"], p["cardCostPercent"]))
             for table in ("cost_distribution_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers", "cost_fixed_lines"):
                 cursor.execute(f"DELETE FROM functions.{table} WHERE enterprise_id = %s", (data["enterpriseId"],))
             for order, group in enumerate(data["distributionGroups"]):

@@ -16,6 +16,10 @@ MIGRATIONS = (
         "004_supplement_lifecycle_ids",
         APP_ROOT / "sql" / "migrations" / "004_supplement_lifecycle_ids.sql",
     ),
+    (
+        "006_unified_hotels",
+        APP_ROOT / "sql" / "migrations" / "006_unified_hotels.sql",
+    ),
 )
 
 _schema_ready = False
@@ -39,7 +43,7 @@ def ensure_supplement_schema():
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT pg_advisory_lock(hashtext(%s))",
-                    ("functions.supplement_schema",),
+                    ("functions.application_schema",),
                 )
                 try:
                     cursor.execute("CREATE SCHEMA IF NOT EXISTS functions")
@@ -73,7 +77,7 @@ def ensure_supplement_schema():
                 finally:
                     cursor.execute(
                         "SELECT pg_advisory_unlock(hashtext(%s))",
-                        ("functions.supplement_schema",),
+                        ("functions.application_schema",),
                     )
 
         _schema_ready = True

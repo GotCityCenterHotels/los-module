@@ -77,7 +77,7 @@ class SupplementDomainTests(unittest.TestCase):
         source = Path(supplement_service.__file__).read_text(encoding="utf-8")
         detail_source = source[source.index("def fetch_supplement_detail"):]
         coverage_guard = detail_source[detail_source.index("if coverage and ("):detail_source.index(
-            "cursor.execute(\n                \"SELECT 1 FROM functions.supplement_hotels",
+            "cursor.execute(\n                \"SELECT 1 FROM functions.hotels",
             detail_source.index("if coverage and ("),
         )]
         self.assertNotIn("comparison_date <", coverage_guard)

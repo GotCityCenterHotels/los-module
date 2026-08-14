@@ -9,10 +9,14 @@ WITH
 current_source AS (
     SELECT
         r.number::text AS reservation_id,
-        trim(r.hotel_name)::text AS hotel_code,
+        enterprise.id::text AS hotel_code,
+        trim(enterprise.name)::text AS hotel_name,
         (r.start_utc AT TIME ZONE 'Europe/Stockholm')::date AS arrival_date,
         (r.night_start_utc AT TIME ZONE 'Europe/Stockholm')::date AS night_date
     FROM staging.room_nights_source r
+    JOIN enterprise_current enterprise
+      ON enterprise.tenant_key = 'GCCH'
+     AND trim(enterprise.name) = trim(r.hotel_name)
     WHERE
         r.number IS NOT NULL
         AND r.hotel_name IS NOT NULL
@@ -39,12 +43,14 @@ current_reservation_los AS (
     SELECT
         reservation_id,
         hotel_code,
+        hotel_name,
         arrival_date,
         count(DISTINCT night_date)::int AS los
     FROM current_source
     GROUP BY
         reservation_id,
         hotel_code,
+        hotel_name,
         arrival_date
 ),
 
@@ -52,6 +58,7 @@ current_facts AS (
     SELECT
         arrival_date,
         hotel_code,
+        hotel_name,
         'current'::text AS scenario,
         los,
         count(*)::bigint AS booking_count,
@@ -60,6 +67,7 @@ current_facts AS (
     GROUP BY
         arrival_date,
         hotel_code,
+        hotel_name,
         los
 ),
 
@@ -70,12 +78,16 @@ current_facts AS (
 ly_source AS (
     SELECT
         r.number::text AS reservation_id,
-        trim(r.hotel_name)::text AS hotel_code,
+        enterprise.id::text AS hotel_code,
+        trim(enterprise.name)::text AS hotel_name,
         (r.start_utc AT TIME ZONE 'Europe/Stockholm')::date AS arrival_date,
         (r.night_start_utc AT TIME ZONE 'Europe/Stockholm')::date AS night_date,
         r.created_utc::date AS created_date,
         r.canceled_utc::date AS cancelled_date
     FROM staging.room_nights_source r
+    JOIN enterprise_current enterprise
+      ON enterprise.tenant_key = 'GCCH'
+     AND trim(enterprise.name) = trim(r.hotel_name)
     WHERE
         r.number IS NOT NULL
         AND r.hotel_name IS NOT NULL
@@ -125,6 +137,7 @@ ly_reservation_los AS (
     SELECT
         reservation_id,
         hotel_code,
+        hotel_name,
         arrival_date,
         created_date,
         cancelled_date,
@@ -133,6 +146,7 @@ ly_reservation_los AS (
     GROUP BY
         reservation_id,
         hotel_code,
+        hotel_name,
         arrival_date,
         created_date,
         cancelled_date
@@ -147,6 +161,7 @@ ly_reservation_flags AS (
             ELSE (r.arrival_date + INTERVAL '1 year')::date
         END AS arrival_date,
         r.hotel_code,
+        r.hotel_name,
         r.los,
         r.cancelled_date IS NULL AS include_ly,
         (
@@ -176,6 +191,7 @@ ly_fact_components AS (
     SELECT
         arrival_date,
         hotel_code,
+        hotel_name,
         los,
         count(*) FILTER (WHERE include_ly)::bigint AS ly_booking_count,
         count(*) FILTER (WHERE include_spit)::bigint AS spit_booking_count
@@ -183,6 +199,7 @@ ly_fact_components AS (
     GROUP BY
         arrival_date,
         hotel_code,
+        hotel_name,
         los
 ),
 
@@ -190,6 +207,7 @@ ly_facts AS (
     SELECT
         f.arrival_date,
         f.hotel_code,
+        f.hotel_name,
         scenario_data.scenario,
         f.los,
         scenario_data.booking_count,
@@ -212,6 +230,7 @@ los_facts AS (
 SELECT
     arrival_date,
     hotel_code,
+    hotel_name,
     scenario,
     los,
     booking_count,

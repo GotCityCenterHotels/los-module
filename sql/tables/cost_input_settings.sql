@@ -1,10 +1,11 @@
 CREATE SCHEMA IF NOT EXISTS functions;
 
-CREATE TABLE IF NOT EXISTS functions.cost_properties (
+CREATE TABLE IF NOT EXISTS functions.hotels (
     enterprise_id text PRIMARY KEY,
     tenant_key text NOT NULL,
     hotel_name text NOT NULL,
-    first_inserted_at timestamptz NOT NULL DEFAULT now(),
+    active boolean NOT NULL DEFAULT true,
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
     last_seen_at timestamptz NOT NULL DEFAULT now(),
     last_updated_at timestamptz NOT NULL DEFAULT now(),
     CHECK (nullif(trim(enterprise_id), '') IS NOT NULL),
@@ -12,8 +13,9 @@ CREATE TABLE IF NOT EXISTS functions.cost_properties (
 );
 
 CREATE TABLE IF NOT EXISTS functions.cost_property_settings (
-    enterprise_id text PRIMARY KEY,
-    hotel_name text NOT NULL,
+    enterprise_id text PRIMARY KEY
+        CONSTRAINT cost_property_settings_hotel_fkey
+        REFERENCES functions.hotels(enterprise_id),
     currency text NOT NULL DEFAULT 'SEK',
     distribution_default_percent numeric(7, 4) NOT NULL DEFAULT 0,
     cleaning_cost_per_minute numeric(18, 4) NOT NULL DEFAULT 0,
@@ -109,8 +111,7 @@ CREATE TABLE IF NOT EXISTS functions.cost_fixed_lines (
     CHECK (amount >= 0)
 );
 
-CREATE INDEX IF NOT EXISTS ix_cost_property_settings_hotel_name ON functions.cost_property_settings(hotel_name);
-CREATE INDEX IF NOT EXISTS ix_cost_properties_hotel_name ON functions.cost_properties(hotel_name);
+CREATE INDEX IF NOT EXISTS ix_hotels_tenant_active_name ON functions.hotels(tenant_key, active, hotel_name, enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_enterprise ON functions.cost_distribution_groups(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.cost_cleaning_categories(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);

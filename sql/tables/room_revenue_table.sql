@@ -2,7 +2,9 @@ CREATE TABLE IF NOT EXISTS functions.room_revenue_night_data (
     room_revenue_night_data_key text PRIMARY KEY,
 
     tenant_key text NOT NULL,
-    enterprise_id text NOT NULL,
+    enterprise_id text NOT NULL
+        CONSTRAINT room_revenue_night_data_hotel_fkey
+        REFERENCES functions.hotels(enterprise_id),
     hotel_name text,
     local_timezone text,
     stay_date date NOT NULL,

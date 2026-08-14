@@ -15,21 +15,20 @@ DELETE FROM functions.supplement_coverage;
         DROP TABLE IF EXISTS functions.supplement_room_categories CASCADE;
         DROP TABLE IF EXISTS functions.supplement_hotels CASCADE;
 
-        CREATE TABLE functions.supplement_hotels (
-            hotel_code text PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS functions.hotels (
+            enterprise_id text PRIMARY KEY,
             tenant_key text NOT NULL,
-            enterprise_id uuid NOT NULL,
             hotel_name text NOT NULL,
             active boolean NOT NULL DEFAULT true,
+            first_seen_at timestamptz NOT NULL DEFAULT now(),
             last_seen_at timestamptz NOT NULL DEFAULT now(),
-            UNIQUE (tenant_key, enterprise_id),
-            CHECK (hotel_code = enterprise_id::text),
+            last_updated_at timestamptz NOT NULL DEFAULT now(),
             CHECK (nullif(trim(hotel_name), '') IS NOT NULL)
         );
 
         CREATE TABLE functions.supplement_room_categories (
             hotel_code text NOT NULL
-                REFERENCES functions.supplement_hotels(hotel_code),
+                REFERENCES functions.hotels(enterprise_id),
             room_category_id uuid NOT NULL,
             space_room_name text NOT NULL,
             short_name text NOT NULL,

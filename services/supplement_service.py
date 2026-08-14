@@ -189,10 +189,10 @@ def list_supplement_hotels():
         with connection.cursor(row_factory=dict_row) as cursor:
             publication = _publication(cursor, required=False)
             cursor.execute("""
-                SELECT hotel_code, hotel_name
-                FROM functions.supplement_hotels
+                SELECT enterprise_id AS hotel_code, hotel_name
+                FROM functions.hotels
                 WHERE active
-                ORDER BY hotel_name, hotel_code
+                ORDER BY hotel_name, enterprise_id
             """)
             hotels = [
                 {"code": row["hotel_code"], "name": row["hotel_name"]}
@@ -359,9 +359,9 @@ def fetch_supplement_grid(
                 return cached
             logging.info("Supplement grid cache miss run_id=%s", publication["run_id"])
             cursor.execute("""
-                SELECT hotel_code, hotel_name
-                FROM functions.supplement_hotels
-                WHERE active ORDER BY hotel_name, hotel_code
+                SELECT enterprise_id AS hotel_code, hotel_name
+                FROM functions.hotels
+                WHERE active ORDER BY hotel_name, enterprise_id
             """)
             hotel_lookup = {row["hotel_code"]: row["hotel_name"] for row in cursor.fetchall()}
             requested_hotel_set = set(requested_hotels)
@@ -596,7 +596,7 @@ def fetch_supplement_detail(
                     "The selected detail date has not been backfilled into PostgreSQL"
                 )
             cursor.execute(
-                "SELECT 1 FROM functions.supplement_hotels WHERE active AND hotel_code = %s",
+                "SELECT 1 FROM functions.hotels WHERE active AND enterprise_id = %s",
                 (hotel_code,),
             )
             if cursor.fetchone() is None:

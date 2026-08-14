@@ -2,12 +2,13 @@ SELECT
     md5(
         concat_ws(
             '|',
-            r.hotel_name,
+            ec.id::text,
             e.stay_date::text
         )
     ) AS arr_dep_data_key,
 
-    r.hotel_name,
+    ec.id::text AS enterprise_id,
+    trim(ec.name)::text AS hotel_name,
     e.stay_date,
 
     count(distinct r.reservation_id) FILTER (
@@ -20,6 +21,10 @@ SELECT
 
 FROM staging.room_nights_source r
 
+JOIN enterprise_current ec
+  ON ec.tenant_key = 'GCCH'
+ AND trim(ec.name) = trim(r.hotel_name)
+
 CROSS JOIN LATERAL (
     VALUES
         ((r.start_utc AT TIME ZONE 'Europe/Stockholm')::date, 'arrival'),
@@ -30,9 +35,10 @@ WHERE r.canceled_utc IS NULL
   AND e.stay_date IS NOT NULL
 
 GROUP BY
-    r.hotel_name,
+    ec.id,
+    ec.name,
     e.stay_date
 
 ORDER BY
-    r.hotel_name,
+    ec.name,
     e.stay_date;

@@ -287,20 +287,23 @@ def _publish_stage(cursor, run_id, source_snapshots):
         )
 
     cursor.execute("""
-        INSERT INTO functions.supplement_hotels (
-            hotel_code, tenant_key, enterprise_id, hotel_name, last_seen_at
+        INSERT INTO functions.hotels (
+            enterprise_id, tenant_key, hotel_name, active, last_seen_at
         )
         SELECT DISTINCT ON (source.enterprise_id)
                source.enterprise_id::text, source.tenant_key,
-               source.enterprise_id, source.hotel_name, now()
+               source.hotel_name, true, now()
         FROM supplement_inventory_source_stage AS source
         ORDER BY source.enterprise_id, source.snapshot_date DESC
-        ON CONFLICT (hotel_code) DO UPDATE SET
+        ON CONFLICT (enterprise_id) DO UPDATE SET
             tenant_key = EXCLUDED.tenant_key,
-            enterprise_id = EXCLUDED.enterprise_id,
             hotel_name = EXCLUDED.hotel_name,
             active = true,
-            last_seen_at = now()
+            last_seen_at = now(),
+            last_updated_at = CASE
+                WHEN functions.hotels.hotel_name IS DISTINCT FROM EXCLUDED.hotel_name
+                THEN now() ELSE functions.hotels.last_updated_at
+            END
     """)
     cursor.execute("""
         INSERT INTO functions.supplement_room_categories (

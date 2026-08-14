@@ -263,11 +263,11 @@ class CostSettingsValidationTests(unittest.TestCase):
         ensure_schema.assert_called_once_with()
         cursor = pool.connection_instance.cursor_instance
         self.assertEqual(cursor.parameters, [
-            ("property-42", "Hotel A"),
-            ("property-43", "Hotel B"),
+            ("property-42",),
+            ("property-43",),
         ])
         self.assertIn("INSERT INTO functions.cost_property_settings", cursor.sql)
-        self.assertIn("ON CONFLICT (enterprise_id) DO UPDATE", cursor.sql)
+        self.assertIn("ON CONFLICT (enterprise_id) DO NOTHING", cursor.sql)
         self.assertNotIn("card_cost_percent", cursor.sql)
 
     def test_settings_load_persists_property_pair_in_database_a(self):

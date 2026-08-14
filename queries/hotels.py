@@ -1,8 +1,12 @@
 HOTELS_SQL = """
-WITH hotel_codes AS (
+WITH hotels AS (
     /* Keep both date predicates directly beside the source relation. */
-    SELECT trim(r.hotel_name)::text AS hotel_code
+    SELECT enterprise.id::text AS hotel_code,
+           trim(enterprise.name)::text AS hotel_name
     FROM staging.room_nights_source r
+    JOIN enterprise_current enterprise
+      ON enterprise.tenant_key = 'GCCH'
+     AND trim(enterprise.name) = trim(r.hotel_name)
     WHERE
         r.hotel_name IS NOT NULL
         AND trim(r.hotel_name) <> ''
@@ -17,8 +21,12 @@ WITH hotel_codes AS (
 
     UNION ALL
 
-    SELECT trim(r.hotel_name)::text AS hotel_code
+    SELECT enterprise.id::text AS hotel_code,
+           trim(enterprise.name)::text AS hotel_name
     FROM staging.room_nights_source r
+    JOIN enterprise_current enterprise
+      ON enterprise.tenant_key = 'GCCH'
+     AND trim(enterprise.name) = trim(r.hotel_name)
     WHERE
         r.hotel_name IS NOT NULL
         AND trim(r.hotel_name) <> ''
@@ -41,7 +49,7 @@ WITH hotel_codes AS (
             )::timestamp AT TIME ZONE 'Europe/Stockholm'
         )
 )
-SELECT DISTINCT hotel_code
-FROM hotel_codes
-ORDER BY hotel_code;
+SELECT DISTINCT hotel_code, hotel_name
+FROM hotels
+ORDER BY hotel_name, hotel_code;
 """

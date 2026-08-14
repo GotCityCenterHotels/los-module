@@ -73,14 +73,14 @@ def run_dataset(dataset_name):
                 cursor.execute(
                     """
                     SELECT count(*)
-                    FROM functions.cost_properties
+                    FROM functions.hotels
                     WHERE tenant_key = 'GCCH'
                     """
                 )
                 verified_rows = cursor.fetchone()[0]
         if verified_rows == 0:
             raise RuntimeError(
-                "Properties were exported but are not visible to the cost settings API in Database A"
+                "Properties were exported but are not visible in the unified hotel dimension in Database A"
             )
         result["verified_rows"] = verified_rows
 

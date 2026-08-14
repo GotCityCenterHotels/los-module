@@ -35,7 +35,11 @@ def fetch_los_facts(start_date, end_date, ly_comparison_basis):
     return [
         {
             "arrivalDate": row["arrival_date"].isoformat(),
-            "hotelCode": row["hotel_code"],
+            # Keep hotelCode backward-compatible for existing filters while
+            # exposing the stable unified identity for new consumers.
+            "hotelCode": row["hotel_name"],
+            "enterpriseId": row["hotel_code"],
+            "hotelName": row["hotel_name"],
             "scenario": row["scenario"],
             "los": int(row["los"]),
             "bookingCount": int(row["booking_count"]),

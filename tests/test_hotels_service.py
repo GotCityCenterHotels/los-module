@@ -38,7 +38,7 @@ class FakeCursor:
         self.owner.release.wait(timeout=2)
 
     def fetchall(self):
-        return [("A",), ("B",)]
+        return [("enterprise-a", "A"), ("enterprise-b", "B")]
 
 
 class FakeConnection:

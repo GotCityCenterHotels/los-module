@@ -176,7 +176,11 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         self.assertIn("inventory_quality text not null", migration)
         self.assertEqual(
             [name for name, _path in supplement_schema_service.MIGRATIONS],
-            ["003_supplement_read_model", "004_supplement_lifecycle_ids"],
+            [
+                "003_supplement_read_model",
+                "004_supplement_lifecycle_ids",
+                "006_unified_hotels",
+            ],
         )
 
     def test_sync_keeps_final_facts_and_replaces_only_discovered_snapshots(self):

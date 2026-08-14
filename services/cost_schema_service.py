@@ -17,6 +17,10 @@ MIGRATIONS = (
         "002_cost_properties",
         APP_ROOT / "sql" / "migrations" / "002_cost_properties.sql",
     ),
+    (
+        "006_unified_hotels",
+        APP_ROOT / "sql" / "migrations" / "006_unified_hotels.sql",
+    ),
 )
 
 _schema_ready = False
@@ -45,7 +49,7 @@ def ensure_cost_settings_schema():
                 # A session lock coordinates migrations across Function workers.
                 cursor.execute(
                     "SELECT pg_advisory_lock(hashtext(%s))",
-                    ("functions.cost_settings_schema",),
+                    ("functions.application_schema",),
                 )
                 try:
                     cursor.execute(
@@ -105,7 +109,7 @@ def ensure_cost_settings_schema():
                 finally:
                     cursor.execute(
                         "SELECT pg_advisory_unlock(hashtext(%s))",
-                        ("functions.cost_settings_schema",),
+                        ("functions.application_schema",),
                     )
 
         _schema_ready = True

@@ -3,7 +3,9 @@ CREATE SCHEMA IF NOT EXISTS functions;
 CREATE TABLE IF NOT EXISTS functions.breakfast_data (
     breakfast_data_key text PRIMARY KEY,
 
-    enterprise_id uuid NOT NULL,
+    enterprise_id text NOT NULL
+        CONSTRAINT breakfast_data_hotel_fkey
+        REFERENCES functions.hotels(enterprise_id),
     hotel_name text NOT NULL,
     stay_date date NOT NULL,
 

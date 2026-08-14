@@ -1,7 +1,9 @@
 CREATE TABLE IF NOT EXISTS functions.total_payment_data (
     total_payment_data_key text PRIMARY KEY,
 
-    enterprise_id uuid NOT NULL,
+    enterprise_id text NOT NULL
+        CONSTRAINT total_payment_data_hotel_fkey
+        REFERENCES functions.hotels(enterprise_id),
     hotel_name text,
     stay_date date NOT NULL,
     amount_currency text NOT NULL,

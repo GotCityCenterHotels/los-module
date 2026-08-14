@@ -47,7 +47,9 @@ def fetch_hotels(start_date, end_date, ly_comparison_basis):
                         "ly_comparison_basis": ly_comparison_basis,
                     },
                 )
-                hotels = [row[0] for row in cursor.fetchall()]
+                # Preserve the existing browser contract (display-name codes)
+                # while the SQL resolves each name through the enterprise ID.
+                hotels = [row[1] for row in cursor.fetchall()]
 
         hotel_tuple = tuple(hotels)
         with _cache_lock:
