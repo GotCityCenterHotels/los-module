@@ -27,6 +27,24 @@ class FakeTimer:
     past_due = False
 
 
+class FakeOut:
+    def __init__(self):
+        self.value = None
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeQueueMessage:
+    dequeue_count = 1
+
+    def __init__(self, job_id):
+        self.job_id = job_id
+
+    def get_json(self):
+        return {"jobId": self.job_id}
+
+
 class FakeRequest:
     def __init__(self, body, params=None):
         self.body = body
@@ -77,62 +95,93 @@ class CostDataTriggerTests(unittest.TestCase):
             pipeline.run_dataset("properties")
 
     def test_timer_runs_every_dataset(self):
-        expected = {"status": "success", "results": []}
-
+        output = FakeOut()
         with patch.object(
             function_app,
-            "run_all_datasets",
-            return_value=expected,
-        ) as run_all:
-            function_app.cost_data_timer(FakeTimer())
+            "create_import_job",
+            return_value=({"jobId": "job-1"}, True),
+        ) as create:
+            function_app.cost_data_timer(FakeTimer(), output)
 
-        run_all.assert_called_once_with()
+        create.assert_called_once_with("cost", "all", {"dataset": "all"})
+        self.assertIn("job-1", output.value)
 
     def test_manual_trigger_runs_a_selected_dataset(self):
-        expected = {"dataset": "parking", "export_rows": 2, "import_rows": 2}
-
+        output = FakeOut()
         with patch.object(
             function_app,
-            "run_dataset",
-            return_value=expected,
-        ) as run_one:
+            "create_import_job",
+            return_value=({"jobId": "job-2", "status": "queued"}, True),
+        ) as create:
             response = function_app.cost_data_import(
-                FakeRequest({"dataset": "parking"})
+                FakeRequest({"dataset": "parking"}),
+                output,
             )
 
-        run_one.assert_called_once_with("parking")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn('"dataset":"parking"', response.get_body().decode())
-        self.assertIn('"status":"success"', response.get_body().decode())
+        create.assert_called_once_with(
+            "cost", "parking", {"dataset": "parking"}
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertIn("job-2", output.value)
+        self.assertEqual(response.headers["Retry-After"], "2")
 
     def test_manual_trigger_defaults_to_all_datasets(self):
-        expected = {"status": "success", "results": []}
-
+        output = FakeOut()
         with patch.object(
             function_app,
-            "run_all_datasets",
-            return_value=expected,
-        ) as run_all:
-            response = function_app.cost_data_import(FakeRequest({}))
+            "create_import_job",
+            return_value=({"jobId": "job-3", "status": "queued"}, True),
+        ) as create:
+            response = function_app.cost_data_import(FakeRequest({}), output)
 
-        run_all.assert_called_once_with()
-        self.assertEqual(response.status_code, 200)
+        create.assert_called_once_with("cost", "all", {"dataset": "all"})
+        self.assertEqual(response.status_code, 202)
 
-    def test_manual_trigger_returns_property_validation_failure(self):
-        with patch.object(
-            function_app,
-            "run_dataset",
-            side_effect=RuntimeError("enterprise_current returned no GCCH properties"),
-        ):
+    def test_manual_trigger_rejects_unknown_dataset_before_queueing(self):
+        with patch.object(function_app, "create_import_job") as create:
             response = function_app.cost_data_import(
-                FakeRequest({"dataset": "properties"})
+                FakeRequest({"dataset": "unknown"}), FakeOut()
             )
+        self.assertEqual(response.status_code, 400)
+        create.assert_not_called()
 
-        self.assertEqual(response.status_code, 502)
-        self.assertIn(
-            "enterprise_current returned no GCCH properties",
-            response.get_body().decode(),
-        )
+    def test_worker_executes_cost_job_and_records_completion(self):
+        job = {
+            "job_type": "cost",
+            "operation": "parking",
+            "payload": {"dataset": "parking"},
+        }
+        expected = {"dataset": "parking", "export_rows": 2, "import_rows": 2}
+        with patch.object(
+            function_app, "claim_import_job", return_value=job
+        ), patch.object(
+            function_app, "run_dataset", return_value=expected
+        ) as run, patch.object(
+            function_app, "complete_import_job"
+        ) as complete, patch.object(function_app, "log_pool_stats"):
+            function_app.import_job_worker(FakeQueueMessage("job-4"))
+        run.assert_called_once_with("parking")
+        self.assertEqual(complete.call_args.args[0], "job-4")
+        self.assertEqual(complete.call_args.args[1]["status"], "success")
+
+    def test_worker_marks_transient_failure_for_retry(self):
+        job = {
+            "job_type": "cost",
+            "operation": "parking",
+            "payload": {"dataset": "parking"},
+        }
+        with patch.object(
+            function_app, "claim_import_job", return_value=job
+        ), patch.object(
+            function_app, "run_dataset", side_effect=RuntimeError("source unavailable")
+        ), patch.object(
+            function_app, "fail_import_job"
+        ) as fail, patch.object(function_app, "log_pool_stats"), self.assertRaises(
+            RuntimeError
+        ):
+            function_app.import_job_worker(FakeQueueMessage("job-5"))
+        fail.assert_called_once()
+        self.assertTrue(fail.call_args.args[2])
 
     def test_v2_function_app_registers_manual_and_timer_triggers(self):
         registered_functions = function_app.app.get_functions()
@@ -151,8 +200,11 @@ class CostDataTriggerTests(unittest.TestCase):
         self.assertIn("CostDataTimer", function_names)
         self.assertIn("SupplementDataImport", function_names)
         self.assertIn("SupplementDataTimer", function_names)
+        self.assertIn("ImportJobWorker", function_names)
+        self.assertIn("ImportJobStatus", function_names)
         self.assertIn("costdata/properties", routes)
         self.assertIn("costdata/settings/{enterprise_id}", routes)
+        self.assertIn("imports/{job_id}", routes)
         self.assertNotIn("costdata/settings/hotels", routes)
 
 

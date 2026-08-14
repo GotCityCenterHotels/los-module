@@ -121,7 +121,9 @@ coverage and parity checks pass, set
 Europe/Stockholm and imports the latest view date plus the preceding three dates
 in one booking read and one inventory read.
 
-Manual delta or repair imports use the function-authenticated endpoint:
+Manual delta or repair imports use the function-authenticated endpoint. The
+endpoint returns `202 Accepted` with a job and `statusUrl`; poll that URL until
+the queued worker publishes or fails the import:
 
 ```json
 {"mode":"repair","snapshotFrom":"2026-08-10","snapshotTo":"2026-08-12"}
@@ -129,6 +131,10 @@ Manual delta or repair imports use the function-authenticated endpoint:
 
 Failed runs never replace `functions.supplement_publication`; APIs continue to
 serve the last good PostgreSQL snapshot and show a stale warning after 36 hours.
+
+Both the daily timer and the manual endpoint enqueue work on `import-jobs`.
+See `IMPORT_PERFORMANCE_DEPLOYMENT.md` for queue retry, scaling, and source-plan
+verification details.
 
 Run representative parity checks after backfill:
 

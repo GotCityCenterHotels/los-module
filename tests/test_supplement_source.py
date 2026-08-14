@@ -142,6 +142,16 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         self.assertFalse(profile_supplement_source._has_broad_scan(
             broad_index, {"resource_history"}
         ))
+        self.assertTrue(profile_supplement_source._uses_relation_index_access(
+            broad_index, "resource_history"
+        ))
+        self.assertFalse(profile_supplement_source._uses_relation_index_access(
+            broad_index, "resource_category_history"
+        ))
+        summary = profile_supplement_source._scan_summary(
+            broad_index, {"resource_history"}
+        )
+        self.assertEqual(summary[0]["rowsExamined"], 182311)
 
     def test_migration_contains_partitioned_snapshots_and_publication_pointer(self):
         migration = (

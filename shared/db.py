@@ -53,6 +53,7 @@ def get_export_connection():
             "DB_SSLMODE",
             default="require",
         ),
+        connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
         options="-c default_transaction_read_only=on -c statement_timeout=300000",
         row_factory=dict_row,
     )
@@ -83,4 +84,5 @@ def get_import_connection():
             "POSTGRES_SSLMODE",
             default="require",
         ),
+        connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
     )

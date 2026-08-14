@@ -28,7 +28,16 @@ from services.supplement_service import (
     list_supplement_hotels,
 )
 from services.supplement_sync_service import sync_supplement
-from shared.pipeline import run_all_datasets, run_dataset
+from services.import_job_schema_service import ImportJobSchemaError
+from services.import_job_service import (
+    claim_import_job,
+    complete_import_job,
+    create_import_job,
+    fail_import_job,
+    get_import_job,
+    log_pool_stats,
+)
+from shared.pipeline import DATASETS, run_all_datasets, run_dataset
 
 
 app = func.FunctionApp()
@@ -36,6 +45,8 @@ app = func.FunctionApp()
 VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
 SUPPLEMENT_TIMER_HOUR = 2
 SUPPLEMENT_TIMER_MINUTE = 15
+IMPORT_QUEUE_NAME = "import-jobs"
+IMPORT_MAX_DEQUEUE_COUNT = int(os.environ.get("IMPORT_MAX_DEQUEUE_COUNT", "3"))
 
 
 def parse_date(value: str | None) -> date | None:
@@ -90,6 +101,25 @@ def supplement_timer_due(now_utc=None):
 
 def supplement_disabled_response():
     return json_response({"error": "Supplement live data is not enabled"}, 503)
+
+
+def enqueue_import_job(message, job_type, operation, payload):
+    job, created = create_import_job(job_type, operation, payload)
+    # Re-emit an existing queued job as well. If a previous output binding
+    # failed after the database insert, the next request repairs that orphan.
+    # Duplicate queue deliveries are harmless because claiming is conditional.
+    if created or job["status"] == "queued":
+        message.set(json.dumps({"jobId": job["jobId"]}, separators=(",", ":")))
+    status_url = f'/api/imports/{job["jobId"]}'
+    return json_response(
+        {
+            "job": job,
+            "statusUrl": status_url,
+            "deduplicated": not created,
+        },
+        202,
+        headers={"Location": status_url, "Retry-After": "2"},
+    )
 
 
 def list_parameter(req, name):
@@ -356,8 +386,16 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
     methods=["POST"],
     auth_level=func.AuthLevel.ANONYMOUS,
 )
-def cost_data_import(req: func.HttpRequest) -> func.HttpResponse:
-    """Manually transfer one cost dataset, or every dataset, to Database A."""
+@app.queue_output(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def cost_data_import(
+    req: func.HttpRequest,
+    message: func.Out[str],
+) -> func.HttpResponse:
+    """Queue one cost dataset, or every dataset, for background import."""
     try:
         try:
             body = req.get_json()
@@ -371,31 +409,49 @@ def cost_data_import(req: func.HttpRequest) -> func.HttpResponse:
 
         dataset = body.get("dataset") or req.params.get("dataset") or "all"
         dataset = str(dataset).strip().lower()
-
-        if dataset == "all":
-            result = run_all_datasets()
-        else:
-            dataset_result = run_dataset(dataset)
-            result = {
-                "status": "success",
-                "results": [
-                    {
-                        "status": "success",
-                        **dataset_result,
-                    }
-                ],
-            }
-
-        status_code = 200 if result.get("status") == "success" else 207
-        return json_response(result, status_code)
+        if dataset != "all" and dataset not in DATASETS:
+            return json_response(
+                {"error": f"Unknown dataset '{dataset}'. Allowed: {sorted(DATASETS)}"},
+                400,
+            )
+        return enqueue_import_job(
+            message,
+            "cost",
+            dataset,
+            {"dataset": dataset},
+        )
     except ValueError as error:
         return json_response({"error": str(error)}, 400)
     except RuntimeError as error:
-        logging.exception("Cost data import validation failed")
+        logging.exception("Cost data import queueing failed")
         return json_response({"error": str(error)}, 502)
     except Exception:
-        logging.exception("Manual cost data import failed")
-        return json_response({"error": "Unable to import cost data"}, 500)
+        logging.exception("Manual cost data import queueing failed")
+        return json_response({"error": "Unable to queue cost data import"}, 500)
+
+
+@app.function_name(name="ImportJobStatus")
+@app.route(
+    route="imports/{job_id}",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def import_job_status(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        job = get_import_job(req.route_params.get("job_id"))
+        if job is None:
+            return json_response({"error": "Import job was not found"}, 404)
+        return json_response(
+            {"job": job},
+            headers={"Cache-Control": "no-store"},
+        )
+    except ValueError as error:
+        return json_response({"error": str(error)}, 400)
+    except ImportJobSchemaError as error:
+        return json_response({"error": str(error)}, 503)
+    except Exception:
+        logging.exception("Import job status endpoint failed")
+        return json_response({"error": "Unable to retrieve import job"}, 500)
 
 
 @app.route(
@@ -532,7 +588,15 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
     methods=["POST"],
     auth_level=func.AuthLevel.FUNCTION,
 )
-def supplement_import(req: func.HttpRequest) -> func.HttpResponse:
+@app.queue_output(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def supplement_import(
+    req: func.HttpRequest,
+    message: func.Out[str],
+) -> func.HttpResponse:
     if not supplement_enabled():
         return supplement_disabled_response()
     try:
@@ -544,12 +608,98 @@ def supplement_import(req: func.HttpRequest) -> func.HttpResponse:
         mode = str(body.get("mode") or "delta").strip().lower()
         snapshot_from = parse_date(body.get("snapshotFrom"))
         snapshot_to = parse_date(body.get("snapshotTo"))
-        return json_response(sync_supplement(mode, snapshot_from, snapshot_to))
+        if mode not in {"delta", "repair", "backfill"}:
+            raise ValueError("mode must be delta, repair, or backfill")
+        if mode != "delta":
+            if snapshot_from is None or snapshot_to is None:
+                raise ValueError("repair and backfill require snapshotFrom and snapshotTo")
+            if snapshot_from > snapshot_to:
+                raise ValueError("snapshotFrom cannot be after snapshotTo")
+        return enqueue_import_job(
+            message,
+            "supplement",
+            mode,
+            {
+                "mode": mode,
+                "snapshotFrom": snapshot_from.isoformat() if snapshot_from else None,
+                "snapshotTo": snapshot_to.isoformat() if snapshot_to else None,
+            },
+        )
     except ValueError as error:
         return json_response({"error": str(error)}, 400)
     except Exception:
-        logging.exception("Manual Supplement import failed")
-        return json_response({"error": "Unable to import Supplement data"}, 500)
+        logging.exception("Manual Supplement import queueing failed")
+        return json_response({"error": "Unable to queue Supplement import"}, 500)
+
+
+@app.function_name(name="ImportJobWorker")
+@app.queue_trigger(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def import_job_worker(message: func.QueueMessage) -> None:
+    envelope = message.get_json()
+    job_id = envelope.get("jobId") if isinstance(envelope, dict) else None
+    if not job_id:
+        raise ValueError("Import queue message does not contain jobId")
+    dequeue_count = max(int(getattr(message, "dequeue_count", 1) or 1), 1)
+    job = claim_import_job(job_id, dequeue_count)
+    if job is None:
+        logging.info("Import queue delivery skipped job_id=%s", job_id)
+        return
+
+    started_at = perf_counter()
+    try:
+        payload = job["payload"] or {}
+        if job["job_type"] == "cost":
+            dataset = payload.get("dataset") or job["operation"]
+            if dataset == "all":
+                result = run_all_datasets()
+                if result.get("status") != "success":
+                    raise RuntimeError(f"Cost import completed with failures: {result}")
+            else:
+                dataset_result = run_dataset(dataset)
+                result = {
+                    "status": "success",
+                    "results": [{"status": "success", **dataset_result}],
+                }
+        elif job["job_type"] == "supplement":
+            mode = payload.get("mode") or job["operation"]
+            result = sync_supplement(
+                mode,
+                parse_date(payload.get("snapshotFrom")),
+                parse_date(payload.get("snapshotTo")),
+            )
+        else:
+            raise ValueError(f"Unsupported import job type: {job['job_type']}")
+
+        result = {
+            **result,
+            "durationSeconds": round(perf_counter() - started_at, 3),
+        }
+        complete_import_job(job_id, result)
+        logging.info(
+            "Import job completed job_id=%s job_type=%s operation=%s "
+            "attempt=%s elapsed_seconds=%.3f",
+            job_id,
+            job["job_type"],
+            job["operation"],
+            dequeue_count,
+            perf_counter() - started_at,
+        )
+    except Exception as error:
+        will_retry = dequeue_count < IMPORT_MAX_DEQUEUE_COUNT
+        fail_import_job(job_id, error, will_retry)
+        logging.exception(
+            "Import job failed job_id=%s attempt=%s retry=%s",
+            job_id,
+            dequeue_count,
+            will_retry,
+        )
+        raise
+    finally:
+        log_pool_stats(job_id)
 
 
 @app.function_name(name="CostDataTimer")
@@ -559,19 +709,24 @@ def supplement_import(req: func.HttpRequest) -> func.HttpResponse:
     run_on_startup=False,
     use_monitor=True,
 )
-def cost_data_timer(mytimer: func.TimerRequest) -> None:
-    """Transfer every cost dataset once per day at 00:05."""
+@app.queue_output(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def cost_data_timer(mytimer: func.TimerRequest, message: func.Out[str]) -> None:
+    """Queue every cost dataset once per day at 00:05."""
     if mytimer.past_due:
         logging.warning("CostDataTimer is running later than scheduled")
 
-    logging.info("CostDataTimer started")
-    result = run_all_datasets()
-    logging.info("CostDataTimer finished result=%s", result)
-
-    if result.get("status") != "success":
-        raise RuntimeError(
-            f"CostDataTimer finished with non-success status: {result}"
-        )
+    job, created = create_import_job("cost", "all", {"dataset": "all"})
+    if created or job["status"] == "queued":
+        message.set(json.dumps({"jobId": job["jobId"]}, separators=(",", ":")))
+    logging.info(
+        "CostDataTimer queued job_id=%s deduplicated=%s",
+        job["jobId"],
+        not created,
+    )
 
 
 @app.function_name(name="SupplementDataTimer")
@@ -583,8 +738,16 @@ def cost_data_timer(mytimer: func.TimerRequest) -> None:
     run_on_startup=False,
     use_monitor=True,
 )
-def supplement_data_timer(mytimer: func.TimerRequest) -> None:
-    """Copy bounded Supplement snapshots from integration_db into PostgreSQL."""
+@app.queue_output(
+    arg_name="message",
+    queue_name=IMPORT_QUEUE_NAME,
+    connection="AzureWebJobsStorage",
+)
+def supplement_data_timer(
+    mytimer: func.TimerRequest,
+    message: func.Out[str],
+) -> None:
+    """Queue a bounded Supplement delta from integration_db into PostgreSQL."""
     if not supplement_enabled():
         logging.info("SupplementDataTimer skipped because live data is disabled")
         return
@@ -593,5 +756,15 @@ def supplement_data_timer(mytimer: func.TimerRequest) -> None:
         return
     if mytimer.past_due:
         logging.warning("SupplementDataTimer is running later than scheduled")
-    result = sync_supplement("delta")
-    logging.info("SupplementDataTimer finished result=%s", result)
+    job, created = create_import_job(
+        "supplement",
+        "delta",
+        {"mode": "delta", "snapshotFrom": None, "snapshotTo": None},
+    )
+    if created or job["status"] == "queued":
+        message.set(json.dumps({"jobId": job["jobId"]}, separators=(",", ":")))
+    logging.info(
+        "SupplementDataTimer queued job_id=%s deduplicated=%s",
+        job["jobId"],
+        not created,
+    )

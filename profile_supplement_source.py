@@ -47,6 +47,38 @@ def _uses_index_access(plan):
     )
 
 
+def _uses_relation_index_access(plan, relation_name):
+    relation_name = relation_name.lower()
+    return any(
+        "Index" in node.get("Node Type", "")
+        and str(node.get("Relation Name", "")).lower() == relation_name
+        and int(node.get("Actual Loops") or 0) > 0
+        for node in _walk_plan(plan[0]["Plan"])
+    )
+
+
+def _scan_summary(plan, relation_names):
+    names = {name.lower() for name in relation_names}
+    summary = []
+    for node in _walk_plan(plan[0]["Plan"]):
+        relation = str(node.get("Relation Name", "")).lower()
+        if relation not in names or "Scan" not in node.get("Node Type", ""):
+            continue
+        loops = int(node.get("Actual Loops") or 0)
+        scanned_per_loop = int(node.get("Actual Rows") or 0) + int(
+            node.get("Rows Removed by Filter") or 0
+        ) + int(node.get("Rows Removed by Index Recheck") or 0)
+        summary.append({
+            "relation": relation,
+            "nodeType": node.get("Node Type"),
+            "indexName": node.get("Index Name"),
+            "loops": loops,
+            "rowsExamined": scanned_per_loop * loops,
+            "indexCondition": node.get("Index Cond"),
+        })
+    return summary
+
+
 def _has_broad_scan(plan, relation_names, include_index_scans=False):
     names = {name.lower() for name in relation_names}
     for node in _walk_plan(plan[0]["Plan"]):
@@ -80,17 +112,25 @@ def main():
         add_months(arguments.snapshot_date, 18),
     )
     inventory_plan = explain_inventory(arguments.snapshot_date)
+    history_relations = {
+        "resource_history",
+        "resource_category_history",
+        "resource_category_assignment_history",
+    }
     booking_passed = (
         _uses_bounded_access(booking_plan, "start_utc")
         and not _has_broad_scan(booking_plan, {"order_item_current"})
     )
     inventory_passed = (
-        _uses_index_access(inventory_plan)
-        and not _has_broad_scan(inventory_plan, {
-            "resource_history",
-            "resource_category_history",
-            "resource_category_assignment_history",
-        }, include_index_scans=True)
+        all(
+            _uses_relation_index_access(inventory_plan, relation)
+            for relation in history_relations
+        )
+        and not _has_broad_scan(
+            inventory_plan,
+            history_relations,
+            include_index_scans=True,
+        )
     )
     report = {
         "boundedBookingLifecycleRead": booking_plan,
@@ -98,6 +138,14 @@ def main():
         "checks": {
             "bookingReadPrunesOrUsesStayDateIndex": booking_passed,
             "inventoryReadUsesIndex": inventory_passed,
+        },
+        "performance": {
+            "bookingExecutionMs": booking_plan[0].get("Execution Time"),
+            "inventoryExecutionMs": inventory_plan[0].get("Execution Time"),
+            "inventoryHistoryScans": _scan_summary(
+                inventory_plan,
+                history_relations,
+            ),
         },
         "rolloutGate": "pass" if booking_passed and inventory_passed else "blocked",
     }

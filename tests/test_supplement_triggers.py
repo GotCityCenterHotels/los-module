@@ -33,6 +33,14 @@ class FakeTimer:
     past_due = False
 
 
+class FakeOut:
+    def __init__(self):
+        self.value = None
+
+    def set(self, value):
+        self.value = value
+
+
 class SupplementTriggerTests(unittest.TestCase):
     def test_disabled_grid_does_not_touch_any_database_service(self):
         with patch.dict(os.environ, {"SUPPLEMENT_LIVE_ENABLED": "false"}), patch.object(
@@ -68,31 +76,44 @@ class SupplementTriggerTests(unittest.TestCase):
         self.assertEqual(arguments["inventory_basis"], "physical")
 
     def test_authenticated_import_forwards_repair_dates(self):
-        expected = {"status": "published", "runId": 4}
         request = FakeRequest(body={
             "mode": "repair",
             "snapshotFrom": "2026-08-10",
             "snapshotTo": "2026-08-12",
         })
+        output = FakeOut()
         with patch.dict(os.environ, {"SUPPLEMENT_LIVE_ENABLED": "true"}), patch.object(
             function_app,
-            "sync_supplement",
-            return_value=expected,
-        ) as sync:
-            response = function_app.supplement_import(request)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(sync.call_args.args[0], "repair")
-        self.assertEqual(sync.call_args.args[1].isoformat(), "2026-08-10")
-        self.assertEqual(sync.call_args.args[2].isoformat(), "2026-08-12")
+            "create_import_job",
+            return_value=({"jobId": "job-6", "status": "queued"}, True),
+        ) as create:
+            response = function_app.supplement_import(request, output)
+        self.assertEqual(response.status_code, 202)
+        create.assert_called_once_with(
+            "supplement",
+            "repair",
+            {
+                "mode": "repair",
+                "snapshotFrom": "2026-08-10",
+                "snapshotTo": "2026-08-12",
+            },
+        )
+        self.assertIn("job-6", output.value)
 
     def test_daily_timer_runs_only_when_enabled(self):
+        output = FakeOut()
         with patch.dict(os.environ, {"SUPPLEMENT_LIVE_ENABLED": "true"}), patch.object(
             function_app,
-            "sync_supplement",
-            return_value={"status": "published"},
-        ) as sync, patch.object(function_app, "supplement_timer_due", return_value=True):
-            function_app.supplement_data_timer(FakeTimer())
-        sync.assert_called_once_with("delta")
+            "create_import_job",
+            return_value=({"jobId": "job-7"}, True),
+        ) as create, patch.object(function_app, "supplement_timer_due", return_value=True):
+            function_app.supplement_data_timer(FakeTimer(), output)
+        create.assert_called_once_with(
+            "supplement",
+            "delta",
+            {"mode": "delta", "snapshotFrom": None, "snapshotTo": None},
+        )
+        self.assertIn("job-7", output.value)
 
     def test_stockholm_timer_selects_one_utc_candidate_across_dst(self):
         cases = (

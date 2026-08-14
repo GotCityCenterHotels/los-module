@@ -31,12 +31,19 @@ connection_string = make_conninfo(
         "POSTGRES_SSLMODE",
         default="require",
     ),
+    connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
+    application_name="los-functions-app",
 )
 
 
 cost_pool = ConnectionPool(
     conninfo=connection_string,
     min_size=0,
-    max_size=5,
+    max_size=int(os.environ.get("APP_DB_POOL_MAX_SIZE", "4")),
+    timeout=float(os.environ.get("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "10")),
+    max_waiting=int(os.environ.get("DB_POOL_MAX_WAITING", "16")),
+    max_idle=float(os.environ.get("DB_POOL_MAX_IDLE_SECONDS", "300")),
+    max_lifetime=float(os.environ.get("DB_POOL_MAX_LIFETIME_SECONDS", "1800")),
+    check=ConnectionPool.check_connection,
     open=True,
 )
