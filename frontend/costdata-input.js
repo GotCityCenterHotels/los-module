@@ -46,17 +46,11 @@
     }
     // Which group each value is already assigned to, so the picker can show it
     // as taken rather than silently allowing a duplicate across groups.
+    // The pure logic lives in costdata-match.js so it can be unit tested.
     function assignmentIndex(matchType, exceptGroup, exceptRuleIndex) {
-        const assigned = new Map();
-        model.distributionGroups.forEach((group, groupIndex) => {
-            group.rules.forEach((rule, ruleIndex) => {
-                if (rule.matchType !== matchType) return;
-                if (groupIndex === exceptGroup && ruleIndex === exceptRuleIndex) return;
-                const value = String(rule.matchValue || "").trim();
-                if (value) assigned.set(value.toLowerCase(), group.groupName || `Group ${groupIndex + 1}`);
-            });
-        });
-        return assigned;
+        return CostMatch.assignmentIndex(
+            model.distributionGroups, matchType, exceptGroup, exceptRuleIndex
+        );
     }
 
     function toFixedDecimals(value) {
@@ -261,10 +255,21 @@
             bindFields(row,group); root.append(row);
         }); emptyMessage(root,"No distribution groups yet.");
     }
-    // A datalist gives native type-to-search without a custom dropdown widget.
-    // Values already used by another group are listed in a trailing "Already
-    // assigned" section showing their group, and are rejected on selection -
-    // the same value in two groups would make the cost percentage ambiguous.
+    // Only one popup may be open at a time; a single document listener closes it
+    // rather than each row registering its own (which would leak on re-render).
+    let openCombo = null;
+    function closeOpenCombo() {
+        if (openCombo) { openCombo.close(); openCombo = null; }
+    }
+    document.addEventListener("pointerdown", (event) => {
+        if (openCombo && !openCombo.root.contains(event.target)) closeOpenCombo();
+    });
+
+    // A real listbox, because a native <datalist> can neither disable an option
+    // nor group options into sections. Values already used by another group get
+    // their own "Already assigned" section at the bottom, greyed out and
+    // labelled with the owning group, and cannot be selected - the same value in
+    // two groups would make the cost percentage ambiguous.
     function buildMatchRow(group, groupIndex, rule, ruleIndex) {
         const match = document.createElement("div");
         match.className = "match-row";
@@ -274,52 +279,160 @@
         type.add(new Option("Channel", "channel", false, rule.matchType === "channel"));
         type.add(new Option("Rate", "rate", false, rule.matchType === "rate"));
 
+        const combo = document.createElement("div");
+        combo.className = "combo";
+
         const listId = `match-options-${groupIndex}-${ruleIndex}`;
         const value = document.createElement("input");
+        value.className = "combo-input";
+        value.id = `match-value-${groupIndex}-${ruleIndex}`;
         value.setAttribute("aria-label", "Match value");
-        value.setAttribute("list", listId);
-        value.required = true;
+        value.setAttribute("role", "combobox");
+        value.setAttribute("aria-expanded", "false");
+        value.setAttribute("aria-controls", listId);
+        value.setAttribute("aria-autocomplete", "list");
+        value.setAttribute("autocomplete", "off");
+        // Deliberately NOT required. Clicking "+ Add rate or channel match" and
+        // then leaving the row blank is a normal thing to do, and marking it
+        // required made the whole form invalid - so saving everything else
+        // silently failed. Blank rows are pruned on save instead.
         value.value = rule.matchValue || "";
         value.placeholder = "Search rates and channels...";
 
-        const list = document.createElement("datalist");
-        list.id = listId;
+        const popup = document.createElement("div");
+        popup.className = "combo-popup";
+        popup.id = listId;
+        popup.setAttribute("role", "listbox");
+        popup.hidden = true;
 
         const note = document.createElement("small");
         note.className = "match-note";
 
-        function refreshOptions() {
-            const available = optionsFor(rule.matchType);
-            const assigned = assignmentIndex(rule.matchType, groupIndex, ruleIndex);
-            list.replaceChildren();
+        let selectable = [];
+        let activeIndex = -1;
 
-            const free = available.filter(item => !assigned.has(item.name.toLowerCase()));
-            const taken = available.filter(item => assigned.has(item.name.toLowerCase()));
-
-            for (const item of free) list.append(new Option(item.name, item.name));
-            // Native datalist cannot disable an option, so assigned values are
-            // pushed to the bottom and labelled with their group instead.
-            for (const item of taken) {
-                const option = new Option(
-                    `${item.name} - already in ${assigned.get(item.name.toLowerCase())}`,
-                    item.name
-                );
-                option.dataset.assigned = "true";
-                list.append(option);
+        function setActive(index) {
+            activeIndex = index;
+            for (const option of popup.querySelectorAll('[role="option"]')) {
+                option.classList.remove("is-active");
             }
-
-            if (!available.length) {
-                note.textContent = sources && sources.error
-                    ? "Could not load this hotel's list - type the value manually."
-                    : "No values found for this hotel - type the value manually.";
+            const active = selectable[index];
+            if (active) {
+                active.classList.add("is-active");
+                value.setAttribute("aria-activedescendant", active.id);
+                active.scrollIntoView({block: "nearest"});
             }
             else {
-                note.textContent = `${free.length} available, ${taken.length} already assigned`;
+                value.removeAttribute("aria-activedescendant");
             }
         }
 
-        function applyValue(raw) {
-            const entered = String(raw || "").trim();
+        function buildOption(item, owner, optionIndex) {
+            const option = document.createElement("div");
+            option.id = `${listId}-opt-${optionIndex}`;
+            option.setAttribute("role", "option");
+            option.className = "combo-option";
+
+            const label = document.createElement("span");
+            label.className = "combo-option-name";
+            label.textContent = item.name;
+            option.append(label);
+
+            if (owner) {
+                // Greyed out and inert: aria-disabled keeps it announced but
+                // unselectable, and it is skipped by keyboard navigation.
+                option.classList.add("is-assigned");
+                option.setAttribute("aria-disabled", "true");
+                option.setAttribute("aria-selected", "false");
+                const badge = document.createElement("span");
+                badge.className = "combo-option-group";
+                badge.textContent = owner;
+                option.append(badge);
+            }
+            else {
+                option.setAttribute("aria-selected", String(
+                    item.name.toLowerCase() === String(value.value).trim().toLowerCase()
+                ));
+                option.addEventListener("pointerdown", (event) => {
+                    event.preventDefault();
+                    commit(item.name);
+                });
+            }
+            return option;
+        }
+
+        function renderPopup() {
+            const available = optionsFor(rule.matchType);
+            const assigned = assignmentIndex(rule.matchType, groupIndex, ruleIndex);
+            const {free, taken} = CostMatch.partitionOptions(available, assigned, value.value);
+            const matching = free.concat(taken);
+
+            popup.replaceChildren();
+            let optionIndex = 0;
+
+            if (free.length) {
+                const section = document.createElement("div");
+                section.setAttribute("role", "group");
+                section.setAttribute("aria-label", "Available");
+                if (taken.length) {
+                    const heading = document.createElement("div");
+                    heading.className = "combo-section";
+                    heading.textContent = "Available";
+                    section.append(heading);
+                }
+                for (const item of free) section.append(buildOption(item, null, optionIndex++));
+                popup.append(section);
+            }
+
+            if (taken.length) {
+                const section = document.createElement("div");
+                section.setAttribute("role", "group");
+                section.setAttribute("aria-label", "Already assigned");
+                const heading = document.createElement("div");
+                heading.className = "combo-section";
+                heading.textContent = "Already assigned";
+                section.append(heading);
+                for (const item of taken) {
+                    section.append(buildOption(item, item.owner, optionIndex++));
+                }
+                popup.append(section);
+            }
+
+            if (!matching.length) {
+                const empty = document.createElement("div");
+                empty.className = "combo-empty";
+                empty.textContent = available.length
+                    ? "No match - press Enter to use what you typed."
+                    : (sources && sources.error
+                        ? "This hotel's list could not be loaded. Type the value manually."
+                        : "No values found for this hotel. Type the value manually.");
+                popup.append(empty);
+            }
+
+            selectable = Array.from(popup.querySelectorAll('[role="option"]:not([aria-disabled="true"])'));
+            setActive(selectable.length ? 0 : -1);
+            note.textContent = available.length
+                ? `${free.length} available, ${taken.length} already assigned`
+                : "";
+        }
+
+        function open() {
+            if (!popup.hidden) return;
+            closeOpenCombo();
+            popup.hidden = false;
+            value.setAttribute("aria-expanded", "true");
+            openCombo = api;
+            renderPopup();
+        }
+        function close() {
+            popup.hidden = true;
+            value.setAttribute("aria-expanded", "false");
+            value.removeAttribute("aria-activedescendant");
+            activeIndex = -1;
+        }
+        const api = {root: combo, close};
+
+        function validate(entered) {
             const assigned = assignmentIndex(rule.matchType, groupIndex, ruleIndex);
             const owner = assigned.get(entered.toLowerCase());
             if (owner) {
@@ -330,21 +443,66 @@
             else {
                 value.setCustomValidity("");
                 match.classList.remove("is-duplicate");
-                refreshOptions();
             }
-            rule.matchValue = entered;
-            setDirty(true);
         }
+
+        function commit(name) {
+            value.value = name;
+            rule.matchValue = name;
+            validate(name);
+            close();
+            openCombo = null;
+            setDirty(true);
+            // Another row's list changes the moment this one is assigned.
+            refreshSiblingCombos();
+        }
+
+        value.addEventListener("focus", open);
+        value.addEventListener("input", () => {
+            rule.matchValue = value.value.trim();
+            validate(rule.matchValue);
+            setDirty(true);
+            open();
+            renderPopup();
+            // Clearing this row frees its value for the others.
+            refreshSiblingCombos();
+        });
+        value.addEventListener("keydown", (event) => {
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                if (popup.hidden) { open(); return; }
+                if (!selectable.length) return;
+                const step = event.key === "ArrowDown" ? 1 : -1;
+                setActive((activeIndex + step + selectable.length) % selectable.length);
+            }
+            else if (event.key === "Enter") {
+                if (!popup.hidden && selectable[activeIndex]) {
+                    event.preventDefault();
+                    commit(selectable[activeIndex].querySelector(".combo-option-name").textContent);
+                }
+                else if (!popup.hidden) {
+                    event.preventDefault();
+                    close();
+                }
+            }
+            else if (event.key === "Escape") {
+                if (!popup.hidden) { event.stopPropagation(); close(); openCombo = null; }
+            }
+            else if (event.key === "Tab") {
+                close();
+                openCombo = null;
+            }
+        });
 
         type.onchange = () => {
             rule.matchType = type.value;
             rule.matchValue = "";
             value.value = "";
             value.setCustomValidity("");
-            refreshOptions();
+            match.classList.remove("is-duplicate");
+            if (!popup.hidden) renderPopup();
             setDirty(true);
         };
-        value.oninput = () => applyValue(value.value);
 
         const remove = document.createElement("button");
         remove.type = "button";
@@ -356,10 +514,27 @@
             setDirty(true);
         };
 
-        refreshOptions();
-        if (rule.matchValue) applyValue(rule.matchValue);
-        match.append(type, value, list, remove, note);
+        if (rule.matchValue) validate(rule.matchValue);
+        combo.append(value, popup);
+        match.append(type, combo, remove, note);
+        // Re-validating matters as much as re-rendering: if the value that made
+        // this row a duplicate is removed elsewhere, a stale customValidity
+        // would keep blocking the save with a message about a conflict that no
+        // longer exists.
+        match.refreshCombo = () => {
+            if (rule.matchValue) validate(rule.matchValue);
+            else { value.setCustomValidity(""); match.classList.remove("is-duplicate"); }
+            if (!popup.hidden) renderPopup();
+        };
         return match;
+    }
+
+    // Assigning a value in one group must immediately update every other row,
+    // without a full re-render (which would close the popup being used).
+    function refreshSiblingCombos() {
+        for (const row of document.querySelectorAll(".match-row")) {
+            if (typeof row.refreshCombo === "function") row.refreshCombo();
+        }
     }
 
     function renderRows(key) {
@@ -404,7 +579,19 @@
     function emptyMessage(root,text){if(!root.children.length){const p=document.createElement("p");p.className="rules-empty";p.textContent=text;root.append(p)}}
     function removeRow(key,index){model[key].splice(index,1);key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)}
     function escapeHtml(value){return String(value??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;")}
-    function collect(){for(const input of form.querySelectorAll("[name]"))model.profile[input.name]=input.value;return model}
+    function collect() {
+        for (const input of form.querySelectorAll("[name]")) {
+            model.profile[input.name] = input.value;
+        }
+        // A half-finished match row carries no meaning and the backend rejects a
+        // blank match value outright, which previously failed the entire save.
+        for (const group of model.distributionGroups) {
+            group.rules = (group.rules || []).filter(
+                rule => String(rule.matchValue || "").trim()
+            );
+        }
+        return model;
+    }
 
     function sectionOf(element) {
         const section = element.closest("[data-settings-section]");
