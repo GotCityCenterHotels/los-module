@@ -51,6 +51,34 @@ class SupplementSourceSafetyTests(unittest.TestCase):
         self.assertIn("h.id = resource_key.id", query)
         self.assertIn("limit 1", query)
 
+    def test_inventory_source_carries_the_mews_category_ordering(self):
+        query = " ".join(
+            supplement_source._render_inventory_sql("ordering", "ordering")
+            .lower().split()
+        )
+        self.assertIn('coalesce(c."ordering", 2147483647)::int as category_ordering', query)
+        self.assertIn('h."ordering" as category_ordering', query)
+        self.assertIn("group by r.tenant_key, c.enterprise_id, e.name, c.id, "
+                      'c.space_name, c."ordering"', query)
+        self.assertIn(
+            "order by snapshot_date, hotel_name, category_ordering, category_name",
+            query,
+        )
+
+    def test_a_mirror_without_the_ordering_column_still_produces_valid_sql(self):
+        # Both halves of the UNION must keep the same column list, or the
+        # whole inventory read fails rather than merely losing the ordering.
+        query = " ".join(supplement_source.INVENTORY_SQL.lower().split())
+        self.assertIn("2147483647::int as category_ordering", query)
+        self.assertIn("null::int as category_ordering", query)
+        self.assertNotIn("{", query)
+        self.assertEqual(
+            query.count("as category_ordering"),
+            # current_inventory, the history lateral, category_asof's outer
+            # select is a passthrough, and historical_inventory.
+            3,
+        )
+
     def test_database_a_rejects_integration_db_name(self):
         settings = {
             "POSTGRES_HOST": "localhost",

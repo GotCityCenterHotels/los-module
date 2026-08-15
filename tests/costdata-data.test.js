@@ -82,3 +82,33 @@ test("summaries keep currencies separate and total operational values", () => {
 test("unknown datasets fail explicitly", () => {
     assert.throws(() => CostData.aggregate("unknown", []), /Unknown cost dataset/);
 });
+
+test("every grain buckets to the first date of its period", () => {
+    // Same keying as los-data.js, so a period label means the same thing on
+    // every page: weeks start on Monday.
+    assert.equal(CostData.periodKey("2026-01-08", "day"), "2026-01-08");
+    assert.equal(CostData.periodKey("2026-01-08", "week"), "2026-01-05");
+    assert.equal(CostData.periodKey("2026-01-05", "week"), "2026-01-05");
+    assert.equal(CostData.periodKey("2026-01-04", "week"), "2025-12-29");
+    assert.equal(CostData.periodKey("2026-01-08", "month"), "2026-01-01");
+    assert.equal(CostData.periodKey("2026-01-08", "year"), "2026-01-01");
+});
+
+test("weekly aggregation collapses a Monday-to-Sunday span into one row", () => {
+    // 2 Jan (Friday) and 4 Jan (Sunday) share the week beginning 29 Dec;
+    // 20 Jan starts its own.
+    const rows = CostData.aggregate("roomRevenue", [
+        ...data.roomRevenue,
+        {
+            stayDate: "2026-01-04",
+            hotelName: "A",
+            amountCurrency: "SEK",
+            roomRevenueInclProducts1Net: "10.00"
+        }
+    ], { grain: "week", hotelName: "A" });
+
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].stayDate, "2025-12-29");
+    assert.equal(rows[0].roomRevenueInclProducts1Net, 135.75);
+    assert.equal(rows[1].stayDate, "2026-01-19");
+});

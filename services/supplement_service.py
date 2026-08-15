@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
+from queries.supplement_source import fetch_pickup_history
 from services.supplement_schema_service import ensure_supplement_schema
 
 #s
@@ -524,33 +525,127 @@ def _detail_rows(cursor, table, hotel_code, stay_date, category, as_of=None):
     return cursor.fetchall()
 
 
-def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
+def _stored_inventory_by_snapshot(
+    cursor, hotel_code, stay_date, category, maximum_snapshot_date
+):
+    """Per-snapshot inventory for the days a sync actually materialised.
+
+    Deliberately has no lower bound: the old "snapshot_date BETWEEN stay_date -
+    366 AND stay_date + 7" clipped the curve at a year regardless of what was
+    asked for.
+    """
     category_clause = (
         "AND i.space_room_category_id = %(category)s::uuid" if category else ""
     )
     cursor.execute(f"""
-        SELECT i.snapshot_date, coalesce(sum(c.assigned_rooms), 0) AS assigned_rooms,
-               coalesce(sum(c.room_revenue), 0) AS room_revenue,
+        SELECT i.snapshot_date,
                sum(i.total_space) AS total_space,
                sum(i.space_to_sell) AS space_to_sell,
                CASE WHEN bool_or(i.inventory_quality = 'approximated-current')
                     THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
         FROM functions.supplement_snapshot_inventory i
-        LEFT JOIN functions.supplement_snapshot_category c
-          USING (snapshot_date, stay_date, hotel_code, space_room_category_id)
         WHERE i.hotel_code = %(hotel_code)s AND i.stay_date = %(stay_date)s
-          AND i.snapshot_date BETWEEN (%(stay_date)s - 366) AND (%(stay_date)s + 7)
           AND i.snapshot_date <= %(maximum_snapshot_date)s
           {category_clause}
         GROUP BY i.snapshot_date
-        ORDER BY i.snapshot_date
     """, {
         "hotel_code": hotel_code,
         "stay_date": stay_date,
         "category": category,
         "maximum_snapshot_date": maximum_snapshot_date,
     })
-    return cursor.fetchall()
+    return {row["snapshot_date"]: row for row in cursor.fetchall()}
+
+
+def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
+    """Full pickup curve for one stay date, back to the first booking.
+
+    Rooms and revenue are rebuilt from reservation lifecycle in integration_db,
+    so the curve reaches as far back as bookings exist rather than as far back as
+    the snapshot pipeline happens to have run. Inventory still comes from stored
+    snapshots where a sync materialised them; days without one fall back to the
+    latest known inventory and are flagged approximated-current, matching how
+    pre-2026-02-27 inventory is already reported.
+    """
+    history = fetch_pickup_history(
+        hotel_code, stay_date, category, maximum_snapshot_date
+    )
+    if not history:
+        return []
+
+    stored = _stored_inventory_by_snapshot(
+        cursor, hotel_code, stay_date, category, maximum_snapshot_date
+    )
+    fallback = _latest_inventory(cursor, hotel_code, stay_date, category)
+
+    rows = []
+    for point in history:
+        snapshot_date = point["snapshot_date"]
+        inventory = stored.get(snapshot_date)
+        if inventory is None:
+            inventory = {
+                "total_space": fallback.get("total_space"),
+                "space_to_sell": fallback.get("space_to_sell"),
+                "inventory_quality": "approximated-current",
+            }
+        rows.append({
+            "snapshot_date": snapshot_date,
+            "assigned_rooms": point["assigned_rooms"],
+            "room_revenue": point["room_revenue"],
+            "total_space": inventory["total_space"],
+            "space_to_sell": inventory["space_to_sell"],
+            "inventory_quality": inventory["inventory_quality"],
+        })
+    return rows
+
+
+def _latest_inventory(cursor, hotel_code, stay_date, category):
+    category_clause = (
+        "AND space_room_category_id = %(category)s::uuid" if category else ""
+    )
+    cursor.execute(f"""
+        SELECT sum(total_space) AS total_space,
+               sum(space_to_sell) AS space_to_sell
+        FROM functions.supplement_latest_inventory
+        WHERE hotel_code = %(hotel_code)s AND stay_date = %(stay_date)s
+          {category_clause}
+    """, {
+        "hotel_code": hotel_code,
+        "stay_date": stay_date,
+        "category": category,
+    })
+    return cursor.fetchone() or {}
+
+
+def _slice_pickup(points, days_before_stay):
+    """Keep the requested lookback window. None means the whole history.
+
+    Slicing happens here rather than in SQL so the cached series is always the
+    full curve: changing the window never re-queries the source, and there is no
+    ceiling in the query path that could silently clip a large request.
+    """
+    if days_before_stay is None:
+        return points
+    return [
+        point for point in points
+        if point["daysBeforeStay"] <= days_before_stay
+    ]
+
+
+def _windowed_payload(payload, days_before_stay):
+    """A view of the cached full-history payload for one lookback window."""
+    pickup = _slice_pickup(payload["pickup"], days_before_stay)
+    comparison = _slice_pickup(payload["comparisonPickup"], days_before_stay)
+    available = payload.get("pickupHistoryDays")
+    return {
+        **payload,
+        "pickup": pickup,
+        "comparisonPickup": comparison,
+        # What the client asked for, and what actually exists, so the control can
+        # show the true ceiling instead of pretending an empty tail is data.
+        "daysBeforeStay": days_before_stay,
+        "pickupHistoryDays": available,
+    }
 
 
 def fetch_supplement_detail(
@@ -559,11 +654,14 @@ def fetch_supplement_detail(
     category,
     ly_comparison_basis,
     inventory_basis="sellable",
+    days_before_stay=None,
 ):
     if ly_comparison_basis not in VALID_LY_COMPARISONS:
         raise ValueError("lyComparisonBasis must be sameDate or sameWeekday")
     if inventory_basis not in VALID_INVENTORY_BASES:
         raise ValueError("inventoryBasis must be sellable or physical")
+    if days_before_stay is not None and days_before_stay < 1:
+        raise ValueError("daysBeforeStay must be at least 1")
     today = stockholm_today()
     minimum_allowed = add_months(today, -36)
     maximum_allowed = add_months(today, 18)
@@ -584,7 +682,9 @@ def fetch_supplement_detail(
                 cached = _detail_cache.get(cache_key)
             if cached is not None:
                 logging.info("Supplement detail cache hit run_id=%s", publication["run_id"])
-                return cached
+                # The cache holds the complete curve, so changing the lookback
+                # window is a slice of memory rather than another source query.
+                return _windowed_payload(cached, days_before_stay)
             logging.info("Supplement detail cache miss run_id=%s", publication["run_id"])
             comparison_date = shift_last_year(stay_date, ly_comparison_basis)
             coverage = status.get("coverage")
@@ -734,9 +834,16 @@ def fetch_supplement_detail(
                 "breakdown": breakdown,
                 "pickup": pickup,
                 "comparisonPickup": comparison_pickup,
+                # How far the reconstructed history actually reaches, so the
+                # lookback control can bound itself to real data.
+                "pickupHistoryDays": (
+                    max(point["daysBeforeStay"] for point in pickup)
+                    if pickup else 0
+                ),
             }
             with _detail_cache_lock:
                 if len(_detail_cache) >= 256:
                     _detail_cache.clear()
+                # Cache the complete curve; window slicing happens on the way out.
                 _detail_cache[cache_key] = payload
-            return payload
+            return _windowed_payload(payload, days_before_stay)

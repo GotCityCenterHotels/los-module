@@ -273,7 +273,7 @@ function renderTable(rows) {
         const row = document.createElement("tr");
         if (item.hotelCode === "Total") row.classList.add("total-row");
         row.innerHTML = `
-            <td>${escapeHtml(item.periodKey)}</td>
+            <td>${escapeHtml(LosFormat.periodLabel(item.periodKey, grainInput.value))}</td>
             <td>${escapeHtml(item.hotelCode)}</td>
             <td>${formatDecimal(current?.averageLos ?? null)}</td>
             <td>${formatDecimal(ly?.averageLos ?? null)}</td>
@@ -289,16 +289,11 @@ function renderTable(rows) {
     resultsSection.hidden = false;
 }
 
+// Month and year buckets carry their own year in the label ("Jan 2026"), so
+// they return no separate year band - it would only repeat what is already
+// under the tick. Day and week buckets still band the year below the axis.
 function getChartLabel(periodKey) {
-    const date = new Date(`${periodKey}T00:00:00Z`);
-    const month = date.toLocaleString("en", { month: "short", timeZone: "UTC" }).toUpperCase();
-    const day = String(date.getUTCDate()).padStart(2, "0");
-    const year = String(date.getUTCFullYear());
-
-    if (grainInput.value === "year") return { primary: year, year: null };
-    if (grainInput.value === "month") return { primary: month, year };
-    if (grainInput.value === "week") return { primary: `${day} ${month}`, year };
-    return { primary: `${day} ${month}`, year };
+    return LosFormat.periodLabelParts(periodKey, grainInput.value);
 }
 
 function tooltipScenario(label, color, row) {
@@ -362,7 +357,9 @@ function renderChart(rows) {
         svg.appendChild(label);
     }
 
-    const labelStep = grainInput.value === "month" && rows.length <= 18
+    // "Jan 2026" is roughly twice as wide as the old "JAN", so a full year of
+    // monthly ticks still fits but anything longer has to thin out.
+    const labelStep = grainInput.value === "month" && rows.length <= 12
         ? 1
         : Math.max(1, Math.ceil(rows.length / 10));
     rows.forEach((row, index) => {
@@ -376,10 +373,10 @@ function renderChart(rows) {
         svg.appendChild(label);
     });
 
-    if (grainInput.value !== "year") {
+    if (getChartLabel(rows[0].periodKey).year !== null) {
         const yearGroups = [];
         rows.forEach((row, index) => {
-            const year = row.periodKey.slice(0, 4);
+            const year = getChartLabel(row.periodKey).year;
             const last = yearGroups.at(-1);
             if (last?.year === year) last.end = index;
             else yearGroups.push({ year, start: index, end: index });
@@ -469,7 +466,10 @@ function renderChart(rows) {
         hitArea.setAttribute("height", plotHeight);
         hitArea.setAttribute("class", "chart-hit-area");
         hitArea.setAttribute("tabindex", "0");
-        hitArea.setAttribute("aria-label", `Show data for ${row.periodKey}`);
+        hitArea.setAttribute(
+            "aria-label",
+            `Show data for ${LosFormat.periodLabel(row.periodKey, grainInput.value)}`
+        );
         hitArea.addEventListener("mouseenter", () => showPoint(index));
         hitArea.addEventListener("focus", () => showPoint(index));
         hitArea.addEventListener("mouseleave", hidePoint);

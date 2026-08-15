@@ -1,11 +1,30 @@
 import logging
 
-from decimal import Decimal, InvalidOperation
+from collections import defaultdict
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
 from services.cost_schema_service import ensure_cost_settings_schema
 from shared.db import get_export_connection
+
+
+# Every SEK amount in this application is whole kronor. Rounding happens here,
+# on the way in, so the stored value is exactly the value shown in the editor
+# and a total of rounded rows cannot drift from the rounded total. This set is
+# the server-side twin of MONEY_FIELDS in frontend/los-format.js - the two must
+# stay in step.
+MONEY_FIELDS = frozenset({
+    "cleaningCostPerMinute",
+    "receptionCostPerHour",
+    "breakfastFoodCostPerGuest",
+    "breakfastStaffCostPerHour",
+    "linenCost",
+})
+
+
+def _round_sek(value):
+    return Decimal(value).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
 
 
 PROFILE_FIELDS = (
@@ -360,7 +379,10 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
 
             collections = {}
             for name, query in {
-                "cleaningCategories": "SELECT category_name, resource_category_id, occupancy, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE enterprise_id = %s ORDER BY category_name, occupancy, cleaning_category_id",
+                # sort_order holds the Mews category ordering captured when the
+                # rows were saved. Ordering by category_name here would undo it
+                # on every reload.
+                "cleaningCategories": "SELECT category_name, resource_category_id, occupancy, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE enterprise_id = %s ORDER BY sort_order, category_name, occupancy, cleaning_category_id",
                 "arrivalTiers": "SELECT min_arrivals, max_arrivals, reception_hours FROM functions.cost_arrival_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, arrival_tier_id",
                 "breakfastTiers": "SELECT min_guests, max_guests, staff_hours FROM functions.cost_breakfast_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, breakfast_tier_id",
             }.items():
@@ -374,7 +396,93 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
     return {"enterpriseId": enterprise_id, "hotelName": resolved_name, "profile": profile, "distributionGroups": distribution, **collections}
 
 
-def _number(value, label, maximum=None, integer=False):
+COLLECTION_QUERIES = {
+    "cleaningCategories": """
+        SELECT enterprise_id, category_name, resource_category_id, occupancy,
+               cleaning_minutes, linen_cost
+        FROM functions.cost_cleaning_categories
+        ORDER BY enterprise_id, sort_order, category_name, occupancy,
+                 cleaning_category_id
+    """,
+    "arrivalTiers": """
+        SELECT enterprise_id, min_arrivals, max_arrivals, reception_hours
+        FROM functions.cost_arrival_staffing_tiers
+        ORDER BY enterprise_id, sort_order, arrival_tier_id
+    """,
+    "breakfastTiers": """
+        SELECT enterprise_id, min_guests, max_guests, staff_hours
+        FROM functions.cost_breakfast_staffing_tiers
+        ORDER BY enterprise_id, sort_order, breakfast_tier_id
+    """,
+}
+
+
+def fetch_all_cost_settings():
+    """Every property's saved cost rulebook, keyed by hotel name.
+
+    The Cost Data dashboard costs facts that are keyed by hotel name, across
+    every property at once, so it needs the whole rulebook in one round trip
+    rather than one request per property. Nothing is defaulted here: a property
+    that has never been saved simply has no entry, and the caller says so
+    instead of costing it with invented numbers.
+    """
+    ensure_cost_settings_schema()
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("""
+                SELECT settings.*, hotel.hotel_name
+                FROM functions.cost_property_settings settings
+                JOIN functions.hotels hotel USING (enterprise_id)
+            """)
+            profiles = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT g.enterprise_id, g.group_name, g.cost_percent,
+                    coalesce(json_agg(json_build_object('matchType', r.match_type, 'matchValue', r.match_value)
+                        ORDER BY r.distribution_rule_id) FILTER (WHERE r.distribution_rule_id IS NOT NULL), '[]') AS rules
+                FROM functions.cost_distribution_groups g
+                LEFT JOIN functions.cost_distribution_rules r USING (distribution_group_id)
+                GROUP BY g.distribution_group_id
+                ORDER BY g.enterprise_id, g.sort_order, g.distribution_group_id
+            """)
+            groups = cursor.fetchall()
+
+            collections = {}
+            for name, query in COLLECTION_QUERIES.items():
+                cursor.execute(query)
+                collections[name] = cursor.fetchall()
+
+    by_enterprise = defaultdict(lambda: defaultdict(list))
+    for row in groups:
+        by_enterprise[row["enterprise_id"]]["distributionGroups"].append(
+            _json_row({key: value for key, value in row.items() if key != "enterprise_id"})
+        )
+    for name, rows in collections.items():
+        for row in rows:
+            by_enterprise[row["enterprise_id"]][name].append(
+                _json_row({key: value for key, value in row.items() if key != "enterprise_id"})
+            )
+
+    settings_by_hotel = {}
+    for profile_row in profiles:
+        enterprise_id = profile_row["enterprise_id"]
+        hotel_name = profile_row["hotel_name"]
+        profile = dict(DEFAULT_PROFILE)
+        profile.update(_json_row(profile_row))
+        for key in ("hotelName", "enterpriseId", "updatedAt"):
+            profile.pop(key, None)
+        owned = by_enterprise.get(enterprise_id, {})
+        settings_by_hotel[hotel_name] = {
+            "enterpriseId": enterprise_id,
+            "hotelName": hotel_name,
+            "profile": profile,
+            "distributionGroups": owned.get("distributionGroups", []),
+            **{name: owned.get(name, []) for name in COLLECTION_QUERIES},
+        }
+    return settings_by_hotel
+
+
+def _number(value, label, maximum=None, integer=False, money=False):
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError):
@@ -389,7 +497,11 @@ def _number(value, label, maximum=None, integer=False):
         raise ValueError(f"{label} must be{suffix}")
     if integer and result != result.to_integral_value():
         raise ValueError(f"{label} must be a whole number")
-    return int(result) if integer else result
+    if integer:
+        return int(result)
+    # Rounding after the range checks, so 100.4 on a percent field is still
+    # rejected rather than quietly becoming 100.
+    return _round_sek(result) if money else result
 
 
 def _required_text(value, label, max_length=200):
@@ -438,7 +550,12 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
                 raise ValueError("Breakfast calculation basis must be guests or products")
             clean_profile[key] = basis
             continue
-        clean_profile[key] = _number(profile.get(key, DEFAULT_PROFILE[key]), key, 100 if key in percent_fields else None)
+        clean_profile[key] = _number(
+            profile.get(key, DEFAULT_PROFILE[key]),
+            key,
+            100 if key in percent_fields else None,
+            money=key in MONEY_FIELDS,
+        )
 
     result = {"enterpriseId": enterprise_id, "hotelName": hotel_name, "profile": clean_profile}
     groups = payload.get("distributionGroups") or []
@@ -468,7 +585,7 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
         ),
         "occupancy": _number(row.get("occupancy"), "Occupancy", integer=True),
         "cleaningMinutes": _number(row.get("cleaningMinutes"), "Cleaning minutes"),
-        "linenCost": _number(row.get("linenCost"), "Linen cost"),
+        "linenCost": _number(row.get("linenCost"), "Linen cost", money=True),
     } for row in cleaning]
     if any(row["occupancy"] < 1 for row in result["cleaningCategories"]):
         raise ValueError("Cleaning occupancy must be at least 1")

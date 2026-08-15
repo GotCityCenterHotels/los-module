@@ -129,6 +129,48 @@ class SupplementSyncOrchestrationTests(unittest.TestCase):
         self.assertNotIn("INSERT INTO functions.supplement_publication", sql)
         self.assertIn("SET status = 'failed'", sql)
 
+    def test_the_mews_category_ordering_reaches_the_room_category_mirror(self):
+        # Space categories are listed in the Mews ordering everywhere in the
+        # app, so sort_order has to carry it - it used to be hardcoded to 0,
+        # which left every list alphabetical.
+        class StageCursor(FakeCursor):
+            def execute(self, query, parameters=None):
+                super().execute(query, parameters)
+                if "min(stay_date)" in " ".join(str(query).split()):
+                    self.current = {
+                        "minimum_stay_date": date(2026, 8, 6),
+                        "maximum_stay_date": date(2028, 2, 13),
+                    }
+
+        events = []
+        sync_service._publish_stage(StageCursor(events), 41, [date(2026, 8, 13)])
+
+        upsert = next(
+            event[1] for event in events
+            if event[0] == "execute"
+            and "INSERT INTO functions.supplement_room_categories" in event[1]
+        )
+        self.assertIn("source.category_ordering, now()", upsert)
+        self.assertIn("sort_order = EXCLUDED.sort_order", upsert)
+
+    def test_the_inventory_stage_carries_the_category_ordering(self):
+        row = {
+            "snapshot_date": date(2026, 8, 13), "tenant_key": "GCCH",
+            "enterprise_id": "p-1", "hotel_name": " Hotel A ",
+            "category_id": "cat-1", "category_name": " Double ",
+            "category_ordering": 3, "physical_inventory": 10,
+            "sellable_inventory": 9, "inventory_quality": "exact",
+        }
+        self.assertEqual(sync_service._inventory_stage_row(row)[6], 3)
+
+        # A mirror with no ordering column sends nothing; the category must
+        # sort after the ordered ones rather than jumping to the front.
+        del row["category_ordering"]
+        self.assertEqual(
+            sync_service._inventory_stage_row(row)[6],
+            sync_service.UNORDERED_CATEGORY_RANK,
+        )
+
     def test_advisory_lock_blocks_overlapping_run_before_source_access(self):
         connection = FakeConnection(acquired=False)
         with patch.object(sync_service, "ensure_supplement_schema"), patch.object(

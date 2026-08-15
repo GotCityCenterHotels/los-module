@@ -20,6 +20,7 @@ from services.los_schema_service import LosSchemaError
 from services.los_sync_service import sync_los
 from services.cost_data_service import fetch_cost_data
 from services.cost_settings_service import (
+    fetch_all_cost_settings,
     fetch_cost_settings,
     list_cost_settings_hotels,
     save_cost_settings,
@@ -430,6 +431,16 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("Cost data endpoint failed")
         return json_response({"error": "Unable to retrieve cost data"}, 500)
 
+    # The GOP statement on this page is computed entirely from the saved Cost
+    # Input rulebook, so it travels with the facts. A failure here must not take
+    # the facts down with it: the page still shows the datasets, and says which
+    # properties it could not cost.
+    try:
+        cost_settings = fetch_all_cost_settings()
+    except Exception:
+        logging.exception("Cost settings lookup failed for the cost data endpoint")
+        cost_settings = {}
+
     hotels = sorted(
         {
             row["hotelName"]
@@ -449,6 +460,7 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             "rowCounts": row_counts,
             "hotels": hotels,
             "data": datasets,
+            "costSettings": cost_settings,
         },
     )
 
@@ -733,6 +745,24 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
     category = (req.params.get("roomCategory") or "").strip() or None
     ly_basis = req.params.get("lyComparisonBasis") or "sameDate"
     inventory_basis = req.params.get("inventoryBasis") or "sellable"
+    # Lookback window for the pickup curve, in days before the stay date.
+    # Omitted or "all" means the complete history back to the first booking -
+    # deliberately not a large sentinel number, so nothing clips it.
+    days_before_raw = (req.params.get("daysBeforeStay") or "").strip().lower()
+    days_before_stay = None
+    if days_before_raw and days_before_raw != "all":
+        try:
+            days_before_stay = int(days_before_raw)
+        except ValueError:
+            return json_response(
+                {"error": "daysBeforeStay must be a whole number of days or 'all'"},
+                400,
+            )
+        if days_before_stay < 1:
+            return json_response(
+                {"error": "daysBeforeStay must be at least 1"},
+                400,
+            )
     if not hotel_code or stay_date is None:
         return json_response(
             {"error": "hotelCode and a YYYY-MM-DD stayDate are required"},
@@ -741,11 +771,12 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
     try:
         started_at = perf_counter()
         payload = fetch_supplement_detail(
-            hotel_code, stay_date, category, ly_basis, inventory_basis
+            hotel_code, stay_date, category, ly_basis, inventory_basis,
+            days_before_stay,
         )
         request_key = "|".join([
             hotel_code, stay_date.isoformat(), category or "", ly_basis,
-            inventory_basis,
+            inventory_basis, days_before_raw or "all",
         ])
         response = supplement_cached_response(req, payload, request_key)
         logging.info(

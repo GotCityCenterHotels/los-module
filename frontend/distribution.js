@@ -175,7 +175,7 @@ function renderRow(row) {
     card.className = "distribution-card";
     card.innerHTML = `
         <div class="distribution-heading">
-            <div><strong>${escapeHtml(row.periodKey)}</strong><span>${escapeHtml(row.hotelCode)}</span></div>
+            <div><strong>${escapeHtml(LosFormat.periodLabel(row.periodKey, grain.value))}</strong><span>${escapeHtml(row.hotelCode)}</span></div>
             <div>${scenarioLabel(row.scenario)} &middot; ${formatNumber(row.total)}
                 ${metric.value === "bookings" ? "reservations" : "nights"}</div>
         </div>

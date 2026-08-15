@@ -43,6 +43,12 @@
         detailBreakdown: document.getElementById("detailBreakdown"),
         pickupCurve: document.getElementById("pickupCurve"),
         pickupCoverage: document.getElementById("pickupCoverage"),
+        pickupWindowValue: document.getElementById("pickupWindowValue"),
+        pickupWindowSlider: document.getElementById("pickupWindowSlider"),
+        pickupWindowUp: document.getElementById("pickupWindowUp"),
+        pickupWindowDown: document.getElementById("pickupWindowDown"),
+        pickupWindowAll: document.getElementById("pickupWindowAll"),
+        pickupWindowHint: document.getElementById("pickupWindowHint"),
         pickupCurrentLabel: document.getElementById("pickupCurrentLabel"),
         pickupComparisonLabel: document.getElementById("pickupComparisonLabel"),
         closeDialog: document.getElementById("closeDetailDialog"),
@@ -70,6 +76,11 @@
         endDate: Data.formatDateKey(new Date(todayUtc.getTime() + 3 * 86_400_000)),
         lyComparisonType: "sameDate",
         inventoryBasis: "sellable",
+        // Pickup lookback in days before the stay date; null means the complete
+        // history back to the first booking.
+        pickupWindowDays: 30,
+        pickupWindowAll: false,
+        pickupRequest: null,
         differenceMode: "percent",
         pastLyDiff: true,
         futureSpitDiff: false,
@@ -323,21 +334,143 @@
             const value = roundedMaximum * ratio;
             return `<line x1="${margin.left}" x2="${width - margin.right}" y1="${y(value)}" y2="${y(value)}"></line><text x="${margin.left - 12}" y="${y(value) + 4}">${Math.round(value)}</text>`;
         }).join("");
-        const xTicks = [...new Set([0, .25, .5, .75, 1].map((ratio) =>
-            Math.round(maximumDay - daySpan * ratio)
-        ))];
+        // Tick density follows the window: a 7 day view labels every day or two,
+        // a two year view lands on round intervals instead of arbitrary numbers
+        // like "417d". Ticks are always whole days and never overlap.
+        const niceSteps = [1, 2, 5, 7, 10, 14, 30, 60, 90, 180, 365, 730];
+        const targetTicks = 6;
+        const step = niceSteps.find((candidate) => daySpan / candidate <= targetTicks)
+            || Math.ceil(daySpan / targetTicks);
+        const xTicks = [];
+        for (let day = Math.max(0, minimumDay); day <= maximumDay; day += step) {
+            xTicks.push(day);
+        }
+        if (xTicks[xTicks.length - 1] !== maximumDay) xTicks.push(maximumDay);
+        if (minimumDay <= 0 && !xTicks.includes(0)) xTicks.unshift(0);
+
         const dayLabel = (day) => day === 0 ? "Stay" : day < 0
             ? `+${Math.abs(day)}d` : `${day}d`;
         const xGrid = xTicks.map((day) =>
             `<line class="pickup-x-grid" x1="${x(day)}" x2="${x(day)}" y1="${margin.top}" y2="${baseline}"></line><text class="pickup-x-label" x="${x(day)}" y="${baseline + 25}">${dayLabel(day)}</text>`
         ).join("");
+        // The line always uses every point; only the markers thin out, so a long
+        // window stays a readable curve rather than a solid band of circles.
         const pointMarks = (points, className) => {
-            const step = Math.max(1, Math.ceil(points.length / 24));
-            return points.filter((_point, index) => index % step === 0 || index === points.length - 1)
+            const markerStep = Math.max(1, Math.ceil(points.length / 24));
+            return points.filter((_point, index) => index % markerStep === 0 || index === points.length - 1)
                 .map((point) => `<circle class="${className}" cx="${x(point.daysBeforeStay)}" cy="${y(point.assignedRooms)}" r="3"><title>${escapeHtml(point.viewDate)}: ${point.assignedRooms} rooms</title></circle>`).join("");
         };
 
         return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Rooms on the books by days before stay"><title>Pickup pace from ${maximumDay} to ${minimumDay} days before stay</title><g class="pickup-grid">${yGrid}${xGrid}</g>${areaPath ? `<path class="pickup-current-area" d="${areaPath}"></path>` : ""}${comparisonPath ? `<path class="pickup-comparison-line" d="${comparisonPath}"></path>` : ""}${currentPath ? `<path class="pickup-current-line" d="${currentPath}"></path>` : ""}<g class="pickup-points">${pointMarks(comparison, "pickup-comparison-point")}${pointMarks(current, "pickup-current-point")}</g><text class="pickup-axis-title" x="${margin.left + plotWidth / 2}" y="${height - 8}">Days before stay</text></svg>`;
+    }
+
+    // The lookback control. Every whole day is reachable: the slider covers the
+    // common range, the number input and steppers reach any value including far
+    // beyond the slider's maximum, and "from first booking" removes the bound
+    // entirely rather than substituting a large number.
+    function syncWindowControls() {
+        const all = state.pickupWindowAll;
+        elements.pickupWindowAll.checked = all;
+        elements.pickupWindowValue.disabled = all;
+        elements.pickupWindowSlider.disabled = all;
+        elements.pickupWindowUp.disabled = all;
+        elements.pickupWindowDown.disabled = all || state.pickupWindowDays <= 1;
+        if (!all) {
+            elements.pickupWindowValue.value = String(state.pickupWindowDays);
+            // Keep the slider usable when the value exceeds its range instead of
+            // silently clamping the request.
+            elements.pickupWindowSlider.max = String(
+                Math.max(365, state.pickupWindowDays)
+            );
+            elements.pickupWindowSlider.value = String(state.pickupWindowDays);
+        }
+    }
+
+    function describeWindow(payload) {
+        if (!payload) return "";
+        const available = payload.pickupHistoryDays || 0;
+        if (state.pickupWindowAll) {
+            return available
+                ? `Showing the full history: ${available} days before the stay date.`
+                : "No pickup history for this stay date yet.";
+        }
+        if (available && state.pickupWindowDays > available) {
+            return `History starts ${available} days before the stay date, so that is all this window can show.`;
+        }
+        return `Showing ${state.pickupWindowDays} days before the stay date, of ${available} available.`;
+    }
+
+    function setPickupWindow(days, useAll) {
+        const nextAll = Boolean(useAll);
+        const nextDays = Math.max(1, Math.round(Number(days) || 1));
+        if (nextAll === state.pickupWindowAll && nextDays === state.pickupWindowDays) {
+            syncWindowControls();
+            return;
+        }
+        state.pickupWindowAll = nextAll;
+        state.pickupWindowDays = nextDays;
+        syncWindowControls();
+        if (state.pickupRequest) refreshDetail();
+    }
+
+    function bindWindowControls() {
+        elements.pickupWindowSlider.addEventListener("input", () => {
+            setPickupWindow(elements.pickupWindowSlider.value, false);
+        });
+        elements.pickupWindowValue.addEventListener("change", () => {
+            setPickupWindow(elements.pickupWindowValue.value, false);
+        });
+        elements.pickupWindowUp.addEventListener("click", () => {
+            setPickupWindow(state.pickupWindowDays + 1, false);
+        });
+        elements.pickupWindowDown.addEventListener("click", () => {
+            setPickupWindow(state.pickupWindowDays - 1, false);
+        });
+        elements.pickupWindowAll.addEventListener("change", () => {
+            setPickupWindow(state.pickupWindowDays, elements.pickupWindowAll.checked);
+        });
+    }
+
+    async function refreshDetail() {
+        if (!state.pickupRequest) return;
+        elements.pickupCurve.innerHTML = '<div class="pickup-loading" aria-hidden="true"></div>';
+        try {
+            const payload = await Data.fetchDetail({
+                ...state.pickupRequest,
+                daysBeforeStay: state.pickupWindowAll ? "all" : state.pickupWindowDays
+            }, API_BASE_URL);
+            renderPickup(payload);
+        }
+        catch (error) {
+            elements.pickupCurve.innerHTML = "";
+            elements.pickupCoverage.textContent =
+                `Could not reload the pickup curve: ${error.message}`;
+        }
+    }
+
+    function renderPickup(payload) {
+        elements.pickupCurve.innerHTML = curveSvg(payload.pickup, payload.comparisonPickup);
+        const currentLast = payload.pickup.at(-1);
+        const comparisonLast = payload.comparisonPickup.at(-1);
+        elements.pickupCurrentLabel.textContent = currentLast
+            ? `Current · ${currentLast.assignedRooms} rooms` : "Current · no history";
+        elements.pickupComparisonLabel.textContent = comparisonLast
+            ? `${payload.comparison} · ${comparisonLast.assignedRooms} rooms`
+            : payload.comparisonAvailable
+                ? `${payload.comparison} · no history`
+                : `${payload.comparison} · backfill needed`;
+        const coverageParts = [];
+        if (payload.pickup.length) {
+            coverageParts.push(`Current: ${payload.pickup.length} day${payload.pickup.length === 1 ? "" : "s"}`);
+        }
+        if (payload.comparisonPickup.length) {
+            coverageParts.push(`${payload.comparison}: ${payload.comparisonPickup.length} day${payload.comparisonPickup.length === 1 ? "" : "s"}`);
+        }
+        if (!payload.comparisonAvailable) {
+            coverageParts.push(`${payload.comparison} comparison is not available yet`);
+        }
+        elements.pickupCoverage.textContent = coverageParts.join(" · ");
+        elements.pickupWindowHint.textContent = describeWindow(payload);
     }
 
     async function openDetail(button) {
@@ -359,12 +492,17 @@
         elements.dialogFootnote.textContent = "Loading from the latest published PostgreSQL snapshot.";
         elements.dialog.showModal();
         try {
-            const payload = await Data.fetchDetail({
+            state.pickupRequest = {
                 hotelCode: button.dataset.detailHotel,
                 stayDate: button.dataset.detailDate,
                 roomCategory: button.dataset.detailCategory || "",
                 lyComparisonBasis: state.lyComparisonType,
                 inventoryBasis: state.inventoryBasis
+            };
+            syncWindowControls();
+            const payload = await Data.fetchDetail({
+                ...state.pickupRequest,
+                daysBeforeStay: state.pickupWindowAll ? "all" : state.pickupWindowDays
             }, API_BASE_URL);
             const hotelName = state.hotels.find(({ code }) => code === payload.hotelCode)?.name || payload.hotelCode;
             const categoryName = (state.categoriesByHotel[payload.hotelCode] || [])
@@ -386,29 +524,7 @@
             elements.detailBreakdown.innerHTML = payload.breakdown.length
                 ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAssignedRooms, "adr") : "—"}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAveragePrice, "adr") : "—"}</td></tr>`).join("")
                 : '<tr><td colspan="5">No assigned rooms for this stay date.</td></tr>';
-            elements.pickupCurve.innerHTML = curveSvg(payload.pickup, payload.comparisonPickup);
-            const currentLast = payload.pickup.at(-1);
-            const comparisonLast = payload.comparisonPickup.at(-1);
-            elements.pickupCurrentLabel.textContent = currentLast
-                ? `Current · ${currentLast.assignedRooms} rooms` : "Current · no history";
-            elements.pickupComparisonLabel.textContent = comparisonLast
-                ? `${payload.comparison} · ${comparisonLast.assignedRooms} rooms`
-                : payload.comparisonAvailable
-                    ? `${payload.comparison} · no history`
-                    : `${payload.comparison} · backfill needed`;
-            const coverageParts = [];
-            if (payload.pickup.length) {
-                coverageParts.push(`Current: ${payload.pickup.length} snapshot${payload.pickup.length === 1 ? "" : "s"}`);
-            }
-            if (payload.comparisonPickup.length) {
-                coverageParts.push(`${payload.comparison}: ${payload.comparisonPickup.length} snapshot${payload.comparisonPickup.length === 1 ? "" : "s"}`);
-            }
-            if (!payload.comparisonAvailable) {
-                coverageParts.push(`${payload.comparison} comparison is not backfilled yet`);
-            }
-            elements.pickupCoverage.textContent = coverageParts.length
-                ? coverageParts.join(" · ")
-                : "Pickup coverage will appear as daily snapshots are backfilled.";
+            renderPickup(payload);
             elements.dialogFootnote.textContent = payload.inventoryQuality === "approximated-current"
                 ? `Published through ${payload.dataAsOf} · inventory is approximated from current rooms before ${payload.inventoryExactFrom}.`
                 : `Published through ${payload.dataAsOf} · served from PostgreSQL.`;
@@ -477,5 +593,7 @@
         if (event.target === elements.dialog) closeDetailDialog();
     });
 
+    bindWindowControls();
+    syncWindowControls();
     initialize();
 }());

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Supplement Revenue Management</title>
-    <link rel="stylesheet" href="styles.css?v=20260815-2">
+    <link rel="stylesheet" href="styles.css?v=20260815-5">
 </head>
 <body>
     <main class="container supplement-container">
@@ -153,6 +153,23 @@
                         <span><i class="pickup-comparison"></i><b id="pickupComparisonLabel">Comparison</b></span>
                     </div>
                 </div>
+                <div class="pickup-window" role="group" aria-labelledby="pickupWindowLabel">
+                    <label id="pickupWindowLabel" for="pickupWindowValue">View time before stay date</label>
+                    <div class="pickup-window-controls">
+                        <button type="button" id="pickupWindowDown" class="pickup-step" aria-label="One day less">&minus;</button>
+                        <input type="number" id="pickupWindowValue" min="1" step="1" value="30"
+                               inputmode="numeric" aria-describedby="pickupWindowHint">
+                        <span class="pickup-window-unit">days</span>
+                        <button type="button" id="pickupWindowUp" class="pickup-step" aria-label="One day more">+</button>
+                        <input type="range" id="pickupWindowSlider" min="1" max="365" step="1" value="30"
+                               aria-label="Days before stay date">
+                        <label class="pickup-window-all">
+                            <input type="checkbox" id="pickupWindowAll">
+                            <span>From first booking</span>
+                        </label>
+                    </div>
+                    <p id="pickupWindowHint" class="pickup-window-hint"></p>
+                </div>
                 <div id="pickupCurve" class="pickup-curve"></div>
                 <p id="pickupCoverage" class="pickup-coverage"></p>
             </section>
@@ -174,7 +191,7 @@
         <p id="dialogFootnote" class="dialog-footnote">Loaded from the latest published PostgreSQL snapshot.</p>
     </dialog>
 
-    <script src="supplement-data.js?v=20260814-6"></script>
-    <script src="supplement.js?v=20260814-6"></script>
+    <script src="supplement-data.js?v=20260815-1"></script>
+    <script src="supplement.js?v=20260815-1"></script>
 </body>
 </html>

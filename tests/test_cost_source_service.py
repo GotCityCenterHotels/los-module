@@ -147,6 +147,48 @@ class CleaningCategoryTests(unittest.TestCase):
                 cost_source_service.list_cleaning_categories("hotel-1")
         self.assertIn("resource_category_current", str(raised.exception))
 
+    def test_categories_are_ordered_by_the_mews_ordering_not_by_name(self):
+        columns = {"resource_category_current": {
+            "id", "enterprise_id", "space_name", "capacity", "extra_capacity",
+            "type", "is_active", "ordering",
+        }}
+        rows = [{
+            "category_id": "cat-1", "category_name": "Suite",
+            "capacity": 2, "extra_capacity": 0, "category_ordering": 1,
+        }, {
+            "category_id": "cat-2", "category_name": "Double",
+            "capacity": 2, "extra_capacity": 0, "category_ordering": 2,
+        }]
+        categories, cursor = self._run(columns, rows)
+
+        query = " ".join(cursor.executed[-1].lower().split())
+        self.assertIn('coalesce(category."ordering"', query)
+        self.assertIn("order by category_ordering, category_name", query)
+        # Source order is preserved, so the Mews ordering reaches the editor.
+        self.assertEqual(
+            [category["categoryName"] for category in categories],
+            ["Suite", "Double"],
+        )
+        self.assertEqual(categories[0]["ordering"], 1)
+
+    def test_a_mirror_without_the_ordering_column_falls_back_to_the_name(self):
+        columns = {"resource_category_current": {
+            "id", "enterprise_id", "space_name", "capacity", "extra_capacity",
+            "type", "is_active",
+        }}
+        rows = [{
+            "category_id": "cat-1", "category_name": "Double",
+            "capacity": 2, "extra_capacity": 0,
+        }]
+        categories, cursor = self._run(columns, rows)
+
+        query = " ".join(cursor.executed[-1].lower().split())
+        self.assertIn("order by category_ordering, category_name", query)
+        self.assertEqual(
+            categories[0]["ordering"],
+            cost_source_service.UNORDERED_CATEGORY_RANK,
+        )
+
 
 class ChannelLookupTests(unittest.TestCase):
     def setUp(self):

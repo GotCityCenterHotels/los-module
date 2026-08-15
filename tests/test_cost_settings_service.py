@@ -1,5 +1,8 @@
 import os
+import re
 import unittest
+from decimal import Decimal
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -376,6 +379,144 @@ class CostSettingsValidationTests(unittest.TestCase):
             cost_settings_service.validate_cost_settings("00000000-0000-0000-0000-000000000001", "Hotel A", {
                 "profile": {"cardCostPercent": 101}
             })
+
+
+class MoneyRoundingTests(unittest.TestCase):
+    """SEK is whole kronor everywhere, so it is stored that way."""
+
+    def test_money_fields_are_stored_as_whole_kronor(self):
+        result = cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {
+                "profile": {
+                    "cleaningCostPerMinute": "5.49",
+                    "receptionCostPerHour": "312.50",
+                    "breakfastFoodCostPerGuest": "41.4",
+                    "breakfastStaffCostPerHour": "249.5",
+                },
+                "cleaningCategories": [{
+                    "categoryName": "Double", "occupancy": 1,
+                    "cleaningMinutes": "22.5", "linenCost": "74.6",
+                }],
+            }
+        )
+
+        profile = result["profile"]
+        self.assertEqual(profile["cleaningCostPerMinute"], Decimal("5"))
+        # .50 rounds up, so a half krona never disappears into the floor.
+        self.assertEqual(profile["receptionCostPerHour"], Decimal("313"))
+        self.assertEqual(profile["breakfastFoodCostPerGuest"], Decimal("41"))
+        self.assertEqual(profile["breakfastStaffCostPerHour"], Decimal("250"))
+        self.assertEqual(result["cleaningCategories"][0]["linenCost"], Decimal("75"))
+        # Minutes and percentages are not money and keep their precision.
+        self.assertEqual(
+            result["cleaningCategories"][0]["cleaningMinutes"], Decimal("22.5")
+        )
+
+    def test_percentages_keep_their_decimals(self):
+        result = cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {"profile": {"cardCostPercent": "2.75"}}
+        )
+        self.assertEqual(result["profile"]["cardCostPercent"], Decimal("2.75"))
+
+    def test_out_of_range_percentages_are_still_rejected_before_rounding(self):
+        # 100.4 must not become a valid 100 on the way through.
+        with self.assertRaisesRegex(ValueError, "between 0 and 100"):
+            cost_settings_service.validate_cost_settings(
+                "property-42", "Hotel A", {"profile": {"cardCostPercent": "100.4"}}
+            )
+
+    def test_the_money_field_set_matches_the_shared_frontend_registry(self):
+        registry = Path(__file__).resolve().parent.parent / "frontend" / "los-format.js"
+        source = registry.read_text(encoding="utf-8")
+        block = source.split("MONEY_FIELDS = Object.freeze(new Set([", 1)[1]
+        block = block.split("]))", 1)[0]
+        frontend_fields = set(re.findall(r'"([A-Za-z]+)"', block))
+
+        self.assertEqual(frontend_fields, set(cost_settings_service.MONEY_FIELDS))
+
+
+class BulkCostSettingsTests(unittest.TestCase):
+    """The dashboard costs every property in one round trip."""
+
+    class Cursor:
+        def __init__(self, results):
+            self.results = results
+            self.executed = []
+            self._result = []
+
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+        def execute(self, sql, parameters=None):
+            self.executed.append(sql)
+            self._result = self.results.pop(0) if self.results else []
+
+        def fetchall(self): return self._result
+
+    class Connection:
+        def __init__(self, cursor): self._cursor = cursor
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def cursor(self, **_kwargs): return self._cursor
+
+    def test_settings_are_keyed_by_hotel_name_with_their_own_collections(self):
+        cursor = self.Cursor([
+            [
+                {"enterprise_id": "p-1", "hotel_name": "Hotel A",
+                 "currency": "SEK", "card_cost_percent": Decimal("2.5")},
+                {"enterprise_id": "p-2", "hotel_name": "Hotel B",
+                 "currency": "SEK"},
+            ],
+            [{"enterprise_id": "p-1", "group_name": "OTA",
+              "cost_percent": Decimal("14"), "rules": []}],
+            [{"enterprise_id": "p-1", "category_name": "Double", "occupancy": 1,
+              "resource_category_id": "cat-1", "cleaning_minutes": Decimal("30"),
+              "linen_cost": Decimal("75")}],
+            [{"enterprise_id": "p-2", "min_arrivals": 0, "max_arrivals": None,
+              "reception_hours": Decimal("8")}],
+            [{"enterprise_id": "p-1", "min_guests": 0, "max_guests": 30,
+              "staff_hours": Decimal("4")}],
+        ])
+
+        class Pool:
+            def connection(inner): return BulkCostSettingsTests.Connection(cursor)
+
+        with patch.object(
+            cost_settings_service, "ensure_cost_settings_schema",
+        ), patch.object(cost_settings_service, "cost_pool", Pool()):
+            result = cost_settings_service.fetch_all_cost_settings()
+
+        self.assertEqual(sorted(result), ["Hotel A", "Hotel B"])
+        self.assertEqual(result["Hotel A"]["enterpriseId"], "p-1")
+        self.assertEqual(result["Hotel A"]["profile"]["cardCostPercent"], "2.5")
+        # A property that saved nothing gets defaults for the profile only, and
+        # empty collections - never another property's rows.
+        self.assertEqual(result["Hotel B"]["profile"]["cardCostPercent"], "2")
+        self.assertEqual(result["Hotel A"]["distributionGroups"][0]["groupName"], "OTA")
+        self.assertEqual(result["Hotel B"]["distributionGroups"], [])
+        self.assertEqual(result["Hotel A"]["cleaningCategories"][0]["linenCost"], "75")
+        self.assertEqual(result["Hotel B"]["cleaningCategories"], [])
+        self.assertEqual(result["Hotel A"]["arrivalTiers"], [])
+        self.assertEqual(result["Hotel B"]["arrivalTiers"][0]["receptionHours"], "8")
+        self.assertEqual(result["Hotel A"]["breakfastTiers"][0]["maxGuests"], 30)
+        # enterprise_id is the join key, not part of the payload.
+        self.assertNotIn("enterpriseId", result["Hotel A"]["profile"])
+
+    def test_every_collection_is_read_in_the_mews_category_ordering(self):
+        cursor = self.Cursor([[], [], [], [], []])
+
+        class Pool:
+            def connection(inner): return BulkCostSettingsTests.Connection(cursor)
+
+        with patch.object(
+            cost_settings_service, "ensure_cost_settings_schema",
+        ), patch.object(cost_settings_service, "cost_pool", Pool()):
+            cost_settings_service.fetch_all_cost_settings()
+
+        cleaning = " ".join(
+            cost_settings_service.COLLECTION_QUERIES["cleaningCategories"].lower().split()
+        )
+        self.assertIn("order by enterprise_id, sort_order, category_name", cleaning)
 
 
 class NumericGuardTests(unittest.TestCase):

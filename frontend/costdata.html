@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data</title>
-    <link rel="stylesheet" href="styles.css?v=20260815-2">
+    <link rel="stylesheet" href="styles.css?v=20260815-5">
 </head>
 <body>
     <main class="container cost-workspace">
@@ -47,6 +47,7 @@
                 <label for="costGrain">Group by</label>
                 <select id="costGrain">
                     <option value="day">Day</option>
+                    <option value="week">Week</option>
                     <option value="month" selected>Month</option>
                     <option value="year">Year</option>
                 </select>
@@ -61,27 +62,23 @@
             <span id="costScope"></span>
         </div>
 
-        <section id="costSummary" class="cost-summary" aria-label="Selected totals" hidden>
-            <div class="cost-metric">
-                <span>Room revenue incl. products</span>
-                <strong id="summaryRevenue">—</strong>
+        <section id="gopStatement" class="gop-statement" aria-labelledby="gopTitle" hidden>
+            <div class="gop-heading">
+                <div>
+                    <span class="section-eyebrow">NET · EXCL. VAT</span>
+                    <h2 id="gopTitle">Gross Operating Profit</h2>
+                </div>
+                <span id="gopScopeNote" class="gop-scope"></span>
             </div>
-            <div class="cost-metric">
-                <span>Total payments gross</span>
-                <strong id="summaryPayments">—</strong>
-            </div>
-            <div class="cost-metric">
-                <span>Breakfast net cost</span>
-                <strong id="summaryBreakfast">—</strong>
-            </div>
-            <div class="cost-metric">
-                <span>Parking net value</span>
-                <strong id="summaryParking">—</strong>
-            </div>
-            <div class="cost-metric movement-metric">
-                <span>Guest movement</span>
-                <strong id="summaryMovement">—</strong>
-            </div>
+
+            <table class="gop-table">
+                <caption class="visually-hidden">
+                    Net revenue, operating costs, and gross operating profit for the selected scope
+                </caption>
+                <tbody id="gopRows"></tbody>
+            </table>
+
+            <ul id="gopFlags" class="gop-flags" aria-label="Calculation notes" hidden></ul>
         </section>
 
         <section id="costResults" class="cost-results" hidden>
@@ -114,7 +111,8 @@
     </main>
 
     <script src="los-api.js?v=20260811-2"></script>
-    <script src="costdata-data.js?v=20260812-1"></script>
-    <script src="costdata.js?v=20260812-1"></script>
+    <script src="los-format.js?v=20260815-5"></script>
+    <script src="costdata-data.js?v=20260815-5"></script>
+    <script src="costdata.js?v=20260815-5"></script>
 </body>
 </html>

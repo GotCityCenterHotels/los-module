@@ -999,56 +999,113 @@ tbody tr:hover {
     text-align: right;
 }
 
-.cost-summary {
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-
+/* Gross Operating Profit statement. Net figures only: revenue reads as ink,
+   costs are set apart in red and signed, and GOP is separated from both by a
+   heavier rule so the result is never mistaken for another line item. */
+.gop-statement {
+    max-width: 620px;
     margin: 4px 0 28px;
-    border-top: 1px solid #dfe5e4;
-    border-bottom: 1px solid #dfe5e4;
-    background: rgba(255, 255, 255, 0.52);
+    padding: 20px 22px 18px;
+    border: 1px solid #dfe5e4;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.72);
 
     animation: cost-rise 300ms 45ms ease-out both;
 }
 
-.cost-metric {
-    min-width: 0;
-    padding: 20px 22px;
-    border-left: 1px solid #e4e7ec;
+.gop-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
 }
 
-.cost-metric:first-child {
-    border-left: 0;
+.gop-heading h2 {
+    margin: 4px 0 0;
+    color: var(--cost-ink);
+    font-size: 20px;
+    letter-spacing: -0.025em;
 }
 
-.cost-metric > span {
-    display: block;
-    min-height: 34px;
-    margin-bottom: 10px;
-
+.gop-scope {
     color: #667085;
     font-size: 12px;
-    line-height: 1.4;
 }
 
-.cost-metric strong {
-    display: block;
-    overflow-wrap: anywhere;
+.gop-table {
+    width: 100%;
+    border-collapse: collapse;
+}
 
+.gop-row th {
+    padding: 9px 0;
+    color: #344054;
+    font-size: 13.5px;
+    font-weight: 500;
+    text-align: left;
+}
+
+.gop-amount {
+    padding: 9px 0;
     color: var(--cost-ink);
-    font-size: clamp(17px, 1.6vw, 23px);
+    font-size: 15px;
     font-variant-numeric: tabular-nums;
-    letter-spacing: -0.025em;
-    line-height: 1.2;
-}
-
-.cost-metric strong span {
+    text-align: right;
     white-space: nowrap;
 }
 
-.movement-metric strong {
-    color: var(--cost-accent);
-    font-size: clamp(15px, 1.3vw, 19px);
+.gop-row.is-revenue th,
+.gop-row.is-revenue .gop-amount {
+    font-weight: 600;
+}
+
+/* Costs: indented, muted label, red signed amount. */
+.gop-row.is-cost th {
+    padding-left: 14px;
+    color: #667085;
+}
+
+.gop-row.is-cost .gop-amount {
+    color: #b42318;
+}
+
+/* The first cost row, which is the one immediately after the last revenue
+   row. :first-of-type would match the first <tr> in the table instead. */
+.gop-row.is-revenue + .gop-row.is-cost th,
+.gop-row.is-revenue + .gop-row.is-cost .gop-amount {
+    padding-top: 14px;
+    border-top: 1px solid #e4e7ec;
+}
+
+.gop-row.is-result th,
+.gop-row.is-result .gop-amount {
+    padding-top: 14px;
+    border-top: 2px solid var(--cost-ink);
+    color: var(--cost-ink);
+    font-size: 17px;
+    font-weight: 700;
+}
+
+.gop-row.is-result .gop-amount.is-negative {
+    color: #b42318;
+}
+
+/* Every derivation that the fact data cannot support exactly is stated here
+   rather than being silently folded into a figure above. */
+.gop-flags {
+    margin: 16px 0 0;
+    padding: 12px 14px 12px 30px;
+    border-radius: 6px;
+    background: #fffaeb;
+    color: #93370d;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.gop-flags li + li {
+    margin-top: 6px;
 }
 
 .cost-results {
@@ -1205,21 +1262,6 @@ tbody tr:hover {
     to { opacity: 1; }
 }
 
-@media (max-width: 1050px) {
-    .cost-summary {
-        grid-template-columns: repeat(3, 1fr);
-    }
-
-    .cost-metric:nth-child(4) {
-        border-left: 0;
-        border-top: 1px solid #e4e7ec;
-    }
-
-    .cost-metric:nth-child(5) {
-        border-top: 1px solid #e4e7ec;
-    }
-}
-
 @media (max-width: 700px) {
     .main-nav {
         overflow-x: auto;
@@ -1256,29 +1298,14 @@ tbody tr:hover {
         text-align: left;
     }
 
-    .cost-summary {
-        grid-template-columns: 1fr 1fr;
-    }
-
-    .cost-metric,
-    .cost-metric:nth-child(4) {
-        border-top: 1px solid #e4e7ec;
-        border-left: 1px solid #e4e7ec;
-    }
-
-    .cost-metric:nth-child(odd) {
-        border-left: 0;
-    }
-
-    .cost-metric:first-child,
-    .cost-metric:nth-child(2) {
-        border-top: 0;
+    .gop-statement {
+        padding: 16px 14px 14px;
     }
 }
 
 @media (prefers-reduced-motion: reduce) {
     .cost-filters,
-    .cost-summary,
+    .gop-statement,
     .cost-results,
     .cost-table-wrapper tbody tr {
         animation: none;
@@ -1696,6 +1723,30 @@ tbody tr:hover {
     font-size: 9px;
 }
 
+/* Lookback control: every whole day reachable via slider, number field and
+   steppers, plus an unbounded "from first booking" option. */
+.pickup-window { margin: 0 0 12px; padding: 10px 12px;
+    background: #f8fafc; border: 1px solid #e4e7ec; border-radius: 8px; }
+.pickup-window > label { display: block; margin-bottom: 7px;
+    color: #475467; font-size: 10.5px; font-weight: 650;
+    letter-spacing: .06em; text-transform: uppercase; }
+.pickup-window-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pickup-window-controls input[type="number"] { width: 78px; height: 32px;
+    padding: 0 8px; border: 1px solid #d0d5dd; border-radius: 6px;
+    background: white; font-variant-numeric: tabular-nums; text-align: right; }
+.pickup-window-unit { color: #667085; font-size: 12px; }
+.pickup-step { width: 32px; height: 32px; padding: 0; flex: none;
+    border: 1px solid #d0d5dd; border-radius: 6px; background: white;
+    color: #344054; font-size: 16px; line-height: 1; cursor: pointer; }
+.pickup-step:hover:not(:disabled) { background: #f2f4f7; }
+.pickup-step:disabled { opacity: .45; cursor: not-allowed; }
+.pickup-window-controls input[type="range"] { flex: 1 1 200px; min-width: 140px;
+    accent-color: #0b6b62; }
+.pickup-window-controls input:disabled { opacity: .5; }
+.pickup-window-all { display: flex; align-items: center; gap: 6px; flex: none;
+    color: #344054; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.pickup-window-hint { margin: 7px 0 0; color: #667085; font-size: 11px; }
+
 .pickup-empty {
     min-height: 280px;
 }
@@ -1897,6 +1948,30 @@ tbody tr:hover {
 .text-button { width:auto; height:32px; margin:7px 0 0 20px; padding:0; background:transparent; color:var(--cost-accent); font-size:12px; }
 .text-button:hover { background:transparent; color:#115e59; }
 .rules-empty { padding:28px 0; border-bottom:1px solid #e4e7ec; color:#98a2b3; font-size:13px; }
+
+/* Compact threshold rows: one band per row, fields on a single line in the
+   order they are read - from, to, hours - with the field name carried by a
+   column header rather than repeated above every input. Several thresholds
+   then fit on one screen instead of sprawling down the page. */
+.tier-hint { margin:14px 0 2px; color:#667085; font-size:12px; }
+.tier-hint strong { color:#344054; font-weight:650; }
+.is-compact-list .tier-row.is-compact { grid-template-columns:repeat(3,minmax(84px,1fr)) 34px;
+    gap:10px; align-items:center; padding:6px 0; }
+.tier-row.is-compact label { gap:3px; font-size:10.5px; font-weight:600;
+    letter-spacing:.03em; text-transform:uppercase; color:#98a2b3; }
+/* Only the first row keeps its labels; the rest align under them. */
+.is-compact-list .tier-row.is-compact:not(:first-child) label { gap:0; font-size:0; }
+.settings-editor .tier-row.is-compact input { height:34px; padding:0 8px; font-size:13.5px; }
+/* grid-column is pinned because the narrow-screen .rule-row rules below drop
+   the Remove button onto its own full-width line, which is exactly the
+   vertical sprawl this layout exists to avoid. */
+.tier-row.is-compact .remove-rule { grid-column:auto; width:34px; height:34px; padding:0;
+    align-self:end; border-radius:6px; font-size:16px; line-height:1; }
+.is-compact-list .rules-empty { padding:18px 0; }
+
+@media(max-width:520px){
+    .is-compact-list .tier-row.is-compact { grid-template-columns:repeat(3,minmax(0,1fr)) 34px; }
+}
 
 /* Cost Input: rate/channel picker and per-occupancy cleaning rows. */
 .match-row { grid-template-columns:120px minmax(180px,1fr) 38px; }

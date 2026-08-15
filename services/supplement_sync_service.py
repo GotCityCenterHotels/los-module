@@ -14,6 +14,7 @@ from queries.supplement_source import (
     stockholm_today,
 )
 from services.supplement_schema_service import ensure_supplement_schema
+from shared.mews_source import UNORDERED_CATEGORY_RANK
 
 
 SYNC_LOCK_NAME = "functions.supplement_sync"
@@ -41,9 +42,9 @@ BOOKING_STAGE_INSERT_SQL = """
 INVENTORY_STAGE_INSERT_SQL = """
     INSERT INTO supplement_inventory_source_stage (
         snapshot_date, tenant_key, enterprise_id, hotel_name,
-        category_id, category_name, physical_inventory,
+        category_id, category_name, category_ordering, physical_inventory,
         sellable_inventory, inventory_quality
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -72,7 +73,11 @@ def _inventory_stage_row(row):
     return (
         row["snapshot_date"], row["tenant_key"], row["enterprise_id"],
         (row["hotel_name"] or "").strip(), row["category_id"],
-        (row["category_name"] or "").strip(), row["physical_inventory"],
+        (row["category_name"] or "").strip(),
+        # The Mews category ordering. A mirror without the column sends the
+        # unordered rank, which keeps the previous name ordering.
+        row.get("category_ordering") or UNORDERED_CATEGORY_RANK,
+        row["physical_inventory"],
         row["sellable_inventory"], row["inventory_quality"],
     )
 
@@ -107,6 +112,7 @@ def _create_stages(cursor):
             hotel_name text NOT NULL,
             category_id uuid NOT NULL,
             category_name text NOT NULL,
+            category_ordering integer NOT NULL,
             physical_inventory numeric NOT NULL,
             sellable_inventory numeric NOT NULL,
             inventory_quality text NOT NULL,
@@ -305,6 +311,10 @@ def _publish_stage(cursor, run_id, source_snapshots):
                 THEN now() ELSE functions.hotels.last_updated_at
             END
     """)
+    # sort_order carries the Mews category ordering, so every list of space
+    # categories in the application - Supplement and Cost Input alike - shows
+    # them in the order the property defined, not alphabetically. It is part of
+    # the update set: a category reordered in Mews must reorder here too.
     cursor.execute("""
         INSERT INTO functions.supplement_room_categories (
             hotel_code, room_category_id, space_room_name,
@@ -313,13 +323,14 @@ def _publish_stage(cursor, run_id, source_snapshots):
         SELECT DISTINCT ON (source.enterprise_id, source.category_id)
                source.enterprise_id::text, source.category_id,
                source.category_name, left(upper(source.category_name), 8),
-               0, now()
+               source.category_ordering, now()
         FROM supplement_inventory_source_stage AS source
         ORDER BY source.enterprise_id, source.category_id,
                  source.snapshot_date DESC
         ON CONFLICT (hotel_code, room_category_id) DO UPDATE SET
             space_room_name = EXCLUDED.space_room_name,
             short_name = EXCLUDED.short_name,
+            sort_order = EXCLUDED.sort_order,
             last_seen_at = now()
     """)
 

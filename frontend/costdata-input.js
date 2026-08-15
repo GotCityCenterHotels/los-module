@@ -9,17 +9,28 @@
     const dirtyState = document.getElementById("dirtyState"), importButton = document.getElementById("runImportButton");
     let model = null, dirty = false, loadedEnterpriseId = "";
 
-    // Whole-number fields (guest counts, arrival counts) stay integers; every
-    // money/hours field is fixed at two decimals.
+    if (typeof LosFormat === "undefined") {
+        throw new Error(
+            "los-format.js did not load - hard refresh the page, and check that "
+            + "the script deployed alongside costdata-input.js."
+        );
+    }
+
+    // Whole-number fields (guest counts, arrival counts) stay integers. SEK
+    // fields are whole kronor and are owned by the shared LosFormat input
+    // component; everything left over (hours, minutes, percentages) is not
+    // money and keeps two decimals.
     const INTEGER_FIELDS = new Set([
         "minGuests", "maxGuests", "minArrivals", "maxArrivals"
     ]);
     const DECIMALS = 2;
 
+    // Each row is [field, label, type]. Optional fourth entry is a row class.
     const configs = {
         arrivalTiers: [["minArrivals","Min arrivals","number"],["maxArrivals","Max arrivals","number"],["receptionHours","Reception hours","number"]],
-        breakfastTiers: [["minGuests","Min guests","number"],["maxGuests","Max guests","number"],["staffHours","Staff hours","number"]]
+        breakfastTiers: [["minGuests","From guests","number"],["maxGuests","To guests","number"],["staffHours","Staff hours","number"]]
     };
+    const rowClasses = { breakfastTiers: "tier-row is-compact" };
     const defaults = { arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0}, distributionGroups:{groupName:"",costPercent:0,rules:[]} };
 
     // Rates, channels and room categories for the selected hotel, from
@@ -64,10 +75,25 @@
         const parsed = Number(value);
         return Number.isFinite(parsed) ? parsed.toFixed(DECIMALS) : value;
     }
+    // The display value for a field, before the user touches it: SEK fields
+    // are whole kronor, integers are left alone, everything else is fixed at
+    // two decimals.
+    function displayValue(field, value) {
+        if (LosFormat.isMoneyField(field)) return LosFormat.normalizeSekInputValue(value);
+        if (INTEGER_FIELDS.has(field)) return value ?? "";
+        return toFixedDecimals(value);
+    }
     // Applied on blur rather than on input, so typing "1.5" is not rewritten to
-    // "1.50" mid-keystroke and the caret does not jump.
-    function bindDecimalNormalisation(input, field, onChange) {
-        if (input.type !== "number" || INTEGER_FIELDS.has(field)) return;
+    // "1.50" mid-keystroke and the caret does not jump. SEK fields are handed
+    // to the shared component instead, so whole-krona rounding is defined once
+    // for the whole application.
+    function bindNumberNormalisation(input, field, onChange) {
+        if (input.type !== "number") return;
+        if (LosFormat.isMoneyField(field)) {
+            LosFormat.bindSekInput(input, onChange);
+            return;
+        }
+        if (INTEGER_FIELDS.has(field)) return;
         input.step = "0.01";
         input.addEventListener("blur", () => {
             const normalised = toFixedDecimals(input.value);
@@ -147,8 +173,8 @@
         for (const [key, value] of Object.entries(model.profile)) {
             const input = form.elements.namedItem(key);
             if (!input) continue;
-            input.value = input.type === "number" ? toFixedDecimals(value) : value;
-            bindDecimalNormalisation(input, key);
+            input.value = input.type === "number" ? displayValue(key, value) : value;
+            bindNumberNormalisation(input, key);
         }
         // Each section renders independently. One section throwing used to take
         // down the whole page with a bare "Something went wrong", hiding both
@@ -176,6 +202,9 @@
 
     // Cleaning rows are one per (room category, occupancy) and come from the
     // hotel's own room categories: occupancy runs 1..(capacity + extraCapacity).
+    // Categories arrive from /api/costdata/sources already in the Mews ordering
+    // and that order is preserved here, in the saved sort_order, and on reload -
+    // neither alphabetical nor insertion order is applied anywhere.
     // Any saved row whose category no longer exists in the hotel is kept and
     // marked, rather than silently dropped along with its costs.
     function mergeCleaningWithHotel() {
@@ -245,9 +274,9 @@
                 input.type = "number";
                 input.min = "0";
                 input.step = "0.01";
-                input.value = toFixedDecimals(row[field]);
+                input.value = displayValue(field, row[field]);
                 input.dataset.field = field;
-                bindDecimalNormalisation(input, field, (value) => { row[field] = value; });
+                bindNumberNormalisation(input, field, (value) => { row[field] = value; });
                 wrap.append(input);
                 line.append(wrap);
             }
@@ -280,7 +309,7 @@
         model.distributionGroups.forEach((group,index)=>{
             const row=document.createElement("div"); row.className="rule-row distribution-rule";
             row.innerHTML=`<div class="rule-main"><label>Group name<input data-field="groupName" value="${escapeHtml(group.groupName)}" required></label><label>Cost %<input data-field="costPercent" type="number" min="0" max="100" step="0.01" value="${escapeHtml(toFixedDecimals(group.costPercent))}" required></label><button type="button" class="remove-rule" aria-label="Remove group">Remove</button></div><div class="match-list"></div><button type="button" class="text-button add-match">+ Add rate or channel match</button>`;
-            bindDecimalNormalisation(
+            bindNumberNormalisation(
                 row.querySelector('[data-field="costPercent"]'),
                 "costPercent",
                 (value) => { group.costPercent = value; }
@@ -581,7 +610,7 @@
         root.replaceChildren();
         model[key].forEach((item, index) => {
             const row = document.createElement("div");
-            row.className = "rule-row";
+            row.className = `rule-row${rowClasses[key] ? ` ${rowClasses[key]}` : ""}`;
             for (const [field, label, type] of configs[key]) {
                 const wrap = document.createElement("label");
                 wrap.textContent = label;
@@ -590,22 +619,23 @@
                 if (type === "number") {
                     input.min = "0";
                     input.step = INTEGER_FIELDS.has(field) ? "1" : "0.01";
-                    input.value = INTEGER_FIELDS.has(field)
-                        ? (item[field] ?? "")
-                        : toFixedDecimals(item[field]);
+                    input.value = displayValue(field, item[field]);
                 }
                 else {
                     input.value = item[field] ?? "";
                 }
                 input.dataset.field = field;
-                bindDecimalNormalisation(input, field, (value) => { item[field] = value; });
+                bindNumberNormalisation(input, field, (value) => { item[field] = value; });
                 wrap.append(input);
                 row.append(wrap);
             }
             const remove = document.createElement("button");
             remove.type = "button";
             remove.className = "remove-rule";
-            remove.textContent = "Remove";
+            // A compact threshold row has no space for a word; the label stays
+            // on the button for assistive technology.
+            remove.textContent = rowClasses[key] ? "×" : "Remove";
+            remove.setAttribute("aria-label", "Remove threshold");
             remove.onclick = () => removeRow(key, index);
             row.append(remove);
             bindFields(row, item);
@@ -618,8 +648,17 @@
     function removeRow(key,index){model[key].splice(index,1);key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)}
     function escapeHtml(value){return String(value??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;")}
     function collect() {
+        // Money is rounded once here as well as on blur, so a value typed and
+        // submitted with Enter (never blurred) is stored at the same precision
+        // it is displayed at. The backend rounds again as the last word.
         for (const input of form.querySelectorAll("[name]")) {
-            model.profile[input.name] = input.value;
+            model.profile[input.name] = LosFormat.isMoneyField(input.name)
+                ? LosFormat.normalizeSekInputValue(input.value)
+                : input.value;
+        }
+        for (const row of model.cleaningCategories || []) {
+            if (row.linenCost === "" || row.linenCost === null || row.linenCost === undefined) continue;
+            row.linenCost = LosFormat.normalizeSekInputValue(row.linenCost);
         }
         // A half-finished match row carries no meaning and the backend rejects a
         // blank match value outright, which previously failed the entire save.

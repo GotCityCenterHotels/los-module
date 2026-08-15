@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data Input</title>
-    <link rel="stylesheet" href="styles.css?v=20260815-2">
+    <link rel="stylesheet" href="styles.css?v=20260815-5">
 </head>
 <body>
 <main class="container cost-workspace settings-workspace">
@@ -42,18 +42,19 @@
             </section>
             <section data-settings-section="cleaning" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Every room category in this hotel, with one row per possible occupancy. Set cleaning minutes and linen cost for each.</p></div></div>
-                <div class="setting-strip"><label>Cleaning cost / minute<input name="cleaningCostPerMinute" type="number" min="0" step="0.01" required></label></div>
+                <div class="setting-strip"><label>Cleaning cost / minute (kr)<input name="cleaningCostPerMinute" type="number" min="0" step="1" required></label></div>
                 <div id="cleaningCategories" class="rule-list"></div>
             </section>
             <section data-settings-section="arrivals" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set reception hours required when daily arrivals enter a threshold.</p></div><button type="button" class="secondary-button" data-add="arrivalTiers">Add threshold</button></div>
-                <div class="setting-strip"><label>Reception cost / hour<input name="receptionCostPerHour" type="number" min="0" step="0.01" required></label></div>
+                <div class="setting-strip"><label>Reception cost / hour (kr)<input name="receptionCostPerHour" type="number" min="0" step="1" required></label></div>
                 <div id="arrivalTiers" class="rule-list"></div>
             </section>
             <section data-settings-section="breakfast" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">BREAKFAST GUESTS</span><h2>Food & staffing</h2><p>Apply direct food cost per guest and staff hours by guest-count threshold.</p></div><button type="button" class="secondary-button" data-add="breakfastTiers">Add threshold</button></div>
-                <div class="setting-strip"><label>Calculate from<select name="breakfastCalculationBasis"><option value="guests">Breakfast guests</option><option value="products">Sold products</option></select></label><label>Food cost / unit<input name="breakfastFoodCostPerGuest" type="number" min="0" step="0.01" required></label><label>Staff cost / hour<input name="breakfastStaffCostPerHour" type="number" min="0" step="0.01" required></label></div>
-                <div id="breakfastTiers" class="rule-list"></div>
+                <div class="setting-strip"><label>Calculate from<select name="breakfastCalculationBasis"><option value="guests">Breakfast guests</option><option value="products">Sold products</option></select></label><label>Food cost / unit (kr)<input name="breakfastFoodCostPerGuest" type="number" min="0" step="1" required></label><label>Staff cost / hour (kr)<input name="breakfastStaffCostPerHour" type="number" min="0" step="1" required></label></div>
+                <p class="tier-hint">One row per threshold. Leave <strong>To guests</strong> empty on the last row to leave it open-ended.</p>
+                <div id="breakfastTiers" class="rule-list is-compact-list"></div>
             </section>
             <section data-settings-section="rent" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">REVENUE & PAYMENTS</span><h2>Rent and card costs</h2><p>Percentages apply to the matching net revenue stream or gross payments.</p></div></div>
@@ -63,6 +64,6 @@
         </form>
     </div>
 </main>
-<script src="los-api.js?v=20260811-2"></script><script src="costdata-match.js?v=20260815-1"></script><script src="costdata-input.js?v=20260815-4"></script>
+<script src="los-api.js?v=20260811-2"></script><script src="los-format.js?v=20260815-5"></script><script src="costdata-match.js?v=20260815-1"></script><script src="costdata-input.js?v=20260815-5"></script>
 </body>
 </html>

@@ -2,11 +2,14 @@
     "use strict";
 
     const API_URL = "/api/costdata/facts";
+    // "period" columns are the bucket's first date, so they must be labelled
+    // with the selected grain rather than as a plain date; "decimal" columns
+    // are SEK and are rendered by the shared whole-krona formatter.
     const DATASETS = {
         roomRevenue: {
             title: "Room revenue",
             columns: [
-                ["stayDate", "Period", "date"],
+                ["stayDate", "Period", "period"],
                 ["hotelName", "Hotel", "text"],
                 ["amountCurrency", "Currency", "text"],
                 ["roomRevenueExclProducts1Net", "Room excl. products", "decimal"],
@@ -18,7 +21,7 @@
         payments: {
             title: "Payments",
             columns: [
-                ["stayDate", "Period", "date"],
+                ["stayDate", "Period", "period"],
                 ["hotelName", "Hotel", "text"],
                 ["amountCurrency", "Currency", "text"],
                 ["totalPaymentAmountGrossValue", "Total payment gross", "decimal"],
@@ -28,7 +31,7 @@
         breakfast: {
             title: "Breakfast",
             columns: [
-                ["stayDate", "Period", "date"],
+                ["stayDate", "Period", "period"],
                 ["hotelName", "Hotel", "text"],
                 ["breakfastTotal", "Breakfasts", "integer"],
                 ["breakfastNetCost", "Net cost", "decimal"],
@@ -38,7 +41,7 @@
         parking: {
             title: "Parking",
             columns: [
-                ["stayDate", "Period", "date"],
+                ["stayDate", "Period", "period"],
                 ["hotelName", "Hotel", "text"],
                 ["service", "Service", "text"],
                 ["totalReservationsUsingParking", "Reservations", "integer"],
@@ -50,7 +53,7 @@
         arrivalsDepartures: {
             title: "Arrivals & departures",
             columns: [
-                ["stayDate", "Period", "date"],
+                ["stayDate", "Period", "period"],
                 ["hotelName", "Hotel", "text"],
                 ["totalArrivals", "Arrivals", "integer"],
                 ["totalDepartures", "Departures", "integer"],
@@ -67,7 +70,10 @@
         loadButton: document.getElementById("costLoadButton"),
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
-        summary: document.getElementById("costSummary"),
+        gop: document.getElementById("gopStatement"),
+        gopRows: document.getElementById("gopRows"),
+        gopFlags: document.getElementById("gopFlags"),
+        gopScope: document.getElementById("gopScopeNote"),
         results: document.getElementById("costResults"),
         error: document.getElementById("costError"),
         title: document.getElementById("costTableTitle"),
@@ -75,24 +81,16 @@
         head: document.getElementById("costTableHead"),
         body: document.getElementById("costTableBody"),
         freshness: document.getElementById("freshness"),
-        latestUpdate: document.getElementById("latestUpdate"),
-        revenue: document.getElementById("summaryRevenue"),
-        payments: document.getElementById("summaryPayments"),
-        breakfast: document.getElementById("summaryBreakfast"),
-        parking: document.getElementById("summaryParking"),
-        movement: document.getElementById("summaryMovement")
+        latestUpdate: document.getElementById("latestUpdate")
     };
 
-    const numberFormatter = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 2 });
     const integerFormatter = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 0 });
-    const dateFormatter = new Intl.DateTimeFormat("en-SE", {
-        year: "numeric", month: "short", day: "numeric"
-    });
     const dateTimeFormatter = new Intl.DateTimeFormat("en-SE", {
         year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
     });
 
     let loadedData = null;
+    let loadedSettings = {};
     let activeDataset = "roomRevenue";
 
     function localIsoDate(date) {
@@ -135,6 +133,9 @@
             });
             const payload = await LosApi.fetchJson(`${API_URL}?${parameters}`);
             loadedData = payload.data || {};
+            // The cost rulebook travels with the facts, so every figure below is
+            // computed from what is currently saved in Cost Input.
+            loadedSettings = payload.costSettings || {};
             populateHotels(payload.hotels || []);
             updateFreshness();
             render();
@@ -179,48 +180,73 @@
 
     function render() {
         if (!loadedData) return;
-        renderSummary();
+        renderGop();
         renderTable();
         elements.scope.textContent = [
             elements.hotel.value || "All hotels",
             `${elements.startDate.value} – ${elements.endDate.value}`
         ].join(" · ");
-        elements.summary.hidden = false;
+        elements.gop.hidden = false;
         elements.results.hidden = false;
     }
 
-    function renderSummary() {
-        const summary = CostData.summarize(loadedData, { hotelName: elements.hotel.value });
-        elements.revenue.replaceChildren(...currencySummaryNodes(summary.roomRevenue));
-        elements.payments.replaceChildren(...currencySummaryNodes(summary.payments));
-        elements.breakfast.textContent = formatDecimal(summary.breakfastCost);
-        elements.parking.textContent = formatDecimal(summary.parkingNet);
-        elements.movement.textContent = `${integerFormatter.format(summary.arrivals)} in · ${integerFormatter.format(summary.departures)} out`;
+    // A cost is money out; showing it as a bare positive number next to revenue
+    // makes the statement impossible to read down the column. A correction
+    // period can produce a negative cost, which is a credit and reads as one.
+    function signedCost(amount) {
+        return amount < 0
+            ? `+${LosFormat.formatSek(-amount)}`
+            : `−${LosFormat.formatSek(amount)}`;
     }
 
-    function currencySummaryNodes(totals) {
-        const entries = Object.entries(totals);
-        if (!entries.length) return [document.createTextNode("—")];
-        const fragmentNodes = [];
-        entries.sort(([left], [right]) => left.localeCompare(right)).forEach(([currency, total], index) => {
-            if (index) fragmentNodes.push(document.createElement("br"));
-            const line = document.createElement("span");
-            line.textContent = `${formatDecimal(total)} ${currency === "Unspecified" ? "" : currency}`.trim();
-            fragmentNodes.push(line);
+    // The GOP statement is net of VAT throughout: every figure is a net revenue
+    // stream or a cost derived from Cost Input. No gross figure appears here.
+    function renderGop() {
+        const statement = CostData.calculateGop(loadedData, {
+            hotelName: elements.hotel.value,
+            settingsByHotel: loadedSettings
         });
-        return fragmentNodes;
+
+        elements.gopScope.textContent = statement.hotels.length
+            ? `${statement.currency} · net excl. VAT · ${statement.hotels.length} `
+                + `${statement.hotels.length === 1 ? "property" : "properties"}`
+            : "No properties in this scope";
+
+        elements.gopRows.replaceChildren(...statement.lines.map((line) => {
+            const row = document.createElement("tr");
+            row.className = `gop-row is-${line.type}`;
+            const label = document.createElement("th");
+            label.scope = "row";
+            label.textContent = line.label;
+            const amount = document.createElement("td");
+            amount.className = "gop-amount";
+            amount.textContent = line.type === "cost"
+                ? signedCost(line.amount)
+                : LosFormat.formatSek(line.amount);
+            if (line.type === "result" && line.amount < 0) amount.classList.add("is-negative");
+            row.append(label, amount);
+            return row;
+        }));
+
+        elements.gopFlags.replaceChildren(...statement.flags.map((message) => {
+            const item = document.createElement("li");
+            item.textContent = message;
+            return item;
+        }));
+        elements.gopFlags.hidden = statement.flags.length === 0;
     }
 
     function renderTable() {
         const definition = DATASETS[activeDataset];
+        const grain = elements.grain.value;
         const rows = CostData.aggregate(activeDataset, loadedData[activeDataset] || [], {
-            grain: elements.grain.value,
+            grain,
             hotelName: elements.hotel.value
         });
         elements.title.textContent = definition.title;
         elements.rowCount.textContent = `${integerFormatter.format(rows.length)} ${rows.length === 1 ? "row" : "rows"}`;
         elements.head.replaceChildren(buildHeader(definition.columns));
-        elements.body.replaceChildren(...buildRows(rows, definition.columns));
+        elements.body.replaceChildren(...buildRows(rows, definition.columns, grain));
     }
 
     function buildHeader(columns) {
@@ -235,7 +261,7 @@
         return row;
     }
 
-    function buildRows(rows, columns) {
+    function buildRows(rows, columns, grain) {
         if (!rows.length) {
             const row = document.createElement("tr");
             const cell = document.createElement("td");
@@ -250,7 +276,7 @@
             const row = document.createElement("tr");
             for (const [field, , type] of columns) {
                 const cell = document.createElement("td");
-                cell.textContent = formatCell(item[field], type);
+                cell.textContent = formatCell(item[field], type, grain);
                 if (["integer", "decimal"].includes(type)) cell.className = "numeric-column";
                 row.appendChild(cell);
             }
@@ -258,17 +284,13 @@
         });
     }
 
-    function formatCell(value, type) {
+    function formatCell(value, type, grain) {
         if (value === null || value === undefined || value === "") return "—";
         if (type === "integer") return integerFormatter.format(Number(value));
-        if (type === "decimal") return formatDecimal(value);
+        if (type === "decimal") return LosFormat.formatSek(value);
         if (type === "datetime") return formatDateTime(value);
-        if (type === "date") return dateFormatter.format(new Date(`${value}T00:00:00`));
+        if (type === "period") return LosFormat.periodLabel(value, grain);
         return String(value);
-    }
-
-    function formatDecimal(value) {
-        return Number.isFinite(Number(value)) ? numberFormatter.format(Number(value)) : "—";
     }
 
     function formatDateTime(value) {

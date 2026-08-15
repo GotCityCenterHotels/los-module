@@ -19,6 +19,10 @@ from psycopg.rows import dict_row
 from psycopg.sql import SQL, Identifier
 
 from shared.db import get_export_connection
+from shared.mews_source import (
+    CATEGORY_ORDERING_COLUMNS,
+    UNORDERED_CATEGORY_RANK,
+)
 
 
 class CostSourceUnavailableError(RuntimeError):
@@ -178,6 +182,11 @@ def list_cleaning_categories(enterprise_id):
     ExtraCapacity (extra beds). A category serving 2 + 1 produces occupancy
     steps 1, 2 and 3 - one cleaning row each, because linen and minutes differ
     per occupancy.
+
+    Categories come back in the Mews ordering (ResourceCategory.Ordering), not
+    alphabetically: that is the order the property recognises, and every screen
+    listing space categories uses it. A mirror without the ordering column
+    falls back to the name, which is the previous behaviour.
     """
     with get_export_connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
@@ -193,27 +202,47 @@ def list_cleaning_categories(enterprise_id):
                 CATEGORY_EXTRA_CAPACITY_COLUMNS,
                 required=False,
             )
+            ordering_column = _resolve_column(
+                cursor,
+                "resource_category_current",
+                CATEGORY_ORDERING_COLUMNS,
+                required=False,
+            )
             extra_expression = (
                 SQL("coalesce(category.{}, 0)").format(Identifier(extra_column))
                 if extra_column else SQL("0")
             )
+            ordering_expression = (
+                SQL("coalesce(category.{}, {})").format(
+                    Identifier(ordering_column), SQL(str(UNORDERED_CATEGORY_RANK))
+                )
+                if ordering_column else SQL(str(UNORDERED_CATEGORY_RANK))
+            )
+            if ordering_column is None:
+                logging.info(
+                    "No Mews ordering column on resource_category_current "
+                    "(tried %s); space categories fall back to name order",
+                    list(CATEGORY_ORDERING_COLUMNS),
+                )
 
             query = SQL("""
                 SELECT
                     category.id::text AS category_id,
                     trim(category.{name})::text AS category_name,
                     coalesce(category.{capacity}, 0)::int AS capacity,
-                    {extra}::int AS extra_capacity
+                    {extra}::int AS extra_capacity,
+                    {ordering}::int AS category_ordering
                 FROM resource_category_current category
                 WHERE category.enterprise_id::text = %(enterprise_id)s
                   AND category.type = 'Room'
                   AND category.is_active
                   AND nullif(trim(category.{name}), '') IS NOT NULL
-                ORDER BY category_name
+                ORDER BY category_ordering, category_name
             """).format(
                 name=Identifier(name_column),
                 capacity=Identifier(capacity_column),
                 extra=extra_expression,
+                ordering=ordering_expression,
             )
 
             cursor.execute(query, {"enterprise_id": str(enterprise_id)})
@@ -230,6 +259,7 @@ def list_cleaning_categories(enterprise_id):
             "categoryName": row["category_name"],
             "capacity": int(row["capacity"] or 0),
             "extraCapacity": int(row["extra_capacity"] or 0),
+            "ordering": int(row.get("category_ordering") or UNORDERED_CATEGORY_RANK),
             "occupancies": list(range(1, total + 1)),
         })
     return categories
