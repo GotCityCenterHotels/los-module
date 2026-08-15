@@ -16,6 +16,14 @@ CREATE TABLE IF NOT EXISTS functions.cost_property_settings (
     enterprise_id text PRIMARY KEY
         CONSTRAINT cost_property_settings_hotel_fkey
         REFERENCES functions.hotels(enterprise_id),
+    -- services/cost_settings_service.py reads and writes this column
+    -- (_preload_property_settings, save_cost_settings, _get_preloaded_property),
+    -- and migration 001 indexes it. It was missing here, so a database built
+    -- from this file could not run migration 001 or serve the Cost Input page.
+    -- Migration 007 drops it as part of moving names to functions.hotels; that
+    -- migration is deliberately unregistered and must not be applied while the
+    -- application still depends on this column.
+    hotel_name text,
     currency text NOT NULL DEFAULT 'SEK',
     distribution_default_percent numeric(7, 4) NOT NULL DEFAULT 0,
     cleaning_cost_per_minute numeric(18, 4) NOT NULL DEFAULT 0,
@@ -106,9 +114,28 @@ CREATE TABLE IF NOT EXISTS functions.cost_breakfast_staffing_tiers (
     CHECK (staff_hours >= 0)
 );
 
--- Fixed costs are intentionally absent: they are applied once at the analysis
--- stage from a separately maintained roadmap, not per property in the cost
--- algorithm. Migration 011 drops the table on databases that still have it.
+-- Fixed costs are no longer part of the cost algorithm: they are applied once
+-- at the analysis stage from a separately maintained roadmap. No application
+-- code reads this table.
+--
+-- It is still created here because migration 001 runs AFTER this file and issues
+-- eight unguarded statements against it (ALTER TABLE, ADD CONSTRAINT, CREATE
+-- INDEX). Dropping it here made 001 fail on a fresh database with
+-- "relation functions.cost_fixed_lines does not exist". Migration 011 removes
+-- it once the historical chain has been applied.
+CREATE TABLE IF NOT EXISTS functions.cost_fixed_lines (
+    fixed_cost_line_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    enterprise_id text NOT NULL REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
+    cost_name text NOT NULL,
+    amount numeric(18, 4) NOT NULL,
+    cadence text NOT NULL DEFAULT 'monthly' CHECK (cadence IN ('daily', 'monthly', 'yearly')),
+    active boolean NOT NULL DEFAULT true,
+    sort_order integer NOT NULL DEFAULT 0,
+    UNIQUE (enterprise_id, cost_name),
+    CHECK (amount >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_enterprise ON functions.cost_fixed_lines(enterprise_id);
 
 CREATE INDEX IF NOT EXISTS ix_hotels_tenant_active_name ON functions.hotels(tenant_key, active, hotel_name, enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_enterprise ON functions.cost_distribution_groups(enterprise_id);

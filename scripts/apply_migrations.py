@@ -43,7 +43,30 @@ def main():
 
     # Imported here so a missing app setting cannot break --help.
     sys.path.insert(0, str(REPO_ROOT))
+
+    # cost_schema_service imports cost_database, which builds a ConnectionPool
+    # at module import and raises KeyError on any missing setting. This script
+    # never uses that pool - it connects with its own DSN - so placeholders are
+    # enough to get through the import when running with --dsn alone.
+    for name, placeholder in (
+        ("COST_DB_NAME", "placeholder"),
+        ("COST_DB_HOST", "localhost"),
+        ("COST_DB_USER", "placeholder"),
+        ("COST_DB_PASSWORD", "placeholder"),
+    ):
+        os.environ.setdefault(name, placeholder)
+
     from services.cost_schema_service import BASE_SCHEMA_PATH, MIGRATIONS
+
+    # cost_database builds a ConnectionPool at import, which this script never
+    # uses. Left open, its worker threads outlive main() and print "couldn't
+    # stop thread" warnings over the real output.
+    try:
+        from cost_database import cost_pool
+
+        cost_pool.close()
+    except Exception:  # pragma: no cover - only affects log noise
+        pass
 
     steps = [("base schema", BASE_SCHEMA_PATH)] + list(MIGRATIONS)
 
@@ -91,15 +114,80 @@ def main():
                 ORDER BY indexname
             """)
             print("\nfunctions.cost_cleaning_categories indexes:")
+            stale_keys = []
             for index_name, definition in cursor.fetchall():
                 print(f"  {index_name}: {definition}")
-                if "occupancy" not in definition and "UNIQUE" in definition.upper():
-                    print(
-                        "FAIL  a unique index without occupancy still exists; "
-                        "multi-occupancy cleaning rows cannot be saved",
-                        file=sys.stderr,
-                    )
+                lowered = definition.lower()
+                # The dangerous shape is uniqueness over category_name WITHOUT
+                # occupancy. The primary key over cleaning_category_id is unique
+                # too and must not be flagged.
+                if (
+                    "unique" in lowered
+                    and "category_name" in lowered
+                    and "occupancy" not in lowered
+                ):
+                    stale_keys.append(index_name)
+            if stale_keys:
+                print(
+                    f"FAIL  {stale_keys} key cleaning on category_name without "
+                    "occupancy; multi-occupancy rows cannot be saved",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Reproduce the save that failed in production: one room category at
+            # three occupancies. This is the assertion that would have caught the
+            # original bug, and it exercises the schema rather than reading it.
+            print("\nfunctional check: one category at three occupancies")
+            try:
+                cursor.execute("""
+                    INSERT INTO functions.hotels (enterprise_id, tenant_key, hotel_name)
+                    VALUES ('probe-hotel', 'GCCH', 'Probe Hotel')
+                    ON CONFLICT (enterprise_id) DO NOTHING
+                """)
+                cursor.execute("""
+                    INSERT INTO functions.cost_property_settings (enterprise_id, hotel_name)
+                    VALUES ('probe-hotel', 'Probe Hotel')
+                    ON CONFLICT (enterprise_id) DO NOTHING
+                """)
+                cursor.executemany(
+                    """
+                    INSERT INTO functions.cost_cleaning_categories (
+                        enterprise_id, category_name, resource_category_id,
+                        occupancy, min_guests, max_guests,
+                        cleaning_minutes, linen_cost, sort_order
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        ("probe-hotel", "Double Room", "cat-1", occupancy,
+                         occupancy, occupancy, 30, 75, index)
+                        for index, occupancy in enumerate((1, 2, 3))
+                    ],
+                )
+                cursor.execute("""
+                    SELECT count(*) FROM functions.cost_cleaning_categories
+                    WHERE enterprise_id = 'probe-hotel'
+                """)
+                saved = cursor.fetchone()[0]
+                if saved != 3:
+                    print(f"FAIL  expected 3 rows, stored {saved}", file=sys.stderr)
                     return 1
+                print("  ok  stored 3 occupancy rows for one category")
+            except Exception as error:
+                sqlstate = getattr(error, "sqlstate", "unknown")
+                print(
+                    f"FAIL  saving multi-occupancy cleaning rows (SQLSTATE {sqlstate})",
+                    file=sys.stderr,
+                )
+                print(f"      {error}", file=sys.stderr)
+                return 1
+            finally:
+                cursor.execute(
+                    "DELETE FROM functions.cost_property_settings WHERE enterprise_id = 'probe-hotel'"
+                )
+                cursor.execute(
+                    "DELETE FROM functions.hotels WHERE enterprise_id = 'probe-hotel'"
+                )
 
     print("\nAll migrations applied cleanly.")
     return 0

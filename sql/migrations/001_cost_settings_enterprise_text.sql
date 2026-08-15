@@ -79,42 +79,62 @@ ALTER TABLE functions.cost_breakfast_staffing_tiers
 ALTER TABLE functions.cost_fixed_lines
     ALTER COLUMN enterprise_id TYPE text USING enterprise_id::text;
 
-/* Resolve existing hotel-name settings against imported source identifiers. */
-WITH property_candidates AS (
-    SELECT enterprise_id::text, trim(hotel_name) AS hotel_name, 1 AS priority
-    FROM functions.breakfast_data
-    WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+/* Resolve existing hotel-name settings against imported source identifiers.
+ *
+ * Guarded because the cost fact tables are created by migration 010, which runs
+ * after this one. On a database built from scratch they do not exist yet - and
+ * there is no legacy hotel-name keyed data to resolve either, so skipping is
+ * correct. Without the guard this statement aborts a from-scratch run with
+ * "relation functions.breakfast_data does not exist", which is what made the
+ * migration chain unreplayable. */
+DO $resolve_enterprise_ids$
+BEGIN
+    IF to_regclass('functions.breakfast_data') IS NULL
+       OR to_regclass('functions.parking_data') IS NULL
+       OR to_regclass('functions.total_payment_data') IS NULL
+       OR to_regclass('functions.room_revenue_night_data') IS NULL
+    THEN
+        RAISE NOTICE
+            'Cost fact tables absent; skipping the legacy hotel-name backfill.';
+        RETURN;
+    END IF;
 
-    UNION ALL
+    WITH property_candidates AS (
+        SELECT enterprise_id::text, trim(hotel_name) AS hotel_name, 1 AS priority
+        FROM functions.breakfast_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
 
-    SELECT enterprise_id::text, trim(hotel_name), 2
-    FROM functions.parking_data
-    WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+        UNION ALL
 
-    UNION ALL
+        SELECT enterprise_id::text, trim(hotel_name), 2
+        FROM functions.parking_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
 
-    SELECT enterprise_id::text, trim(hotel_name), 3
-    FROM functions.total_payment_data
-    WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+        UNION ALL
 
-    UNION ALL
+        SELECT enterprise_id::text, trim(hotel_name), 3
+        FROM functions.total_payment_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
 
-    SELECT enterprise_id::text, trim(hotel_name), 4
-    FROM functions.room_revenue_night_data
-    WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
-),
-property_map AS (
-    SELECT DISTINCT ON (lower(hotel_name))
-        lower(hotel_name) AS normalized_name,
-        enterprise_id
-    FROM property_candidates
-    ORDER BY lower(hotel_name), priority, enterprise_id
-)
-UPDATE functions.cost_property_settings AS settings
-SET enterprise_id = property_map.enterprise_id
-FROM property_map
-WHERE settings.enterprise_id IS NULL
-  AND lower(trim(settings.hotel_name)) = property_map.normalized_name;
+        UNION ALL
+
+        SELECT enterprise_id::text, trim(hotel_name), 4
+        FROM functions.room_revenue_night_data
+        WHERE enterprise_id IS NOT NULL AND nullif(trim(hotel_name), '') IS NOT NULL
+    ),
+    property_map AS (
+        SELECT DISTINCT ON (lower(hotel_name))
+            lower(hotel_name) AS normalized_name,
+            enterprise_id
+        FROM property_candidates
+        ORDER BY lower(hotel_name), priority, enterprise_id
+    )
+    UPDATE functions.cost_property_settings AS settings
+    SET enterprise_id = property_map.enterprise_id
+    FROM property_map
+    WHERE settings.enterprise_id IS NULL
+      AND lower(trim(settings.hotel_name)) = property_map.normalized_name;
+END $resolve_enterprise_ids$;
 
 UPDATE functions.cost_property_settings
 SET enterprise_id = 'legacy:' || md5(lower(trim(hotel_name)))
