@@ -279,7 +279,10 @@ def _resolve_cleaning_inheritance(rows, bed_types):
             "isBase": is_base,
             "inheritsBeds": inherits_beds,
             "inheritsMinutes": inherits_minutes,
-            "effectiveBeds": beds,
+            # The resolved bed list is deliberately not published. The editor
+            # recomputes inheritance itself through CostCleaning.resolveRow, so
+            # sending it duplicated every base row's beds onto every occupancy
+            # above it for no reader at all.
             "effectiveCleaningMinutes": (
                 "0" if minutes in (None, "") else str(minutes)
             ),
@@ -291,6 +294,10 @@ def _resolve_cleaning_inheritance(rows, bed_types):
 def _cleaning_row_json(row):
     payload = _json_row(row)
     payload["beds"] = list(payload.get("beds") or [])
+    # c.enterprise_id stays in CLEANING_CATEGORIES_SQL because the bulk path
+    # groups on it, but the response already carries the id once at the top
+    # level - repeating it on every cleaning row is pure payload.
+    payload.pop("enterpriseId", None)
     return payload
 
 
@@ -589,8 +596,51 @@ def _resolve_cost_settings_hotel(enterprise_id, fallback_hotel_name=None):
         }
 
 
+def _read_cost_settings(connection, enterprise_id):
+    """Every result set one property's rulebook needs, in one pass.
+
+    None of these seven statements depends on another's result, so in pipeline
+    mode the driver sends them all before waiting for the first answer: ten
+    round trips warm become two. Each statement gets its own cursor, which also
+    removes the ordering trap the sequential path still carries - there, one
+    shared cursor means a query inserted in the middle silently hands one
+    table's rows to another.
+
+    The branch keys off the connection object rather than
+    psycopg.capabilities.has_pipeline(). The library supports pipelining
+    everywhere this runs, but the fakes the tests stand in for a connection do
+    not, and they hand out a single shared cursor.
+    """
+    statements = [
+        ("profile", _PROFILE_SETTINGS_SQL),
+        ("distributionGroups", _DISTRIBUTION_GROUPS_SQL),
+        *_SETTINGS_COLLECTION_QUERIES.items(),
+        ("distributionOriginGroups", DISTRIBUTION_TREE_SQL),
+    ]
+    parameters = (enterprise_id,)
+
+    if hasattr(connection, "pipeline"):
+        cursors = {}
+        with connection.pipeline():
+            for name, query in statements:
+                cursor = connection.cursor(row_factory=dict_row)
+                cursor.execute(query, parameters)
+                cursors[name] = cursor
+        results = {name: cursor.fetchall() for name, cursor in cursors.items()}
+    else:
+        results = {}
+        with connection.cursor(row_factory=dict_row) as cursor:
+            for name, query in statements:
+                cursor.execute(query, parameters)
+                results[name] = cursor.fetchall()
+
+    results["profile"] = results["profile"][0] if results["profile"] else None
+    return results
+
+
 def fetch_cost_settings(enterprise_id, hotel_name=None):
     ensure_cost_settings_schema()
+    bootstrap_property = None
     if hotel_name is None:
         property_record = _resolve_cost_settings_hotel(enterprise_id)
         enterprise_id = property_record["enterpriseId"]
@@ -599,7 +649,7 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
         # The ID/name pair came from the property-list endpoint. Persist it
         # locally on first load as well, so a cached list response cannot leave
         # the subsequent Save request without a Database A property record.
-        property_record = {
+        bootstrap_property = {
             "enterpriseId": _required_text(
                 enterprise_id,
                 "Enterprise ID",
@@ -607,60 +657,45 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
             ),
             "hotelName": _required_text(hotel_name, "Hotel", 250),
         }
-        enterprise_id = property_record["enterpriseId"]
-        hotel_name = property_record["hotelName"]
-        _upsert_mirrored_properties([property_record])
-        _preload_property_settings([property_record])
+        enterprise_id = bootstrap_property["enterpriseId"]
+        hotel_name = bootstrap_property["hotelName"]
+
     with cost_pool.connection() as connection:
-        with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("""
-                SELECT settings.*, hotel.hotel_name
-                FROM functions.cost_property_settings settings
-                JOIN functions.hotels hotel USING (enterprise_id)
-                WHERE settings.enterprise_id = %s
-            """, (enterprise_id,))
-            profile_row = cursor.fetchone()
-            profile = dict(DEFAULT_PROFILE)
-            if profile_row:
-                profile.update(_json_row(profile_row))
-
-            cursor.execute("""
-                SELECT g.distribution_group_id, g.group_name, g.cost_percent,
-                    coalesce(json_agg(json_build_object('matchType', r.match_type, 'matchValue', r.match_value)
-                        ORDER BY r.distribution_rule_id) FILTER (WHERE r.distribution_rule_id IS NOT NULL), '[]') AS rules
-                FROM functions.cost_distribution_groups g
-                LEFT JOIN functions.cost_distribution_rules r USING (distribution_group_id)
-                WHERE g.enterprise_id = %s GROUP BY g.distribution_group_id ORDER BY g.sort_order, g.distribution_group_id
-            """, (enterprise_id,))
-            distribution = [_json_row(row) for row in cursor.fetchall()]
-
-            collections = {}
-            for name, query in {
-                # sort_order holds the Mews category ordering captured when the
-                # rows were saved. Ordering by category_name here would undo it
-                # on every reload.
-                "cleaningCategories": CLEANING_CATEGORIES_SQL + " WHERE c.enterprise_id = %s ORDER BY c.sort_order, c.category_name, c.occupancy, c.cleaning_category_id",
-                "bedTypes": "SELECT bed_name, linen_cost FROM functions.cost_bed_types WHERE enterprise_id = %s ORDER BY sort_order, bed_name",
-                "arrivalTiers": "SELECT min_arrivals, max_arrivals, reception_hours FROM functions.cost_arrival_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, arrival_tier_id",
-                "breakfastTiers": "SELECT min_guests, max_guests, staff_hours FROM functions.cost_breakfast_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, breakfast_tier_id",
-            }.items():
-                cursor.execute(query, (enterprise_id,))
-                collections[name] = [
-                    _cleaning_row_json(row) if name == "cleaningCategories"
-                    else _json_row(row)
-                    for row in cursor.fetchall()
-                ]
-            collections["cleaningCategories"] = _resolve_cleaning_inheritance(
-                collections["cleaningCategories"], collections["bedTypes"]
+        if bootstrap_property is not None:
+            # Both bootstrap writes run on the read's own connection. They used
+            # to take a checkout each, and check=ConnectionPool.check_connection
+            # spends a real round trip on every checkout - three per settings
+            # load, for two writes that in steady state change nothing.
+            _upsert_mirrored_properties(
+                [bootstrap_property], connection=connection
             )
+            _preload_property_settings(
+                [bootstrap_property], connection=connection
+            )
+        rows = _read_cost_settings(connection, enterprise_id)
 
-            # Appended after the collections above, deliberately: the bulk
-            # settings tests feed result sets positionally, so a query inserted
-            # in the middle would silently hand one table's rows to another.
-            cursor.execute(DISTRIBUTION_TREE_SQL, (enterprise_id,))
-            origin_groups = [
-                _origin_group_json(row) for row in cursor.fetchall()
-            ]
+    profile_row = rows["profile"]
+    profile = dict(DEFAULT_PROFILE)
+    if profile_row:
+        profile.update(_json_row(profile_row))
+
+    distribution = [_json_row(row) for row in rows["distributionGroups"]]
+
+    collections = {
+        name: [
+            _cleaning_row_json(row) if name == "cleaningCategories"
+            else _json_row(row)
+            for row in rows[name]
+        ]
+        for name in _SETTINGS_COLLECTION_QUERIES
+    }
+    collections["cleaningCategories"] = _resolve_cleaning_inheritance(
+        collections["cleaningCategories"], collections["bedTypes"]
+    )
+
+    origin_groups = [
+        _origin_group_json(row) for row in rows["distributionOriginGroups"]
+    ]
 
     profile.pop("hotelName", None)
     profile.pop("enterpriseId", None)

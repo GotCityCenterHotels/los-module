@@ -410,10 +410,9 @@
                 || (settings.distributionGroups || []).length;
             if (hasDistributionTree) {
                 flag(
-                    `${hotel}: the fallback distribution % was applied to all room revenue. `
-                    + "The per-origin, per-agency and per-rate percentages need a reservation "
-                    + "level breakdown, which the cost fact tables do not carry - they hold one "
-                    + "revenue total per stay date.",
+                    `${hotel}: only the fallback distribution % could be applied. Your `
+                    + "per-origin, per-agency and per-rate percentages need reservation-level "
+                    + "data, which this page does not have.",
                     "distributionCost"
                 );
             }
@@ -457,9 +456,9 @@
                 + percentOf(parkingRevenue, profile.parkingRentPercent);
             if (numberOf(profile.breakfastRentPercent) > 0) {
                 flag(
-                    `${hotel}: breakfast rent % was applied to the source column `
-                    + "breakfast_net_cost, the only breakfast money figure in the cost facts. "
-                    + "Confirm it is breakfast revenue and not a cost before relying on this line.",
+                    `${hotel}: breakfast rent % was applied to the breakfast net figure. `
+                    + "Check that this figure is breakfast revenue, not a cost, before "
+                    + "relying on this line.",
                     "rentCost"
                 );
             }
@@ -481,9 +480,9 @@
             else {
                 totals.cleaningCost += departures * perDeparture;
                 flag(
-                    "Cleaning cost is departures x the average of the configured category and "
-                    + "occupancy rows. The cost facts carry a total departure count only, with "
-                    + "no per-category or per-occupancy breakdown.",
+                    "Cleaning cost uses the average of your configured category and occupancy "
+                    + "rows, multiplied by departures — the source data has "
+                    + "no per-category or per-occupancy split.",
                     "cleaningCost"
                 );
             }

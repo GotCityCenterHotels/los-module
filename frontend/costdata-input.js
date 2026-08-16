@@ -1796,12 +1796,40 @@
     }
     importButton.onclick=runImport;
     document.querySelectorAll(".settings-nav button").forEach(button => {
-        button.onclick = () => showSection(button.dataset.section);
+        button.onclick = () => {
+            showSection(button.dataset.section);
+            // Six items styled as navigation that left no trace: Back exited the
+            // page (tripping the unsaved-changes prompt), a refresh always
+            // dumped you on Distribution, and "look at Cleaning for Continental"
+            // could not be sent as a link.
+            if (location.hash.slice(1) !== button.dataset.section) {
+                history.pushState(null, "", `#${button.dataset.section}`);
+            }
+        };
     });
-    document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));renderRows(key);setDirty(true);syncSectionSwitches()});
+    // pushState does not fire hashchange, so this is what makes Back walk the
+    // rail rather than leave the page.
+    window.addEventListener("popstate", () => showSection(sectionFromHash()));
+    // A new threshold used to arrive as "from zero arrivals upward, staff
+    // reception for zero hours", which overlaps every row above it. The server
+    // rejects that on the next save with a message that points at nothing, so
+    // the row starts where the previous one ended instead.
+    function nextTierRow(key) {
+        const row = structuredClone(defaults[key]);
+        const [[minField], [maxField], [hoursField]] = configs[key];
+        const previous = model[key][model[key].length - 1];
+        if (previous) {
+            row[minField] = Number(previous[maxField] || previous[minField]) + 1;
+        }
+        // Hours are left blank deliberately: required then blocks the save until
+        // a real figure is typed, which beats a plausible-looking zero.
+        row[hoursField] = "";
+        return row;
+    }
+    document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(nextTierRow(key));renderRows(key);setDirty(true);syncSectionSwitches();focusNewRow(key)});
     // A missing element must not take the page down with it. These lookups run
     // during bootstrap, before loadHotels(), so a null here used to throw and
-    // leave the page stuck on "Loading properties..." with no clue why - which
+    // leave the page stuck on "Loading hotels…" with no clue why - which
     // is what a half-deployed HTML/JS pair looks like.
     function onClick(selector, handler) {
         const element = document.querySelector(selector);
@@ -1819,11 +1847,13 @@
         bedTypeList().push({bedName: "", linenCost: 0});
         renderCleaning();
         setDirty(true);
+        focusNewRow("bedTypes");
     });
     onClick("[data-add-origin-group]", () => {
         model.distributionOriginGroups.push(newOriginGroup());
         renderDistributionTree();
         setDirty(true);
+        focusNewRow("distributionOriginGroups");
     });
     // The two switches and the franchise basis all change which controls are
     // live, so they re-sync before the generic dirty handler runs.
@@ -1833,5 +1863,8 @@
             syncSectionSwitches();
         }
     });
-    hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?")){hotel.value=loadedEnterpriseId;return}loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});loadHotels();
+    hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?")){hotel.value=loadedEnterpriseId;return}loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});
+    showSection(sectionFromHash());
+    setEditorState("loading");
+    loadHotels();
 }());

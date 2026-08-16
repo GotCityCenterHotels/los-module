@@ -18,7 +18,6 @@
 
         <header class="page-header cost-header">
             <div>
-                <span class="page-kicker">POSTGRES · FUNCTIONS SCHEMA</span>
                 <h1>Cost Data</h1>
                 <p>Review revenue, payments, operating costs, and hotel movements.</p>
             </div>
@@ -29,14 +28,15 @@
         </header>
 
         <div class="cost-status-line">
-            <span id="costStatus" role="status" aria-live="polite">Choose a period, then update the data.</span>
+            <span id="costStatus" role="status" aria-live="polite">Select a period, then click Update data.</span>
             <span id="costScope"></span>
         </div>
+
+        <section id="costError" class="error-panel" role="alert" hidden></section>
 
         <div class="cost-overview">
             <section class="filter-panel cost-filters cost-query" aria-labelledby="costQueryTitle">
                 <div class="cost-query-heading">
-                    <span class="section-eyebrow">QUERY</span>
                     <h2 id="costQueryTitle">Query settings</h2>
                 </div>
                 <div class="filter-field">
@@ -81,7 +81,7 @@
             <section id="gopStatement" class="gop-statement" aria-labelledby="gopTitle" hidden>
                 <div class="gop-heading">
                     <div>
-                        <span class="section-eyebrow">NET · EXCL. VAT</span>
+                        <span class="section-eyebrow">Net · excl. VAT</span>
                         <h2 id="gopTitle">Gross Operating Profit</h2>
                     </div>
                     <span id="gopScopeNote" class="gop-scope"></span>
@@ -101,29 +101,28 @@
         <section id="gopChartPanel" class="gop-chart-panel" aria-labelledby="gopChartTitle" hidden>
             <div class="gop-heading">
                 <div>
-                    <span class="section-eyebrow">PER PERIOD</span>
                     <h2 id="gopChartTitle">Cost against revenue</h2>
                 </div>
-                <div class="chart-legend gop-chart-legend" aria-label="Chart legend">
-                    <span><i class="legend-swatch gop-legend-base"></i>Base amount</span>
-                    <span><i class="legend-swatch gop-legend-profit"></i>Profit</span>
-                    <span><i class="legend-swatch gop-legend-loss"></i>Loss</span>
-                    <span><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
+                <!-- ARIA prohibits naming a generic element, so the aria-label here
+                     was simply dropped; the list roles give it something nameable. -->
+                <div class="chart-legend gop-chart-legend" role="list" aria-label="Chart legend">
+                    <span role="listitem"><i class="legend-swatch gop-legend-base"></i>Base amount</span>
+                    <span role="listitem"><i class="legend-swatch gop-legend-profit"></i>Profit</span>
+                    <span role="listitem"><i class="legend-swatch gop-legend-loss"></i>Loss</span>
+                    <span role="listitem"><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
                 </div>
             </div>
 
             <div id="gopChart" class="los-chart gop-chart"></div>
             <p class="gop-chart-note">
-                One bar per period, using the <strong>Group by</strong> setting on the left.
-                The bar is what the period cost to run; the purple marker is the
-                revenue it earned.
+                One bar per <strong>Group by</strong> period. Bar height is what the
+                period cost to run; the marker is the revenue it earned.
             </p>
         </section>
 
         <section id="costResults" class="cost-results" hidden>
             <div class="cost-results-heading">
                 <div>
-                    <span class="section-eyebrow">DATASET</span>
                     <h2 id="costTableTitle">Room revenue</h2>
                 </div>
                 <span id="costRowCount" class="row-count"></span>
@@ -137,7 +136,7 @@
                 <button id="arrivalsDeparturesTab" type="button" role="tab" aria-controls="costTablePanel" aria-selected="false" data-dataset="arrivalsDepartures">Arrivals &amp; departures</button>
             </div>
 
-            <div id="costTablePanel" class="table-wrapper cost-table-wrapper" role="tabpanel" aria-labelledby="roomRevenueTab">
+            <div id="costTablePanel" class="table-wrapper cost-table-wrapper" role="tabpanel" aria-labelledby="roomRevenueTab" tabindex="0">
                 <table id="costTable">
                     <caption class="visually-hidden">Cost data for the selected period</caption>
                     <thead id="costTableHead"></thead>
@@ -145,8 +144,6 @@
                 </table>
             </div>
         </section>
-
-        <section id="costError" class="error-panel" role="alert" hidden></section>
     </main>
 
     <script src="los-api.js?v=73ab0a7665"></script>

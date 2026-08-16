@@ -74,6 +74,12 @@ function updateHotelToggleText() {
     else if (selected.length === 0) hotelToggle.textContent = "No hotels selected";
     else if (selected.length === 1) hotelToggle.textContent = selected[0].value;
     else hotelToggle.textContent = `${selected.length} hotels selected`;
+
+    // Only the single-hotel branch writes text the button cannot hold - most
+    // GCCH names run past the ~26 characters that fit - so that is the one
+    // branch that needs a tooltip carrying the full name.
+    if (hotelListLoaded && selected.length === 1) hotelToggle.title = selected[0].value;
+    else hotelToggle.removeAttribute("title");
 }
 
 function getHotelRequestKey(requestState) {
@@ -92,8 +98,8 @@ async function loadHotels(requestState = loadedRequestState || getRequestState()
     const requestKey = getHotelRequestKey(requestState);
     if (!forceRefresh && hotelListLoaded && loadedHotelRequestKey === requestKey) return;
     if (!hotelListLoaded) {
-        hotelToggle.textContent = "Loading hotels...";
-        hotelOptions.innerHTML = '<span class="multi-select-empty">Loading hotels...</span>';
+        hotelToggle.textContent = "Loading hotels…";
+        hotelOptions.innerHTML = '<span class="multi-select-empty">Loading hotels…</span>';
     }
     const payload = await LosApi.fetchHotelList({
         apiBaseUrl: API_BASE_URL,
@@ -186,14 +192,7 @@ async function loadData() {
         validateInputs();
         requestInProgress = true;
         updateLoadButtonState();
-        const ranges = LosApi.buildContiguousMonthRanges(
-            requestedState.selectedMonths,
-            requestedState.startDate,
-            requestedState.endDate
-        );
-        statusElement.textContent = ranges.length === 1
-            ? "Updating LOS facts..."
-            : `Updating LOS facts across ${ranges.length} selected ranges...`;
+        statusElement.textContent = "Updating…";
         const payload = await LosApi.fetchLosFactRanges({
             apiBaseUrl: API_BASE_URL,
             ...requestedState
@@ -203,13 +202,23 @@ async function loadData() {
         loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
-        statusElement.textContent = loadedFacts.length ? "Data is up to date." : "No data returned.";
+        statusElement.textContent = loadedFacts.length
+            ? "Data is up to date."
+            : "No rows for this period. Try a wider date range or another hotel.";
         loadHotels(requestedState, { forceRefresh: true }).catch(handleHotelError);
     }
     catch (error) {
         console.error(error);
         showError(error.message || "Unable to update data.");
         statusElement.textContent = "Update failed.";
+        summaryElement.hidden = true;
+        chartSection.hidden = true;
+        resultsSection.hidden = true;
+        // Hiding is not enough: the Group by handler calls render() directly,
+        // which unhides all three sections again and repaints whatever is still
+        // in loadedFacts - the numbers from the range we just failed to replace.
+        loadedFacts = [];
+        loadedRequestState = null;
     }
     finally {
         requestInProgress = false;
@@ -261,7 +270,7 @@ function renderTable(rows) {
         const cell = document.createElement("td");
         cell.colSpan = 11;
         cell.className = "empty-table-cell";
-        cell.textContent = "No data returned for the selected hotels.";
+        cell.textContent = "No rows for the selected hotels and period.";
         row.appendChild(cell);
         resultsBody.appendChild(row);
     }
@@ -309,7 +318,7 @@ function renderChart(rows) {
     chartSection.hidden = false;
     losChart.innerHTML = "";
     if (rows.length === 0) {
-        losChart.innerHTML = '<p class="chart-empty">No portfolio data to chart.</p>';
+        losChart.innerHTML = '<p class="chart-empty">Nothing to chart yet — try a wider date range.</p>';
         return;
     }
 
@@ -442,13 +451,21 @@ function renderChart(rows) {
         hoverLine.setAttribute("x1", x(index));
         hoverLine.setAttribute("x2", x(index));
         tooltip.hidden = false;
-        tooltip.classList.toggle("align-right", x(index) > width * 0.72);
         tooltip.style.left = `${x(index) / width * 100}%`;
         tooltip.innerHTML = `
             <strong class="chart-tooltip-title">${escapeHtml(label.primary)}${label.year ? ` ${escapeHtml(label.year)}` : ""}</strong>
             ${tooltipScenario("LOS", "#2563eb", row.scenarios.current)}
             ${tooltipScenario("LOS LY", "#f97316", row.scenarios.ly)}
             ${tooltipScenario("LOS SPIT", "#7c3aed", row.scenarios.spit)}`;
+
+        // The flip has to be measured, and only once the content is in. x() is
+        // in viewBox units (1100 wide) while the tooltip is sized in CSS pixels,
+        // so a fixed viewBox fraction overhangs further the narrower the panel
+        // gets - and .chart-panel { overflow: hidden } amputates it mid-word
+        // rather than scrolling.
+        const hostWidth = losChart.clientWidth;
+        const leftPx = x(index) / width * hostWidth;
+        tooltip.classList.toggle("align-right", leftPx + 14 + tooltip.offsetWidth > hostWidth);
     }
 
     function hidePoint() {
@@ -527,7 +544,13 @@ document.addEventListener("click", (event) => {
     if (!hotelSelect.contains(event.target)) setHotelMenuOpen(false);
 });
 document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") setHotelMenuOpen(false);
+    // Closing the menu sets [hidden], which takes the focused checkbox out of
+    // layout and drops focus to <body>, so the toggle has to take it back. The
+    // menu-state guard keeps Escape from stealing focus when nothing is open.
+    if (event.key === "Escape" && !hotelMenu.hidden) {
+        setHotelMenuOpen(false);
+        hotelToggle.focus();
+    }
 });
 startDateInput.addEventListener("input", markBackendSettingChanged);
 endDateInput.addEventListener("input", markBackendSettingChanged);

@@ -25,6 +25,7 @@
         futureLyDiff: document.getElementById("futureLyDiff"),
         validation: document.getElementById("supplementValidation"),
         tableMount: document.getElementById("supplementTableMount"),
+        gridAnnouncement: document.getElementById("gridAnnouncement"),
         rangeSummary: document.getElementById("rangeSummary"),
         freshness: document.getElementById("supplementFreshness"),
         dateWindowNav: document.getElementById("dateWindowNav"),
@@ -108,24 +109,27 @@
     function setFreshness(payload) {
         const approximate = payload?.inventoryQuality === "approximated-current";
         elements.freshness.classList.toggle("is-stale", Boolean(payload?.stale || approximate));
+        let next;
         if (!payload?.dataAsOf) {
-            elements.freshness.innerHTML = "<strong>Supplement unavailable</strong><span>No PostgreSQL snapshot has been published.</span>";
-            return;
-        }
-        if (payload.stale) {
-            elements.freshness.innerHTML = `<strong>Data is stale</strong><span>Last published snapshot: ${escapeHtml(payload.dataAsOf)}.</span>`;
+            next = "<strong>Supplement unavailable</strong><span>No snapshot has been published.</span>";
+        } else if (payload.stale) {
+            next = `<strong>Data is stale</strong><span>Last published snapshot: ${escapeHtml(payload.dataAsOf)}.</span>`;
         } else if (approximate) {
-            elements.freshness.innerHTML = `<strong>Historical inventory is approximate</strong><span>Exact inventory history begins ${escapeHtml(payload.inventoryExactFrom)}; booking lifecycle facts remain historical.</span>`;
+            next = `<strong>Historical inventory is approximate</strong><span>Exact inventory history begins ${escapeHtml(payload.inventoryExactFrom)}; booking lifecycle facts remain historical.</span>`;
         } else {
-            elements.freshness.innerHTML = `<strong>Published through ${escapeHtml(payload.dataAsOf)}</strong><span>Served from PostgreSQL; integration_db is not queried by this view.</span>`;
+            next = `<strong>Published through ${escapeHtml(payload.dataAsOf)}</strong>`;
         }
+        // The chip is a role="status" region and this runs on every grid load, so every branch
+        // goes through one guarded write. Rewriting identical markup would announce a change
+        // that did not happen.
+        if (elements.freshness.innerHTML !== next) elements.freshness.innerHTML = next;
     }
 
     function showUnavailable(error) {
         state.payload = null;
         elements.tableMount.innerHTML = `<div class="supplement-empty"><strong>Supplement data unavailable</strong><span>${escapeHtml(error.message || "No published data is available.")}</span></div>`;
         elements.freshness.classList.add("is-stale");
-        elements.freshness.innerHTML = "<strong>Live data unavailable</strong><span>The last published PostgreSQL snapshot could not be loaded.</span>";
+        elements.freshness.innerHTML = "<strong>Live data unavailable</strong><span>The last published snapshot could not be loaded.</span>";
         elements.rangeSummary.textContent = "No live data loaded";
         elements.dateWindowNav.hidden = true;
     }
@@ -183,15 +187,25 @@
     function renderMetricCell(row, date, cell, column, metric) {
         const detailHotel = state.mode === "comparison" ? row.code : state.hotelCode;
         const detailCategory = state.mode === "single" && !row.isTotal ? row.code : "";
-        const detailAttributes = row.isTotal ? " disabled" : ` data-detail-hotel="${escapeHtml(detailHotel)}" data-detail-category="${escapeHtml(detailCategory)}" data-detail-date="${date.date}" data-detail-metric="${metric}"`;
+        // A disabled total-row button is pixel-identical to a working one, so point it at the
+        // hidden note that says why there is nothing to open behind it.
+        const detailAttributes = row.isTotal
+            ? ' disabled aria-describedby="totalRowNote"'
+            : ` data-detail-hotel="${escapeHtml(detailHotel)}" data-detail-category="${escapeHtml(detailCategory)}" data-detail-date="${date.date}" data-detail-metric="${metric}"`;
         const todayClass = date.date === todayKey ? " is-today-column" : "";
+        // The visible figure has to come first in the accessible name. Leading with the metric
+        // instead would make the name not start with the label on screen (WCAG 2.5.3) and would
+        // bury the number when a screen reader lists the grid's buttons.
+        const nameFor = (figure) => ` aria-label="${escapeHtml(`${figure} ${metricLabels[metric]} ${column.label}, ${row.shortLabel || row.label}, ${date.date}`)}"`;
         if (column.comparison) {
             const value = differenceValue(cell, column.comparison, metric);
             const direction = value > 0 ? "is-positive" : value < 0 ? "is-negative" : "";
             const highlight = state.highlightedMetrics.has(metric) ? " is-highlighted" : "";
-            return `<td class="metric-difference ${direction}${highlight}${todayClass}"><button type="button"${detailAttributes}>${escapeHtml(Data.formatDifference(value, state.differenceMode, metric))}</button></td>`;
+            const text = Data.formatDifference(value, state.differenceMode, metric);
+            return `<td class="metric-difference ${direction}${highlight}${todayClass}"><button type="button"${detailAttributes}${nameFor(text)}>${escapeHtml(text)}</button></td>`;
         }
-        return `<td class="${todayClass.trim()}"><button type="button"${detailAttributes}>${escapeHtml(Data.formatMetric(cell[column.mode]?.[metric], metric))}</button></td>`;
+        const text = Data.formatMetric(cell[column.mode]?.[metric], metric);
+        return `<td class="${todayClass.trim()}"><button type="button"${detailAttributes}${nameFor(text)}>${escapeHtml(text)}</button></td>`;
     }
 
     function visibleWindow(payload) {
@@ -208,13 +222,19 @@
     }
 
     function renderTable(payload) {
+        // Written before the empty-case return below, so a selection that empties the grid is
+        // announced too. payload.dates is the whole requested range; the visible slice does not
+        // exist until visibleWindow() runs a few lines down.
+        elements.gridAnnouncement.textContent = payload.rows.length
+            ? `Revenue grid updated: ${payload.rows.length} row${payload.rows.length === 1 ? "" : "s"} across ${payload.dates.length} date${payload.dates.length === 1 ? "" : "s"}.`
+            : "Revenue grid is empty. Select at least one room category or hotel.";
         if (!payload.rows.length) {
             elements.tableMount.innerHTML = '<div class="supplement-empty"><strong>No rows selected</strong><span>Select at least one room category or hotel.</span></div>';
             return;
         }
         const window = visibleWindow(payload);
-        const dateHeaders = window.dates.map((date) => `<th colspan="${columnsForDate(date).length}" class="date-group${date.isWeekend ? " is-weekend" : ""}${date.date === todayKey ? " is-today" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
-        const modeHeaders = window.dates.map((date) => columnsForDate(date).map((column) => `<th class="mode-column${column.comparison ? " difference-column" : ""}${date.date === todayKey ? " is-today-column" : ""}">${column.label}</th>`).join("")).join("");
+        const dateHeaders = window.dates.map((date) => `<th scope="colgroup" colspan="${columnsForDate(date).length}" class="date-group${date.isWeekend ? " is-weekend" : ""}${date.date === todayKey ? " is-today" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
+        const modeHeaders = window.dates.map((date) => columnsForDate(date).map((column) => `<th scope="col" class="mode-column${column.comparison ? " difference-column" : ""}${date.date === todayKey ? " is-today-column" : ""}">${column.label}</th>`).join("")).join("");
         const body = payload.rows.map((row) => {
             const averages = Data.computeRowAverages(row);
             return Data.METRICS.map((metric, metricIndex) => {
@@ -227,7 +247,7 @@
                 return `<tr class="${classes.trim()}">${rowLabel}<th class="metric-label" scope="row">${metricLabels[metric]}</th>${cells}${averageCells}</tr>`;
             }).join("");
         }).join("");
-        elements.tableMount.innerHTML = `<table class="supplement-table"><thead><tr><th rowspan="2" class="sticky-label">${state.mode === "single" ? "Category" : "Hotel"}</th><th rowspan="2" class="sticky-metric">Metric</th>${dateHeaders}<th colspan="3" class="average-group">Period average</th></tr><tr>${modeHeaders}<th class="mode-column average-group">OTB</th><th class="mode-column average-group">SPIT</th><th class="mode-column average-group">LY</th></tr></thead><tbody>${body}</tbody></table>`;
+        elements.tableMount.innerHTML = `<table class="supplement-table"><caption class="visually-hidden">Revenue grid by ${state.mode === "single" ? "room category" : "hotel"}, showing OCC, ADR and RevPAR for each date.</caption><thead><tr><th rowspan="2" class="sticky-label">${state.mode === "single" ? "Category" : "Hotel"}</th><th rowspan="2" class="sticky-metric">Metric</th>${dateHeaders}<th colspan="3" class="average-group">Period average</th></tr><tr>${modeHeaders}<th class="mode-column average-group">OTB</th><th class="mode-column average-group">SPIT</th><th class="mode-column average-group">LY</th></tr></thead><tbody>${body}</tbody></table>`;
         elements.tableMount.classList.remove("is-refreshing");
         void elements.tableMount.offsetWidth;
         elements.tableMount.classList.add("is-refreshing");
@@ -246,6 +266,8 @@
         if ((state.mode === "single" && state.enabledCategories.size === 0)
                 || (state.mode === "comparison" && state.enabledHotels.size === 0)) {
             state.payload = { dates: [], rows: [] };
+            // This path never reaches renderTable, so it has to announce the empty grid itself.
+            elements.gridAnnouncement.textContent = "Revenue grid is empty. Select at least one room category or hotel.";
             elements.tableMount.innerHTML = '<div class="supplement-empty"><strong>No rows selected</strong><span>Select at least one room category or hotel.</span></div>';
             elements.rangeSummary.textContent = "No rows selected";
             elements.dateWindowNav.hidden = true;
@@ -305,7 +327,7 @@
         const comparison = [...comparisonPoints].sort((a, b) => b.daysBeforeStay - a.daysBeforeStay);
         const allPoints = [...current, ...comparison];
         if (!allPoints.length) {
-            return '<div class="supplement-empty pickup-empty"><strong>No pickup history yet</strong><span>Backfilled daily snapshots will build this curve over time.</span></div>';
+            return '<div class="supplement-empty pickup-empty"><strong>No pickup history yet</strong><span>No daily snapshots have been recorded for these dates.</span></div>';
         }
 
         const width = 880;
@@ -433,7 +455,10 @@
 
     async function refreshDetail() {
         if (!state.pickupRequest) return;
-        elements.pickupCurve.innerHTML = '<div class="pickup-loading" aria-hidden="true"></div>';
+        elements.pickupCurve.innerHTML = '<div class="pickup-loading" role="progressbar" aria-label="Loading pickup pace"></div>';
+        // The dialog is already open here, so nothing else announces the reload; #pickupCoverage
+        // is the polite region that will carry the new coverage line once the fetch settles.
+        elements.pickupCoverage.textContent = "Loading pickup pace…";
         try {
             const payload = await Data.fetchDetail({
                 ...state.pickupRequest,
@@ -458,7 +483,7 @@
             ? `${payload.comparison} · ${comparisonLast.assignedRooms} rooms`
             : payload.comparisonAvailable
                 ? `${payload.comparison} · no history`
-                : `${payload.comparison} · backfill needed`;
+                : `${payload.comparison} · no history yet`;
         const coverageParts = [];
         if (payload.pickup.length) {
             coverageParts.push(`Current: ${payload.pickup.length} day${payload.pickup.length === 1 ? "" : "s"}`);
@@ -485,11 +510,12 @@
         elements.detailInventory.textContent = "—";
         elements.detailOccupancy.textContent = "—";
         elements.detailBreakdown.innerHTML = "";
-        elements.pickupCurve.innerHTML = '<div class="pickup-loading" aria-hidden="true"></div>';
+        elements.pickupCurve.innerHTML = '<div class="pickup-loading" role="progressbar" aria-label="Loading pickup pace"></div>';
         elements.pickupCoverage.textContent = "";
         elements.pickupCurrentLabel.textContent = "Current · loading";
         elements.pickupComparisonLabel.textContent = "Comparison · loading";
-        elements.dialogFootnote.textContent = "Loading from the latest published PostgreSQL snapshot.";
+        // A blank footnote that fills in a moment later reads as a layout jump, so hold the row.
+        elements.dialogFootnote.textContent = "Loading…";
         elements.dialog.showModal();
         try {
             state.pickupRequest = {
@@ -507,6 +533,10 @@
             const hotelName = state.hotels.find(({ code }) => code === payload.hotelCode)?.name || payload.hotelCode;
             const categoryName = (state.categoriesByHotel[payload.hotelCode] || [])
                 .find(({ code }) => code === payload.roomCategory)?.name;
+            // Clear aria-busy before the first success write, not in the finally block. A polite
+            // update inside an aria-busy subtree is withheld, so #detailContext would otherwise
+            // never be announced — the attribute would only come off after the text had settled.
+            elements.dialog.removeAttribute("aria-busy");
             elements.detailContext.textContent = `${hotelName} · ${categoryName || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
             const occupancy = payload.inventory > 0
                 ? payload.totalAssignedRooms / payload.inventory * 100 : null;
@@ -527,13 +557,13 @@
             renderPickup(payload);
             elements.dialogFootnote.textContent = payload.inventoryQuality === "approximated-current"
                 ? `Published through ${payload.dataAsOf} · inventory is approximated from current rooms before ${payload.inventoryExactFrom}.`
-                : `Published through ${payload.dataAsOf} · served from PostgreSQL.`;
+                : `Data through ${payload.dataAsOf}`;
         } catch (error) {
             elements.dialog.classList.add("has-error");
             elements.detailContext.textContent = "The selected metric could not be opened.";
             elements.detailError.textContent = error.message || "Detail data is unavailable.";
             elements.detailError.hidden = false;
-            elements.dialogFootnote.textContent = "No simulated fallback was used.";
+            elements.dialogFootnote.textContent = "Close and try again in a moment.";
         } finally {
             elements.dialog.removeAttribute("aria-busy");
         }

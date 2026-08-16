@@ -1,7 +1,8 @@
 import os
 import unittest
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 os.environ.setdefault("DB_HOST", "localhost")
@@ -14,6 +15,12 @@ os.environ.setdefault("POSTGRES_USER", "app-test")
 os.environ.setdefault("POSTGRES_PASSWORD", "not-used")
 
 from services import cost_source_service
+
+
+# Importing the service opens the integration_db pool. Nothing here ever uses
+# it - every test patches export_pool - so it is closed rather than left with
+# background threads pointed at a localhost placeholder.
+cost_source_service.export_pool.close()
 
 
 class FakeCursor:
@@ -72,8 +79,8 @@ class CleaningCategoryTests(unittest.TestCase):
     def _run(self, columns, rows):
         cursor = FakeCursor(columns, rows)
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             return cost_source_service.list_cleaning_categories("hotel-1"), cursor
 
@@ -132,8 +139,8 @@ class CleaningCategoryTests(unittest.TestCase):
         columns = {"resource_category_current": {"id", "enterprise_id", "space_name"}}
         cursor = FakeCursor(columns, [])
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             with self.assertRaises(cost_source_service.CostSourceUnavailableError) as raised:
                 cost_source_service.list_cleaning_categories("hotel-1")
@@ -144,8 +151,8 @@ class CleaningCategoryTests(unittest.TestCase):
     def test_unknown_table_is_reported_clearly(self):
         cursor = FakeCursor({}, [])
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             with self.assertRaises(cost_source_service.CostSourceUnavailableError) as raised:
                 cost_source_service.list_cleaning_categories("hotel-1")
@@ -203,8 +210,8 @@ class ChannelLookupTests(unittest.TestCase):
         # simply stays free text.
         cursor = FakeCursor({"reservation_current": {"id", "service_id"}}, [])
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             self.assertEqual(cost_source_service.list_channels("hotel-1"), [])
 
@@ -214,8 +221,8 @@ class ChannelLookupTests(unittest.TestCase):
             [{"channel_name": "ChannelManager"}, {"channel_name": "Direct"}],
         )
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             channels = cost_source_service.list_channels("hotel-1")
         self.assertEqual([c["name"] for c in channels], ["ChannelManager", "Direct"])
@@ -231,8 +238,8 @@ class RateLookupTests(unittest.TestCase):
             [{"rate_id": "r1", "rate_name": "BAR"}],
         )
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             rates = cost_source_service.list_rates("hotel-1")
         self.assertEqual(rates, [{"id": "r1", "name": "BAR"}])
@@ -244,8 +251,8 @@ class RateLookupTests(unittest.TestCase):
             [{"rate_id": "r2", "rate_name": "Corporate"}],
         )
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             rates = cost_source_service.list_rates("hotel-1")
         self.assertEqual(rates, [{"id": "r2", "name": "Corporate"}])
@@ -268,8 +275,8 @@ class SourceWindowTests(unittest.TestCase):
     def _run(self, call, columns, rows):
         cursor = FakeCursor(columns, rows)
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             return call(), cursor
 
@@ -324,8 +331,8 @@ class MatchingRateTests(unittest.TestCase):
     def _run(self, columns, rows, **kwargs):
         cursor = FakeCursor(columns, rows)
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             return cost_source_service.list_matching_rates("hotel-1", **kwargs), cursor
 
@@ -403,16 +410,14 @@ class SourceCacheTests(unittest.TestCase):
             },
             [],
         )
-        with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
-        ) as connect:
+        pool = SimpleNamespace(connection=Mock(return_value=FakeConnection(cursor)))
+        with patch.object(cost_source_service, "export_pool", pool):
             first = cost_source_service.fetch_cost_sources("hotel-1")
             second = cost_source_service.fetch_cost_sources("hotel-1")
 
-        # Four lookups used to mean four TLS handshakes; the second page load
-        # used to mean four more.
-        connect.assert_called_once()
+        # Four lookups used to mean four pool checkouts - and, before the pool,
+        # four TLS handshakes. The second page load used to mean four more.
+        pool.connection.assert_called_once()
         self.assertIs(first, second)
         self.assertIn("origins", first)
         self.assertTrue(first["capabilities"]["origin"])
@@ -435,8 +440,8 @@ class TravelAgencyTests(unittest.TestCase):
     def _run(self, call, columns, rows):
         cursor = FakeCursor(columns, rows)
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             return call(), cursor
 
@@ -507,8 +512,8 @@ class TravelAgencyTests(unittest.TestCase):
         columns = {"reservation_current": {"id", "service_id"}}
         cursor = FakeCursor(columns, [])
         with patch.object(
-            cost_source_service, "get_export_connection",
-            return_value=FakeConnection(cursor)
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
         ):
             self.assertIsNone(cost_source_service._resolve_column(
                 cursor, "reservation_current",

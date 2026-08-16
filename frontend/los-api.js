@@ -25,7 +25,11 @@
                     + "Try a narrower date range."
                 );
             }
-            throw new Error(`Could not reach the API: ${error.message}`);
+            // The underlying fetch failure (DNS, TLS, CORS, offline) is the only
+            // diagnostic there is on this path, and the message shown to the user
+            // deliberately does not carry it, so log it before it is discarded.
+            console.error("Network request failed", error);
+            throw new Error("Could not reach the server. Check your connection and try again.");
         }
 
         const raw = await response.text();

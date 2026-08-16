@@ -18,6 +18,7 @@ lookups themselves.
 import logging
 import os
 
+from concurrent.futures import Future
 from datetime import date, timedelta
 from threading import Lock
 from time import monotonic
@@ -25,7 +26,8 @@ from time import monotonic
 from psycopg.rows import dict_row
 from psycopg.sql import SQL, Identifier, Literal
 
-from shared.db import HTTP_EXPORT_STATEMENT_TIMEOUT_MS, get_export_connection
+from database import pool as export_pool
+from shared.db import HTTP_EXPORT_STATEMENT_TIMEOUT_MS
 from shared.mews_source import (
     CATEGORY_ORDERING_COLUMNS,
     UNORDERED_CATEGORY_RANK,
@@ -106,8 +108,32 @@ PICKER_LIMIT = int(os.environ.get("COST_SOURCE_PICKER_LIMIT", "500"))
 # half of the same bargain, and it also covers the second worker that never
 # sees the browser cache.
 SOURCE_CACHE_TTL_SECONDS = 600
+# A failure is cached too, and for far less time than a success. Without it,
+# every request that arrives while integration_db is unreachable spends the
+# full HTTP_EXPORT_STATEMENT_TIMEOUT_MS holding one of the instance's four HTTP
+# slots; with it, one request pays that and the rest are told immediately.
+SOURCE_FAILURE_TTL_SECONDS = int(
+    os.environ.get("COST_SOURCE_FAILURE_TTL_SECONDS", "30")
+)
+# Cached in place of the exception itself. Re-raising one exception instance
+# across many requests keeps appending frames to its __traceback__, so later
+# App Insights entries would point at the first request's stack.
+_FAILED = object()
 _source_cache = {}
+_source_inflight = {}
 _source_cache_lock = Lock()
+
+# The two interactive pickers run the same reservation_current aggregation as
+# the payload above, but with the operator's own filters, so they cannot share
+# its cache. The TTL is short because these answer a search box: a term typed
+# twice within a minute is the same question, but an agency that appeared in
+# the mirror this morning must not stay invisible all afternoon.
+LOOKUP_CACHE_TTL_SECONDS = int(
+    os.environ.get("COST_SOURCE_LOOKUP_TTL_SECONDS", "60")
+)
+LOOKUP_CACHE_MAX_ENTRIES = 256
+_lookup_cache = {}
+_lookup_lock = Lock()
 
 
 def _split_table(table_name):
@@ -198,38 +224,88 @@ def _resolve_table(cursor, candidates):
 
 
 def _reset_column_cache():
-    """Test seam - the cache is keyed by table name only."""
+    """Test seam - every cache in this module is keyed by table name, hotel or
+    lookup arguments only, so clearing them wholesale is safe."""
     with _column_lock:
         _column_cache.clear()
     with _source_cache_lock:
         _source_cache.clear()
+        # A Future left behind by a failed test would make the next test block
+        # on a result that is never going to arrive.
+        _source_inflight.clear()
+    with _lookup_lock:
+        _lookup_cache.clear()
+
+
+def _lookup_key(name, enterprise_id, origins, search):
+    """A cache key for one interactive lookup.
+
+    Origins are sorted and the search term is case-folded because the query
+    treats them that way: ILIKE is case-insensitive and the origin predicate is
+    a set membership test, so two calls differing only in those respects would
+    otherwise miss a memo entry that already holds their answer.
+    """
+    return (
+        name,
+        str(enterprise_id),
+        tuple(sorted(origins)) if origins else None,
+        str(search or "").strip().casefold(),
+    )
+
+
+def _memoized_lookup(key, compute):
+    now = monotonic()
+    with _lookup_lock:
+        cached = _lookup_cache.get(key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    result = compute()
+
+    with _lookup_lock:
+        _lookup_cache[key] = (monotonic() + LOOKUP_CACHE_TTL_SECONDS, result)
+        if len(_lookup_cache) > LOOKUP_CACHE_MAX_ENTRIES:
+            # Every distinct search term the operator types is a key, so this
+            # would otherwise grow without bound over a worker's lifetime.
+            oldest = min(_lookup_cache, key=lambda entry: _lookup_cache[entry][0])
+            del _lookup_cache[oldest]
+    return result
 
 
 class _Session:
-    """One integration_db connection, opened lazily and shared by the lookups.
+    """One pooled integration_db connection, shared by the lookups.
 
     Every lookup used to open its own connection: three TLS handshakes and
     three SCRAM exchanges per page load, ~60-150ms each against Azure Postgres,
-    all serialized inside one request before a single row was read.
+    all serialized inside one request before a single row was read. Checking
+    out of the pool in database.py removes the handshake from the warm case
+    entirely, and lets psycopg promote these repeated queries to server-side
+    prepared statements - which never happened while every request arrived on a
+    connection that had run each query zero times.
     """
 
     def __init__(self, cursor=None):
         self._cursor = cursor
-        self._connection = None
+        self._checkout = None
         self._owns = cursor is None
 
     def __enter__(self):
         if self._cursor is None:
-            self._connection = get_export_connection(
-                statement_timeout_ms=HTTP_EXPORT_STATEMENT_TIMEOUT_MS
+            self._checkout = export_pool.connection()
+            connection = self._checkout.__enter__()
+            self._cursor = connection.cursor(row_factory=dict_row)
+            # The pool's session options carry the 300s ceiling the background
+            # jobs need. An HTTP read has to narrow it per transaction instead:
+            # the browser gives up at 40s, and a picker query that outlives
+            # that is burning an integration_db backend for nobody.
+            self._cursor.execute(
+                f"SET LOCAL statement_timeout = {HTTP_EXPORT_STATEMENT_TIMEOUT_MS}"
             )
-            self._connection.__enter__()
-            self._cursor = self._connection.cursor(row_factory=dict_row)
         return self._cursor
 
     def __exit__(self, *exception):
-        if self._owns and self._connection is not None:
-            return self._connection.__exit__(*exception)
+        if self._owns and self._checkout is not None:
+            return self._checkout.__exit__(*exception)
         return False
 
 
@@ -565,7 +641,22 @@ def list_travel_agencies(enterprise_id, search="", origins=None, cursor=None):
     Company, so the searchable name comes from the company table. Returns an
     empty list rather than failing when the mirror carries neither, so the
     subgroup filter degrades to a typed value that is matched at cost time.
+
+    Memoized briefly, like the matching-rate lookup it shares a scan with.
     """
+    if cursor is not None:
+        return _list_travel_agencies_uncached(
+            enterprise_id, search, origins, cursor
+        )
+    return _memoized_lookup(
+        _lookup_key("agencies", enterprise_id, origins, search),
+        lambda: _list_travel_agencies_uncached(
+            enterprise_id, search, origins, None
+        ),
+    )
+
+
+def _list_travel_agencies_uncached(enterprise_id, search, origins, cursor):
     with _Session(cursor) as source:
         join = _agency_join(source)
         if not join:
@@ -654,7 +745,24 @@ def list_matching_rates(enterprise_id, origins=None, agencySearch="", cursor=Non
     that can occur under the chosen origin and agency. Returns a `filtered`
     flag so the caller can say plainly whether the narrowing happened, rather
     than presenting the full list as if it were the filtered one.
+
+    Memoized briefly: the editor fires one of these per agency search term
+    through Promise.all, so a four-term subgroup used to run four copies of the
+    same reservation_current aggregation at once.
     """
+    if cursor is not None:
+        return _list_matching_rates_uncached(
+            enterprise_id, origins, agencySearch, cursor
+        )
+    return _memoized_lookup(
+        _lookup_key("rates", enterprise_id, origins, agencySearch),
+        lambda: _list_matching_rates_uncached(
+            enterprise_id, origins, agencySearch, None
+        ),
+    )
+
+
+def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
     with _Session(cursor) as source:
         rate_fk = _resolve_column(
             source, "reservation_current", RESERVATION_RATE_COLUMNS, required=False
@@ -778,15 +886,52 @@ def fetch_cost_sources(enterprise_id):
     Memoized per worker: this data changes at most daily, and recomputing it on
     every page load is the difference between an instant editor and one that
     waits on integration_db.
+
+    Single-flight, because the lock used to be released before the work was
+    done: with perInstanceConcurrency=4, four requests for the same hotel all
+    missed the cache, all ran the same aggregation, and the last one to finish
+    won. The three that lost had spent an integration_db connection each for
+    nothing.
     """
     key = str(enterprise_id)
     now = monotonic()
     with _source_cache_lock:
         cached = _source_cache.get(key)
         if cached and cached[0] > now:
+            if cached[1] is _FAILED:
+                raise CostSourceUnavailableError(
+                    "integration_db was unreachable moments ago; retrying shortly"
+                )
             return cached[1]
 
-    payload = _fetch_cost_sources_uncached(enterprise_id)
-    with _source_cache_lock:
-        _source_cache[key] = (now + SOURCE_CACHE_TTL_SECONDS, payload)
-    return payload
+        pending = _source_inflight.get(key)
+        if pending is None:
+            pending = Future()
+            _source_inflight[key] = pending
+            owns_query = True
+        else:
+            owns_query = False
+
+    if not owns_query:
+        return pending.result()
+
+    try:
+        payload = _fetch_cost_sources_uncached(enterprise_id)
+    except BaseException as error:
+        with _source_cache_lock:
+            _source_cache[key] = (
+                monotonic() + SOURCE_FAILURE_TTL_SECONDS, _FAILED
+            )
+        pending.set_exception(error)
+        raise
+    else:
+        with _source_cache_lock:
+            _source_cache[key] = (
+                monotonic() + SOURCE_CACHE_TTL_SECONDS, payload
+            )
+        pending.set_result(payload)
+        return payload
+    finally:
+        with _source_cache_lock:
+            if _source_inflight.get(key) is pending:
+                del _source_inflight[key]

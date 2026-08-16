@@ -4,6 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data Input</title>
+    <!-- Before the stylesheet on purpose. A classic script does not run while a
+         preceding stylesheet is still loading, so putting this after the link
+         would put the whole of styles.css in front of the first API call. -->
+    <script src="costdata-boot.js"></script>
     <link rel="stylesheet" href="styles.css?v=69c5bf0518">
 </head>
 <body>
@@ -15,56 +19,72 @@
     </nav>
 
     <header class="page-header settings-header">
-        <div><span class="page-kicker">PROPERTY COST RULEBOOK</span><h1>Cost Data Input</h1>
+        <div><h1>Cost Data Input</h1>
             <p>Maintain the assumptions used to turn operating data into property costs.</p></div>
         <div class="settings-property">
-            <label for="settingsHotel">Property</label>
-            <div><select id="settingsHotel"><option value="">Select property</option></select><button type="button" id="runImportButton" class="secondary-button">Run cost data import</button></div>
+            <label for="settingsHotel">Hotel</label>
+            <div><select id="settingsHotel"><option value="">Select hotel</option></select></div>
         </div>
     </header>
 
     <div id="settingsStatus" class="cost-status-line" role="status" aria-live="polite">Select a property to begin.</div>
     <section id="settingsError" class="error-panel" role="alert" hidden></section>
-    <div id="settingsLayout" class="settings-layout" hidden>
-        <aside class="settings-nav" aria-label="Cost setting categories">
-            <button type="button" aria-current="page" data-section="distribution"><span>01</span>Distribution</button>
-            <button type="button" data-section="cleaning"><span>02</span>Cleaning</button>
-            <button type="button" data-section="arrivals"><span>03</span>Arrivals</button>
-            <button type="button" data-section="breakfast"><span>04</span>Breakfast</button>
-            <button type="button" data-section="rent"><span>05</span>Rent</button>
-            <button type="button" data-section="cardFranchise"><span>06</span>Card &amp; franchise</button>
+    <div class="settings-maintenance">
+        <div>
+            <h2>Cost data import</h2>
+            <p>Re-imports every cost dataset for every hotel. Runs for up to 35 minutes.</p>
+        </div>
+        <button type="button" id="runImportButton" class="secondary-button">Run import for all hotels</button>
+    </div>
+    <div id="settingsLayout" class="settings-layout">
+        <!-- The rail is not site navigation: aria-current="page" is already taken
+             by the Cost Input link in the main nav above, and two elements
+             claiming it leaves assistive technology with no single current page.
+             These select a panel, so they are tabs. -->
+        <aside class="settings-nav" role="tablist" aria-label="Cost setting categories">
+            <button type="button" role="tab" aria-selected="true" disabled data-section="distribution"><span>01</span>Distribution</button>
+            <button type="button" role="tab" aria-selected="false" disabled data-section="cleaning"><span>02</span>Cleaning</button>
+            <button type="button" role="tab" aria-selected="false" disabled data-section="arrivals"><span>03</span>Arrivals</button>
+            <button type="button" role="tab" aria-selected="false" disabled data-section="breakfast"><span>04</span>Breakfast</button>
+            <button type="button" role="tab" aria-selected="false" disabled data-section="rent"><span>05</span>Rent</button>
+            <button type="button" role="tab" aria-selected="false" disabled data-section="cardFranchise"><span>06</span>Card &amp; franchise</button>
         </aside>
 
         <form id="settingsForm" class="settings-editor">
             <section data-settings-section="distribution">
                 <div class="editor-heading"><div><span class="section-eyebrow">ROOM REVENUE</span><h2>Distribution costs</h2><p>Group reservations by origin, narrow them by travel agency, then set the percentage for specific rates. The most specific level that matches wins.</p></div><button type="button" class="secondary-button" data-add-origin-group>Add origin group</button></div>
                 <div class="setting-strip"><label>Fallback distribution %<input name="distributionDefaultPercent" type="number" min="0" max="100" step="0.01" required><small>Applied where no group matches</small></label></div>
+                <!-- The shell above is correct before any data exists, so it stays on
+                     screen while the requests are in flight. Only the repeating rows
+                     are unknown, and this stands in for them. -->
+                <div id="settingsSkeleton" class="settings-skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
                 <div id="distributionOriginGroups" class="rule-list distribution-tree"></div>
             </section>
             <section data-settings-section="cleaning" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Define the property's beds once, then say which beds each room category is made up with. The lowest guest count carries the setup and the rest inherit it.</p></div><span id="cleaningProgress" class="section-progress"></span></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>List the hotel's bed types once, then assign beds to each room category. Higher guest counts reuse the lowest count's beds unless you edit them.</p></div><span id="cleaningProgress" class="section-progress"></span></div>
                 <div class="setting-strip"><label>Cleaning cost / minute (kr)<input name="cleaningCostPerMinute" type="number" min="0" step="1" required></label></div>
                 <div class="bed-types">
-                    <div class="bed-types-heading"><span class="tree-field-label">Bed types</span><button type="button" class="text-button" data-add-bed-type>+ Add bed type</button></div>
+                    <div class="bed-types-heading"><h3>Bed types</h3><button type="button" class="secondary-button" data-add-bed-type>Add bed type</button></div>
                     <div id="bedTypes" class="bed-type-list"></div>
                 </div>
                 <div id="cleaningCategories" class="cleaning-list"></div>
             </section>
             <section data-settings-section="arrivals" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set reception hours required when daily arrivals enter a threshold. A count above the highest threshold uses that threshold.</p></div><label class="section-switch"><input type="checkbox" name="arrivalCostEnabled" checked><span>Charge arrival cost</span></label></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set the reception hours needed for each band of daily arrivals. Counts above the highest band use that band.</p></div><label class="section-switch"><input type="checkbox" name="arrivalCostEnabled" checked><span>Charge arrival cost</span></label></div>
                 <div class="setting-strip"><label>Reception cost / hour (kr)<input name="receptionCostPerHour" type="number" min="0" step="1" required></label></div>
                 <div class="section-actions"><button type="button" class="secondary-button" data-add="arrivalTiers">Add threshold</button></div>
-                <div id="arrivalTiers" class="rule-list"></div>
-                <p class="section-off-note" hidden>Arrival cost is switched off for this property, so these thresholds are not applied and the Cost Data page will not report them as missing.</p>
+                <div id="arrivalTiers" class="rule-list is-compact-list"></div>
+                <p class="section-off-note" hidden>Arrival cost is off for this hotel. These thresholds are not applied, and Cost Data will not flag them as missing.</p>
             </section>
             <section data-settings-section="breakfast" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">BREAKFAST GUESTS</span><h2>Food & staffing</h2><p>Apply direct food cost per guest and staff hours by guest-count threshold.</p></div><button type="button" class="secondary-button" data-add="breakfastTiers">Add threshold</button></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">BREAKFAST GUESTS</span><h2>Food & staffing</h2><p>Apply direct food cost per guest and staff hours by guest-count threshold.</p></div></div>
                 <div class="setting-strip"><label>Calculate from<select name="breakfastCalculationBasis"><option value="guests">Breakfast guests</option><option value="products">Sold products</option></select></label><label>Food cost / unit (kr)<input name="breakfastFoodCostPerGuest" type="number" min="0" step="1" required></label><label>Staff cost / hour (kr)<input name="breakfastStaffCostPerHour" type="number" min="0" step="1" required></label></div>
-                <p class="tier-hint">One row per threshold. Leave <strong>To guests</strong> empty on the last row to leave it open-ended.</p>
+                <p class="tier-hint">Leave <strong>To guests</strong> empty on the last row for no upper limit.</p>
+                <div class="section-actions"><button type="button" class="secondary-button" data-add="breakfastTiers">Add threshold</button></div>
                 <div id="breakfastTiers" class="rule-list is-compact-list"></div>
             </section>
             <section data-settings-section="rent" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">REVENUE</span><h2>Rent costs</h2><p>Percentages apply to the matching net revenue stream.</p></div></div>
+                <div class="editor-heading is-single"><div><span class="section-eyebrow">REVENUE</span><h2>Rent costs</h2><p>Percentages apply to the matching net revenue stream.</p></div></div>
                 <div class="setting-grid"><label>Room rent %<input name="roomRentPercent" type="number" min="0" max="100" step="0.01" required><small>Room revenue net</small></label><label>Breakfast rent %<input name="breakfastRentPercent" type="number" min="0" max="100" step="0.01" required><small>Breakfast revenue net</small></label><label>Parking rent %<input name="parkingRentPercent" type="number" min="0" max="100" step="0.01" required><small>Parking revenue net</small></label></div>
             </section>
             <section data-settings-section="cardFranchise" hidden>
@@ -72,14 +92,14 @@
                 <div class="setting-grid"><label>Card cost %<input name="cardCostPercent" type="number" min="0" max="100" step="0.01" required><small>Gross payments; default 2%</small></label></div>
                 <div class="franchise-card" id="franchiseCard">
                     <div class="franchise-card-heading">
-                        <div><h3>Franchise fee</h3><p>The switch decides whether this property is charged at all; the fields below decide how much.</p></div>
+                        <div><h3>Franchise fee</h3></div>
                         <label class="section-switch"><input type="checkbox" name="franchiseEnabled"><span>Charge franchise fee</span></label>
                     </div>
                     <div class="franchise-fields" id="franchiseFields">
                         <label>Franchise %<input name="franchisePercent" type="number" min="0" max="100" step="0.01" required><small>Of the revenue base below</small></label>
-                        <label>Calculated from<select name="franchiseBasis"><option value="net">Net revenue</option><option value="gross">Gross revenue (incl. VAT)</option></select><small>Cost facts are net; gross is derived</small></label>
+                        <label>Calculated from<select name="franchiseBasis"><option value="net">Net revenue</option><option value="gross">Gross revenue (incl. VAT)</option></select><small>Revenue is stored net of VAT</small></label>
                         <label>Revenue base<select name="franchiseRevenueBase"><option value="roomInclProducts">Room revenue incl. products</option><option value="roomExclProducts">Room revenue &minus; products</option><option value="roomExclProductsPlusParking">Room revenue &minus; products, plus parking</option><option value="totalRevenue">Total revenue (room incl. products + parking)</option></select><small>Products include breakfast sold on the room</small></label>
-                        <label id="franchiseVatField" hidden>VAT % used for gross<input name="franchiseVatPercent" type="number" min="0" max="100" step="0.01" required><small>Grosses the net revenue base up before the franchise % is applied</small></label>
+                        <label id="franchiseVatField" hidden>VAT % used for gross<input name="franchiseVatPercent" type="number" min="0" max="100" step="0.01" required><small>Used to convert net revenue to gross</small></label>
                     </div>
                     <p class="section-off-note" id="franchiseOffNote" hidden>The franchise fee is switched off for this property, so nothing in this card is charged.</p>
                 </div>

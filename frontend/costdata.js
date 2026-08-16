@@ -144,7 +144,7 @@
         try {
             validateDates();
             setLoading(true);
-            elements.status.textContent = "Reading the functions schema…";
+            elements.status.textContent = "Loading cost data…";
             const parameters = new URLSearchParams({
                 startDate: elements.startDate.value,
                 endDate: elements.endDate.value
@@ -168,6 +168,13 @@
             elements.error.textContent = error.message || "Unable to update cost data.";
             elements.error.hidden = false;
             elements.status.textContent = "Update failed.";
+            // The previous query's figures must not stay on screen under the new
+            // header controls: the error panel sits well below the fold, so the
+            // page would otherwise read as a successful answer to the new query.
+            elements.gop.hidden = true;
+            elements.gopChart.hidden = true;
+            elements.results.hidden = true;
+            elements.scope.textContent = "";
         }
         finally {
             setLoading(false);
@@ -277,8 +284,8 @@
 
         elements.gopScope.textContent = statement.hotels.length
             ? `${statement.currency} · net excl. VAT · ${statement.hotels.length} `
-                + `${statement.hotels.length === 1 ? "property" : "properties"}`
-            : "No properties in this scope";
+                + `${statement.hotels.length === 1 ? "hotel" : "hotels"}`
+            : "No hotels selected";
 
         elements.gopRows.replaceChildren(...statement.lines.map((line) => {
             const row = document.createElement("tr");
@@ -353,7 +360,7 @@
     function renderGopChart(statement) {
         const periods = statement.periods || [];
         if (!periods.length) {
-            chartEmpty("No periods to chart for the selected scope.");
+            chartEmpty("Nothing to chart for the hotels and period you selected.");
             return;
         }
 
@@ -566,7 +573,7 @@
             const cell = document.createElement("td");
             cell.colSpan = columns.length;
             cell.className = "cost-empty";
-            cell.textContent = "No rows in this dataset for the selected scope.";
+            cell.textContent = "No rows for the hotels and period you selected.";
             row.appendChild(cell);
             return [row];
         }

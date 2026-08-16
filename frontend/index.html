@@ -8,7 +8,7 @@
         content="width=device-width, initial-scale=1.0"
     >
 
-    <title>LOS Explorer</title>
+    <title>Average LOS</title>
 
     <link
         rel="stylesheet"
@@ -20,7 +20,7 @@
 
     <main class="container">
 
-        <nav class="main-nav">
+        <nav class="main-nav" aria-label="Primary navigation">
 
             <a href="/" aria-current="page">
                 Average LOS
@@ -40,13 +40,15 @@
         </nav>
 
         <header class="page-header">
-            <div>
-                <h1>Length of Stay Explorer</h1>
 
-                <p>
-                    Explore average LOS by arrival period.
-                </p>
-            </div>
+            <h1>
+                Average LOS
+            </h1>
+
+            <p>
+                Explore average LOS by arrival period.
+            </p>
+
         </header>
 
 
@@ -81,9 +83,15 @@
                 >
             </div>
 
-            <div class="filter-field month-picker-field">
+            <!-- The name has to live on a wrapper with an explicit role: a bare
+                 <div> is role=generic, which drops aria-labelledby entirely. -->
+            <div
+                class="filter-field month-picker-field"
+                role="group"
+                aria-labelledby="monthPickerLabel"
+            >
                 <label id="monthPickerLabel">Full months</label>
-                <div id="monthPicker" aria-labelledby="monthPickerLabel"></div>
+                <div id="monthPicker"></div>
             </div>
 
 
@@ -153,6 +161,8 @@
                         class="multi-select-toggle"
                         type="button"
                         aria-labelledby="hotelSelectLabel hotelToggle"
+                        aria-haspopup="true"
+                        aria-controls="hotelMenu"
                         aria-expanded="false"
                     >
                         All hotels
@@ -175,13 +185,13 @@
                                 id="clearAllHotels"
                                 type="button"
                             >
-                                Unselect all
+                                Clear all
                             </button>
                         </div>
 
                         <div id="hotelOptions">
                             <span class="multi-select-empty">
-                                Open this selector to load hotels.
+                                Loading hotels…
                             </span>
                         </div>
                     </div>
@@ -204,12 +214,33 @@
              STATUS
              ========================================== -->
 
-        <section class="status-panel">
+        <div
+            class="status-panel"
+            role="status"
+            aria-live="polite"
+        >
 
             <span id="status">
                 Select a period, then click Update data.
             </span>
 
+        </div>
+
+
+        <!-- ==========================================
+             ERROR
+             ========================================== -->
+
+        <!-- The error panel sits directly under the status line so a failure
+             cannot be missed; at the bottom of the page it was 600px below the
+             fold while the stale figures stayed on screen. -->
+
+        <section
+            id="errorPanel"
+            class="error-panel"
+            role="alert"
+            hidden
+        >
         </section>
 
 
@@ -224,9 +255,9 @@
         >
 
             <div class="summary-card total-summary-card">
-                <span class="summary-heading">
-                    Selected properties total
-                </span>
+                <h2 class="summary-heading">
+                    Selected hotels total
+                </h2>
 
                 <div class="summary-values">
                     <div>
@@ -279,11 +310,16 @@
         >
 
             <div class="section-heading">
-                <h2>LOS results</h2>
+                <h2 id="resultsHeading">LOS results</h2>
             </div>
 
 
-            <div class="table-wrapper">
+            <div
+                class="table-wrapper"
+                role="region"
+                aria-labelledby="resultsHeading"
+                tabindex="0"
+            >
 
                 <table>
 
@@ -313,18 +349,6 @@
 
             </div>
 
-        </section>
-
-
-        <!-- ==========================================
-             ERROR
-             ========================================== -->
-
-        <section
-            id="errorPanel"
-            class="error-panel"
-            hidden
-        >
         </section>
 
     </main>

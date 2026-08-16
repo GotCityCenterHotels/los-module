@@ -48,7 +48,7 @@ function getRequestKey() {
 function updateLoadButtonState() {
     const changed = lastLoadedRequestKey === null || getRequestKey() !== lastLoadedRequestKey;
     loadButton.disabled = requestInProgress || !isValidPeriod() || !changed;
-    loadButton.textContent = requestInProgress ? "Updating..." : "Update data";
+    loadButton.textContent = requestInProgress ? "Updating…" : "Update data";
 }
 
 function markBackendSettingChanged() {
@@ -82,7 +82,7 @@ async function loadHotels(requestState = loadedRequestState || getRequestState()
     const selectedHotel = hotelName.value;
     const requestKey = getHotelRequestKey(requestState);
     if (!forceRefresh && hotelListLoaded && loadedHotelRequestKey === requestKey) return;
-    if (!hotelListLoaded) hotelName.options[0].textContent = "Loading hotels...";
+    if (!hotelListLoaded) hotelName.options[0].textContent = "Loading hotels…";
     const payload = await LosApi.fetchHotelList({
         apiBaseUrl: API_BASE_URL,
         startDate: requestState.startDate,
@@ -116,14 +116,7 @@ async function loadData() {
         validateInputs();
         requestInProgress = true;
         updateLoadButtonState();
-        const ranges = LosApi.buildContiguousMonthRanges(
-            requestedState.selectedMonths,
-            requestedState.startDate,
-            requestedState.endDate
-        );
-        status.textContent = ranges.length === 1
-            ? "Updating LOS facts..."
-            : `Updating LOS facts across ${ranges.length} selected ranges...`;
+        status.textContent = "Updating…";
         const payload = await LosApi.fetchLosFactRanges({
             apiBaseUrl: API_BASE_URL,
             ...requestedState
@@ -133,7 +126,9 @@ async function loadData() {
         loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
-        status.textContent = loadedFacts.length ? "Data is up to date." : "No data returned.";
+        status.textContent = loadedFacts.length
+            ? "Data is up to date."
+            : "No rows for this period. Try a wider date range or another hotel.";
         loadHotels(requestedState, { forceRefresh: true }).catch(handleHotelError);
     }
     catch (error) {
@@ -141,6 +136,14 @@ async function loadData() {
         errorPanel.hidden = false;
         errorPanel.textContent = error.message || "Unable to update distribution.";
         status.textContent = "Update failed.";
+        // The cards have to be cleared as well as the loaded rows: every Display control calls
+        // render() directly on change, so a failed update that only left the state behind would
+        // repaint the previous period's distribution under the new settings.
+        results.innerHTML = "";
+        loadedFacts = [];
+        loadedMonths = [];
+        loadedRequestState = null;
+        lastLoadedRequestKey = null;
     }
     finally {
         requestInProgress = false;
@@ -175,7 +178,7 @@ function renderRow(row) {
     card.className = "distribution-card";
     card.innerHTML = `
         <div class="distribution-heading">
-            <div><strong>${escapeHtml(LosFormat.periodLabel(row.periodKey, grain.value))}</strong><span>${escapeHtml(row.hotelCode)}</span></div>
+            <div><h3>${escapeHtml(LosFormat.periodLabel(row.periodKey, grain.value))}</h3><span>${escapeHtml(row.hotelCode)}</span></div>
             <div>${scenarioLabel(row.scenario)} &middot; ${formatNumber(row.total)}
                 ${metric.value === "bookings" ? "reservations" : "nights"}</div>
         </div>
