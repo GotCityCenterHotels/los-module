@@ -164,15 +164,50 @@ CREATE TABLE IF NOT EXISTS functions.cost_cleaning_categories (
     occupancy integer NOT NULL DEFAULT 1,
     min_guests integer NOT NULL DEFAULT 1,
     max_guests integer,
-    cleaning_minutes numeric(10, 2) NOT NULL DEFAULT 0,
+    -- NULL means "take the lowest occupancy's figure". Most categories are
+    -- cleaned the same way whatever the occupancy, so only the rows that
+    -- genuinely differ carry a number of their own.
+    cleaning_minutes numeric(10, 2),
+    -- Superseded by the beds assigned below, and kept as the fallback for a
+    -- row that has none yet. See migration 015.
     linen_cost numeric(18, 4) NOT NULL DEFAULT 0,
+    -- This occupancy carries its own bed setup instead of inheriting.
+    overrides_base boolean NOT NULL DEFAULT false,
     sort_order integer NOT NULL DEFAULT 0,
     UNIQUE (enterprise_id, category_name, occupancy),
     CHECK (occupancy >= 1),
     CHECK (min_guests >= 0),
     CHECK (max_guests IS NULL OR max_guests >= min_guests),
-    CHECK (cleaning_minutes >= 0),
+    CHECK (cleaning_minutes IS NULL OR cleaning_minutes >= 0),
     CHECK (linen_cost >= 0)
+);
+
+-- The property's bed types, each with the linen cost of making it up. Defined
+-- once here rather than as a number retyped into every room category row.
+CREATE TABLE IF NOT EXISTS functions.cost_bed_types (
+    bed_type_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    enterprise_id text NOT NULL
+        REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
+    bed_name text NOT NULL,
+    linen_cost numeric(18, 4) NOT NULL DEFAULT 0,
+    sort_order integer NOT NULL DEFAULT 0,
+    UNIQUE (enterprise_id, bed_name),
+    CHECK (nullif(trim(bed_name), '') IS NOT NULL),
+    CHECK (linen_cost >= 0)
+);
+
+-- Which beds are made up in one (category, occupancy) row. Referenced by name,
+-- not by bed_type_id: saving rewrites every table in the rulebook, so an
+-- identity foreign key would dangle the moment the bed types were reinserted.
+CREATE TABLE IF NOT EXISTS functions.cost_cleaning_beds (
+    cleaning_bed_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cleaning_category_id bigint NOT NULL
+        REFERENCES functions.cost_cleaning_categories(cleaning_category_id) ON DELETE CASCADE,
+    bed_name text NOT NULL,
+    quantity integer NOT NULL DEFAULT 1,
+    UNIQUE (cleaning_category_id, bed_name),
+    CHECK (quantity >= 1),
+    CHECK (nullif(trim(bed_name), '') IS NOT NULL)
 );
 
 CREATE TABLE IF NOT EXISTS functions.cost_arrival_staffing_tiers (
@@ -231,6 +266,8 @@ CREATE INDEX IF NOT EXISTS ix_cost_distribution_agency_filters_group ON function
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_rate_groups_parent ON functions.cost_distribution_rate_groups(agency_group_id, sort_order);
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_rate_values_group ON functions.cost_distribution_rate_values(rate_group_id);
 CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.cost_cleaning_categories(enterprise_id);
+CREATE INDEX IF NOT EXISTS ix_cost_bed_types_enterprise ON functions.cost_bed_types(enterprise_id, sort_order);
+CREATE INDEX IF NOT EXISTS ix_cost_cleaning_beds_category ON functions.cost_cleaning_beds(cleaning_category_id);
 CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_enterprise ON functions.cost_breakfast_staffing_tiers(enterprise_id);
 

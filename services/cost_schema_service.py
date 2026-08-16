@@ -40,6 +40,10 @@ MIGRATIONS = (
         "014_franchise_and_distribution_tree",
         APP_ROOT / "sql" / "migrations" / "014_franchise_and_distribution_tree.sql",
     ),
+    (
+        "015_bed_types_and_cleaning_inheritance",
+        APP_ROOT / "sql" / "migrations" / "015_bed_types_and_cleaning_inheritance.sql",
+    ),
 )
 
 _schema_ready = False

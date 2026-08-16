@@ -42,9 +42,13 @@
                 <div id="distributionOriginGroups" class="rule-list distribution-tree"></div>
             </section>
             <section data-settings-section="cleaning" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Every room category in this hotel, with one row per possible occupancy. Set cleaning minutes and linen cost for each.</p></div></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Define the property's beds once, then say which beds each room category is made up with. The lowest guest count carries the setup and the rest inherit it.</p></div><span id="cleaningProgress" class="section-progress"></span></div>
                 <div class="setting-strip"><label>Cleaning cost / minute (kr)<input name="cleaningCostPerMinute" type="number" min="0" step="1" required></label></div>
-                <div id="cleaningCategories" class="rule-list"></div>
+                <div class="bed-types">
+                    <div class="bed-types-heading"><span class="tree-field-label">Bed types</span><button type="button" class="text-button" data-add-bed-type>+ Add bed type</button></div>
+                    <div id="bedTypes" class="bed-type-list"></div>
+                </div>
+                <div id="cleaningCategories" class="cleaning-list"></div>
             </section>
             <section data-settings-section="arrivals" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set reception hours required when daily arrivals enter a threshold. A count above the highest threshold uses that threshold.</p></div><label class="section-switch"><input type="checkbox" name="arrivalCostEnabled" checked><span>Charge arrival cost</span></label></div>

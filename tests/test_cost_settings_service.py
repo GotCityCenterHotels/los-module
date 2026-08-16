@@ -520,7 +520,14 @@ class BulkCostSettingsTests(unittest.TestCase):
         cleaning = " ".join(
             cost_settings_service.COLLECTION_QUERIES["cleaningCategories"].lower().split()
         )
-        self.assertIn("order by enterprise_id, sort_order, category_name", cleaning)
+        # The rows are now aliased because each one carries its beds, but
+        # sort_order still comes before the name: it holds the Mews category
+        # ordering captured when the rows were saved, and ordering by name here
+        # would undo it on every reload.
+        self.assertIn(
+            "order by c.enterprise_id, c.sort_order, c.category_name", cleaning
+        )
+        self.assertIn("cost_cleaning_beds", cleaning)
 
 
 class NumericGuardTests(unittest.TestCase):
@@ -831,6 +838,203 @@ class DistributionTreeShapeTests(unittest.TestCase):
     def test_the_whole_tree_must_be_a_list(self):
         with self.assertRaisesRegex(ValueError, "must be a list"):
             self._tree({"groupName": "G"})
+
+
+class BedTypeValidationTests(unittest.TestCase):
+    def _settings(self, payload):
+        return cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", payload
+        )
+
+    def test_bed_types_carry_the_linen_cost_in_whole_kronor(self):
+        result = self._settings({"bedTypes": [
+            {"bedName": " Double bed ", "linenCost": "74.6"},
+            {"bedName": "Extra bed", "linenCost": 40},
+        ]})
+
+        self.assertEqual(result["bedTypes"], [
+            {"bedName": "Double bed", "linenCost": Decimal("75")},
+            {"bedName": "Extra bed", "linenCost": Decimal("40")},
+        ])
+
+    def test_duplicate_bed_names_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Bed type names must be unique"):
+            self._settings({"bedTypes": [
+                {"bedName": "Double bed", "linenCost": 75},
+                {"bedName": "double bed", "linenCost": 40},
+            ]})
+
+    def test_a_room_cannot_reference_a_bed_the_property_has_not_defined(self):
+        # The row references the bed by name, so an unknown one would look
+        # configured in the editor while contributing no linen cost at all.
+        with self.assertRaisesRegex(ValueError, "not one of this property's bed types"):
+            self._settings({
+                "bedTypes": [{"bedName": "Double bed", "linenCost": 75}],
+                "cleaningCategories": [{
+                    "categoryName": "Double", "occupancy": 1,
+                    "beds": [{"bedName": "Bunk", "quantity": 1}],
+                }],
+            })
+
+    def test_blank_minutes_are_stored_as_absent_rather_than_zero(self):
+        result = self._settings({"cleaningCategories": [
+            {"categoryName": "Double", "occupancy": 1, "cleaningMinutes": "30"},
+            {"categoryName": "Double", "occupancy": 2, "cleaningMinutes": ""},
+        ]})
+
+        self.assertEqual(result["cleaningCategories"][0]["cleaningMinutes"], Decimal("30"))
+        self.assertIsNone(result["cleaningCategories"][1]["cleaningMinutes"])
+
+    def test_bed_quantities_default_to_one_and_deduplicate(self):
+        result = self._settings({
+            "bedTypes": [{"bedName": "Double bed", "linenCost": 75}],
+            "cleaningCategories": [{
+                "categoryName": "Double", "occupancy": 1,
+                "beds": [
+                    {"bedName": "Double bed"},
+                    {"bedName": "double bed", "quantity": 4},
+                    {"bedName": "  "},
+                ],
+            }],
+        })
+
+        self.assertEqual(
+            result["cleaningCategories"][0]["beds"],
+            [{"bedName": "Double bed", "quantity": 1}],
+        )
+
+
+class CleaningInheritanceTests(unittest.TestCase):
+    """The lowest occupancy in a category carries the setup; the rows above it
+    inherit beds unless overridden, and minutes whenever they are blank."""
+
+    BEDS = [
+        {"bedName": "Double bed", "linenCost": "75"},
+        {"bedName": "Extra bed", "linenCost": "40"},
+    ]
+
+    def _rows(self, *rows):
+        return cost_settings_service._resolve_cleaning_inheritance(
+            list(rows), self.BEDS
+        )
+
+    def test_higher_occupancies_inherit_the_lowest_ones_beds_and_minutes(self):
+        one, two, three = self._rows(
+            {"categoryName": "Double", "occupancy": 1, "cleaningMinutes": "30",
+             "linenCost": "0", "overridesBase": False,
+             "beds": [{"bedName": "Double bed", "quantity": 1}]},
+            {"categoryName": "Double", "occupancy": 2, "cleaningMinutes": None,
+             "linenCost": "0", "overridesBase": False, "beds": []},
+            {"categoryName": "Double", "occupancy": 3, "cleaningMinutes": "45",
+             "linenCost": "0", "overridesBase": False, "beds": []},
+        )
+
+        self.assertTrue(one["isBase"])
+        self.assertEqual(one["effectiveCleaningMinutes"], "30")
+        self.assertEqual(one["effectiveLinenCost"], "75")
+
+        # Nothing typed: takes both from the lowest occupancy.
+        self.assertTrue(two["inheritsBeds"])
+        self.assertTrue(two["inheritsMinutes"])
+        self.assertEqual(two["effectiveCleaningMinutes"], "30")
+        self.assertEqual(two["effectiveLinenCost"], "75")
+
+        # Its own minutes, still the inherited beds. The two rules are
+        # independent on purpose.
+        self.assertFalse(three["inheritsMinutes"])
+        self.assertTrue(three["inheritsBeds"])
+        self.assertEqual(three["effectiveCleaningMinutes"], "45")
+        self.assertEqual(three["effectiveLinenCost"], "75")
+
+    def test_an_overridden_occupancy_uses_its_own_beds(self):
+        _, three = self._rows(
+            {"categoryName": "Double", "occupancy": 1, "cleaningMinutes": "30",
+             "linenCost": "0", "overridesBase": False,
+             "beds": [{"bedName": "Double bed", "quantity": 1}]},
+            {"categoryName": "Double", "occupancy": 3, "cleaningMinutes": None,
+             "linenCost": "0", "overridesBase": True,
+             "beds": [{"bedName": "Double bed", "quantity": 1},
+                      {"bedName": "Extra bed", "quantity": 2}]},
+        )
+
+        self.assertFalse(three["inheritsBeds"])
+        # 75 + 2 x 40. Quantity multiplies, and the linen cost is the beds'.
+        self.assertEqual(three["effectiveLinenCost"], "155")
+        # Minutes still inherit: overriding the beds says nothing about time.
+        self.assertTrue(three["inheritsMinutes"])
+        self.assertEqual(three["effectiveCleaningMinutes"], "30")
+
+    def test_a_row_with_no_beds_keeps_its_own_pre_bed_types_linen_cost(self):
+        # Every property is in this state on the day bed types ship, so this is
+        # the case that decides whether the release re-costs the estate. Each
+        # row keeps exactly the figure it was costed at before: inheritance
+        # governs the bed-derived cost, not the legacy one. Taking the base's
+        # figure here would quietly turn 55/90 into 55/55.
+        base, second = self._rows(
+            {"categoryName": "Single", "occupancy": 1, "cleaningMinutes": "20",
+             "linenCost": "55", "overridesBase": False, "beds": []},
+            {"categoryName": "Single", "occupancy": 2, "cleaningMinutes": None,
+             "linenCost": "90", "overridesBase": False, "beds": []},
+        )
+
+        self.assertEqual(base["effectiveLinenCost"], "55")
+        self.assertEqual(second["effectiveLinenCost"], "90")
+        # Minutes are a different question: those really were blank, so they do
+        # inherit. Existing rows all carry a number, so nothing changes there
+        # either until someone clears a box.
+        self.assertEqual(second["effectiveCleaningMinutes"], "20")
+
+    def test_beds_on_the_base_row_drive_every_inheriting_row(self):
+        _, second = self._rows(
+            {"categoryName": "Single", "occupancy": 1, "cleaningMinutes": "20",
+             "linenCost": "55", "overridesBase": False,
+             "beds": [{"bedName": "Double bed", "quantity": 1}]},
+            {"categoryName": "Single", "occupancy": 2, "cleaningMinutes": None,
+             "linenCost": "90", "overridesBase": False, "beds": []},
+        )
+
+        # Once the base has beds the inheriting row follows them, and its own
+        # stale legacy figure stops being used.
+        self.assertEqual(second["effectiveLinenCost"], "75")
+
+    def test_each_category_has_its_own_base(self):
+        rows = self._rows(
+            {"categoryName": "Suite", "occupancy": 2, "cleaningMinutes": "60",
+             "linenCost": "0", "overridesBase": False,
+             "beds": [{"bedName": "Double bed", "quantity": 2}]},
+            {"categoryName": "Double", "occupancy": 1, "cleaningMinutes": "30",
+             "linenCost": "0", "overridesBase": False,
+             "beds": [{"bedName": "Double bed", "quantity": 1}]},
+            {"categoryName": "Suite", "occupancy": 4, "cleaningMinutes": None,
+             "linenCost": "0", "overridesBase": False, "beds": []},
+        )
+        suite_four = rows[2]
+
+        # The Suite's base is its own occupancy 2, not the Double's occupancy 1.
+        self.assertEqual(suite_four["effectiveCleaningMinutes"], "60")
+        self.assertEqual(suite_four["effectiveLinenCost"], "150")
+
+    def test_the_base_row_falls_back_to_zero_rather_than_inheriting_upwards(self):
+        base, = self._rows(
+            {"categoryName": "Double", "occupancy": 1, "cleaningMinutes": None,
+             "linenCost": "0", "overridesBase": False, "beds": []},
+        )
+
+        self.assertTrue(base["isBase"])
+        self.assertFalse(base["inheritsMinutes"])
+        self.assertEqual(base["effectiveCleaningMinutes"], "0")
+
+    def test_an_unknown_bed_contributes_nothing_rather_than_crashing(self):
+        # Validation rejects these on the way in, but a row saved before a bed
+        # type was renamed by hand in the database must not take the dashboard
+        # down with it.
+        base, = self._rows(
+            {"categoryName": "Double", "occupancy": 1, "cleaningMinutes": "30",
+             "linenCost": "0", "overridesBase": False,
+             "beds": [{"bedName": "Waterbed", "quantity": 1}]},
+        )
+
+        self.assertEqual(base["effectiveLinenCost"], "0")
 
 
 if __name__ == "__main__":

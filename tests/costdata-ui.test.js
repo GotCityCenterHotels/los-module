@@ -288,3 +288,149 @@ test("the picker payload scans the reservation table once, not twice", () => {
     assert.doesNotMatch(fetch, /list_channels\(/);
     assert.match(fetch, /"channels": \[\s*\n\s*\{"id": origin\["name"\]/);
 });
+
+// ---------------------------------------------------------------------------
+// Cleaning: bed types, inheritance, and a much denser layout
+// ---------------------------------------------------------------------------
+
+test("bed types sit between the cost per minute and the room categories", () => {
+    const html = read("costdata-input.html");
+    const section = /data-settings-section="cleaning"[\s\S]*?<\/section>/.exec(html)[0];
+
+    assert.match(section, /id="bedTypes"/);
+    assert.match(section, /data-add-bed-type/);
+    assert.ok(
+        section.indexOf('name="cleaningCostPerMinute"') < section.indexOf('id="bedTypes"'),
+        "bed types belong below the cleaning cost per minute"
+    );
+    assert.ok(
+        section.indexOf('id="bedTypes"') < section.indexOf('id="cleaningCategories"'),
+        "bed types belong above the room categories that use them"
+    );
+});
+
+test("rooms are bound to a bed type by a stable key, never by its name", () => {
+    const script = read("costdata-input.js");
+
+    // The name is what gets persisted, but it is also what the operator is
+    // editing one keystroke at a time. Matching rooms on it meant that typing
+    // "Sofa bed" beside an existing "Sofa" re-pointed Sofa's rooms on the way
+    // past, that clearing the field to retype it unbound every room for good,
+    // and that deleting one of two identically named beds stripped the
+    // other's rooms.
+    assert.match(script, /function ensureBedKeys\(\)/);
+    assert.match(script, /function bedByKey\(key\)/);
+    assert.match(script, /function resolveRowBed\(rowBed\)/);
+    assert.doesNotMatch(script, /renameBedEverywhere/);
+    assert.match(script, /function removeBedEverywhere\(bedKey\)/);
+    assert.match(script, /bed\.bedKey !== bedKey/);
+    // Keys never leave the editor; the save writes the current names back out.
+    assert.match(script, /if \(resolved\.bed\) bed\.bedName = resolved\.bed\.bedName;/);
+});
+
+test("a stale occupancy inside a live category is still marked and removable", () => {
+    const script = read("costdata-input.js");
+
+    // Mews dropping an extra bed shrinks a category from 1-3 to 1-2, stranding
+    // the saved occupancy-3 row inside a category that still exists. Gating on
+    // the category left it indistinguishable from a real row, undeletable, and
+    // still skewing the blended per-departure cost.
+    assert.match(script, /if \(!row\.fromHotel\) \{/);
+    assert.match(script, /line\.classList\.add\("is-orphaned-row"\)/);
+    assert.match(read("styles.css"), /\.is-orphaned-row/);
+});
+
+test("an emptied bed count settles at one instead of failing the save", () => {
+    const script = read("costdata-input.js");
+    const service = fs.readFileSync(
+        path.join(__dirname, "..", "services", "cost_settings_service.py"), "utf8"
+    );
+
+    // A cleared number box sends "", which passed the browser's check and then
+    // failed the whole PUT with a message naming the bed rather than the box.
+    assert.match(script, /quantity\.required = true;/);
+    assert.match(script, /quantity\.value = "1";/);
+    assert.match(service, /1 if raw_quantity in \(None, ""\) else raw_quantity/);
+});
+
+test("the lowest guest count carries the setup and the rest inherit it", () => {
+    const script = read("costdata-input.js");
+
+    assert.match(script, /function baseRowFor\(categoryName\)/);
+    assert.match(script, /function effectiveRow\(row\)/);
+    // Beds inherit unless the row's override is switched on; minutes inherit
+    // whenever the box is empty. The two rules are deliberately different.
+    assert.match(script, /const inheritsBeds = !isBase && !row\.overridesBase/);
+    assert.match(
+        script,
+        /const inheritsMinutes = !isBase && \(rawMinutes === null \|\| rawMinutes === undefined \|\| rawMinutes === ""\)/
+    );
+    // Switching the override on must start from what was being inherited, not
+    // from an empty row.
+    assert.match(script, /row\.beds = state\.beds\.map\(bed => \(\{\.\.\.bed\}\)\)/);
+});
+
+test("an inherited minute count shows greyed in the box rather than as a value", () => {
+    const script = read("costdata-input.js");
+    const css = read("styles.css");
+
+    assert.match(script, /minutes\.placeholder = state\.minutes/);
+    // A placeholder, not a value: typing in the other counts stays optional
+    // and the field still reads as empty when it is.
+    assert.match(script, /row\.cleaningMinutes = minutes\.value === "" \? null : minutes\.value/);
+    assert.match(css, /\.cleaning-minutes::placeholder/);
+});
+
+test("categories with nothing chosen are called out, and counted", () => {
+    const html = read("costdata-input.html");
+    const script = read("costdata-input.js");
+
+    assert.match(html, /id="cleaningProgress"/);
+    assert.match(script, /function categoryIsSet\(group\)/);
+    assert.match(script, /categories have beds set/);
+    assert.match(script, /No beds set/);
+});
+
+test("the room category layout is a dense grid, not a bordered row each", () => {
+    const script = read("costdata-input.js");
+    const css = read("styles.css");
+
+    // One block per category with one line per occupancy; the old layout spent
+    // a 60px bordered .rule-row plus an h3 on every single occupancy.
+    assert.match(script, /className = "cleaning-grid-row"/);
+    assert.doesNotMatch(script, /className = "rule-row cleaning-row"/);
+    assert.match(css, /\.cleaning-grid-row \{ display:grid;/);
+    // Labels appear once per category, in the header, not on every field.
+    assert.match(script, /className = "cleaning-grid-head"/);
+});
+
+test("the cost calculation reads the resolved figures, not the raw ones", () => {
+    const CostData = require("../frontend/costdata-data.js");
+
+    // An inheriting row has no figures of its own; reading its raw fields
+    // would cost it at zero minutes and zero linen.
+    const settings = {
+        A: {
+            profile: { currency: "SEK", cleaningCostPerMinute: "5" },
+            cleaningCategories: [
+                { categoryName: "D", occupancy: 1, cleaningMinutes: "30", linenCost: "0",
+                  effectiveCleaningMinutes: "30", effectiveLinenCost: "75" },
+                { categoryName: "D", occupancy: 2, cleaningMinutes: null, linenCost: "0",
+                  effectiveCleaningMinutes: "30", effectiveLinenCost: "75" }
+            ],
+            arrivalTiers: [], breakfastTiers: [], distributionGroups: []
+        }
+    };
+    const data = {
+        arrivalsDepartures: [
+            { stayDate: "2026-01-02", hotelName: "A", totalArrivals: 0, totalDepartures: 10 }
+        ]
+    };
+    const statement = CostData.calculateGop(data, { settingsByHotel: settings });
+
+    // Both rows resolve to 30 min x 5 kr + 75 kr = 225, so 10 departures cost
+    // 2250. Reading the raw fields would have given half that.
+    assert.equal(
+        statement.lines.find((line) => line.key === "cleaningCost").amount, 2250
+    );
+});

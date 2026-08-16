@@ -155,6 +155,7 @@
             ]);
             model = payload.data;
             model.distributionOriginGroups = model.distributionOriginGroups || [];
+            model.bedTypes = model.bedTypes || [];
             loadedEnterpriseId = model.enterpriseId;
             rememberProperty(loadedEnterpriseId);
             rateCache.clear();
@@ -273,13 +274,188 @@
         if (offNote) offNote.hidden = franchiseOn;
     }
 
-    // Cleaning rows are one per (room category, occupancy) and come from the
-    // hotel's own room categories: occupancy runs 1..(capacity + extraCapacity).
-    // Categories arrive from /api/costdata/sources already in the Mews ordering
-    // and that order is preserved here, in the saved sort_order, and on reload -
-    // neither alphabetical nor insertion order is applied anywhere.
-    // Any saved row whose category no longer exists in the hotel is kept and
-    // marked, rather than silently dropped along with its costs.
+    // ======================================================================
+    // Cleaning
+    //
+    // The property defines its bed types once, with the linen cost of making
+    // each one up. A room category then says which beds are made up at each
+    // occupancy, and the linen cost follows from that rather than being a
+    // number retyped into every row.
+    //
+    // Most categories are cleaned the same way whatever the occupancy, so the
+    // lowest occupancy carries the real setup and the rows above it inherit:
+    // beds unless that row's override is switched on, minutes whenever its box
+    // is left empty. The inherited figure is shown greyed in the empty box, so
+    // it is always clear both what will be used and that typing is optional.
+    // ======================================================================
+    function bedTypeList() {
+        return model.bedTypes || (model.bedTypes = []);
+    }
+
+    // Room rows are bound to a bed type by a key that lives only in this
+    // editor, never by its name.
+    //
+    // The name is what gets persisted - it is the only reference that survives
+    // a save, which rewrites every table and reissues every identity column -
+    // but it is also the thing the operator is editing, one keystroke at a
+    // time. Matching on it meant that typing "Sofa bed" next to an existing
+    // "Sofa" re-pointed Sofa's rooms on the way past, that clearing the field
+    // to retype it unbound every room permanently, and that deleting one of two
+    // identically named beds stripped the other's rooms. Keys have none of
+    // those failure modes; collect() writes the current names back out.
+    let nextBedKey = 1;
+
+    function ensureBedKeys() {
+        for (const bed of bedTypeList()) {
+            if (!bed.bedKey) bed.bedKey = `bed-${nextBedKey++}`;
+        }
+        for (const row of model.cleaningCategories || []) {
+            for (const bed of row.beds || []) {
+                if (bed.bedKey && bedByKey(bed.bedKey)) continue;
+                const match = bedTypeList().find(
+                    entry => String(entry.bedName || "").toLowerCase()
+                        === String(bed.bedName || "").toLowerCase()
+                );
+                bed.bedKey = match ? match.bedKey : null;
+            }
+        }
+    }
+
+    function bedByKey(key) {
+        return key ? bedTypeList().find(entry => entry.bedKey === key) : null;
+    }
+
+    // The bed type a room row points at, and what it is called right now. A row
+    // whose bed type no longer exists keeps its saved name so it stays visible
+    // and removable rather than vanishing from the editor.
+    function resolveRowBed(rowBed) {
+        const bed = bedByKey(rowBed.bedKey);
+        return {
+            bed,
+            name: bed ? bed.bedName : rowBed.bedName,
+            linenCost: bed ? numberValue(bed.linenCost) : 0
+        };
+    }
+
+    function numberValue(value) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    // What this row is actually made up with, following inheritance. Mirrors
+    // _resolve_cleaning_inheritance on the server; the two must agree, because
+    // the editor shows one and the Cost Data page costs the other.
+    function baseRowFor(categoryName) {
+        let base = null;
+        for (const row of model.cleaningCategories || []) {
+            if (String(row.categoryName).toLowerCase() !== String(categoryName).toLowerCase()) continue;
+            if (!base || Number(row.occupancy) < Number(base.occupancy)) base = row;
+        }
+        return base;
+    }
+
+    function effectiveRow(row) {
+        const base = baseRowFor(row.categoryName);
+        const isBase = base === row;
+        const inheritsBeds = !isBase && !row.overridesBase;
+        const beds = ((inheritsBeds ? base : row) || {}).beds || [];
+        const rawMinutes = row.cleaningMinutes;
+        const inheritsMinutes = !isBase && (rawMinutes === null || rawMinutes === undefined || rawMinutes === "");
+        const minutes = inheritsMinutes ? (base ? base.cleaningMinutes : null) : rawMinutes;
+        // With no beds in play the row keeps its OWN linen cost, exactly as it
+        // was costed before bed types existed. Taking the base's figure here
+        // would re-cost every property the day this shipped, with no bed
+        // configured anywhere to explain the change. Inheritance governs the
+        // bed-derived cost only.
+        const linen = beds.length
+            ? beds.reduce(
+                (total, bed) =>
+                    total + resolveRowBed(bed).linenCost * (Number(bed.quantity) || 1), 0
+            )
+            : numberValue(row.linenCost);
+        return {base, isBase, inheritsBeds, inheritsMinutes, beds, minutes, linen};
+    }
+
+    function renderBedTypes() {
+        const root = document.getElementById("bedTypes");
+        if (!root) return;
+        root.replaceChildren();
+        bedTypeList().forEach((bed, index) => {
+            const row = document.createElement("div");
+            row.className = "bed-type-row";
+
+            const name = document.createElement("input");
+            name.type = "text";
+            name.value = bed.bedName || "";
+            name.placeholder = "Double bed";
+            name.setAttribute("aria-label", "Bed name");
+            name.required = true;
+            name.oninput = () => {
+                // Rooms follow the bed by key, so a rename is just a rename -
+                // nothing else in the model has to be rewritten to keep up.
+                bed.bedName = name.value;
+                setDirty(true);
+                refreshCleaningTotals();
+            };
+            // The chips and "same as" summaries below carry the bed's name and
+            // are only rebuilt by a render. Redrawing per keystroke would take
+            // the focus out of this field, so they catch up when it is left.
+            name.onchange = () => renderCleaning();
+
+            const cost = document.createElement("input");
+            cost.type = "number";
+            cost.min = "0";
+            cost.step = "1";
+            cost.value = LosFormat.normalizeSekInputValue(bed.linenCost ?? 0);
+            cost.setAttribute("aria-label", `${bed.bedName || "Bed"} linen cost`);
+            cost.required = true;
+            LosFormat.bindSekInput(cost, (value) => {
+                bed.linenCost = value;
+                refreshCleaningTotals();
+            });
+            cost.addEventListener("input", () => {
+                bed.linenCost = cost.value;
+                setDirty(true);
+                refreshCleaningTotals();
+            });
+
+            const unit = document.createElement("span");
+            unit.className = "bed-type-unit";
+            unit.textContent = "kr";
+
+            const remove = iconButton("×", `Remove ${bed.bedName || "bed type"}`);
+            remove.classList.add("bed-type-remove");
+            remove.onclick = () => {
+                bedTypeList().splice(index, 1);
+                removeBedEverywhere(bed.bedKey);
+                renderCleaning();
+                setDirty(true);
+            };
+
+            row.append(name, cost, unit, remove);
+            root.append(row);
+        });
+        if (!bedTypeList().length) {
+            const empty = document.createElement("p");
+            empty.className = "tree-field-empty";
+            empty.textContent =
+                "No bed types yet. Add one to assign it to a room category below.";
+            root.append(empty);
+        }
+    }
+
+    // Only the rows pointing at THIS bed type. Filtering by name would take
+    // out a second, identically named bed type's rooms along with it.
+    function removeBedEverywhere(bedKey) {
+        for (const row of model.cleaningCategories || []) {
+            row.beds = (row.beds || []).filter(bed => bed.bedKey !== bedKey);
+        }
+    }
+
+    // Every room category in this hotel, with one row per possible occupancy,
+    // merged with what was saved. Categories come from the hotel in the Mews
+    // ordering and that order is preserved. A saved row whose category no
+    // longer exists is kept and marked rather than dropped with its costs.
     function mergeCleaningWithHotel() {
         const saved = new Map(
             (model.cleaningCategories || []).map(row =>
@@ -297,78 +473,51 @@
                     occupancy,
                     capacity: category.capacity,
                     extraCapacity: category.extraCapacity,
-                    cleaningMinutes: existing ? existing.cleaningMinutes : 0,
+                    // Blank, not zero: an occupancy with nothing typed in it
+                    // takes the lowest occupancy's figure.
+                    cleaningMinutes: existing ? existing.cleaningMinutes : null,
                     linenCost: existing ? existing.linenCost : 0,
+                    overridesBase: existing ? Boolean(existing.overridesBase) : false,
+                    beds: existing ? (existing.beds || []).map(bed => ({...bed})) : [],
                     fromHotel: true
                 });
             }
         }
-        for (const orphan of saved.values()) merged.push({...orphan, fromHotel: false});
+        for (const orphan of saved.values()) {
+            merged.push({...orphan, beds: (orphan.beds || []).map(bed => ({...bed})), fromHotel: false});
+        }
         model.cleaningCategories = merged;
         return merged;
     }
 
+    function groupCategories(rows) {
+        const groups = new Map();
+        for (const row of rows) {
+            const key = String(row.categoryName).toLowerCase();
+            let group = groups.get(key);
+            if (!group) {
+                group = {name: row.categoryName, rows: [], fromHotel: row.fromHotel,
+                    capacity: row.capacity, extraCapacity: row.extraCapacity};
+                groups.set(key, group);
+            }
+            group.rows.push(row);
+        }
+        for (const group of groups.values()) {
+            group.rows.sort((left, right) => Number(left.occupancy) - Number(right.occupancy));
+        }
+        return Array.from(groups.values());
+    }
+
     function renderCleaning() {
+        ensureBedKeys();
+        renderBedTypes();
         const root = document.getElementById("cleaningCategories");
         if (!root) return;
         const rows = mergeCleaningWithHotel();
         root.replaceChildren();
 
-        let currentCategory = null;
-        for (const [index, row] of rows.entries()) {
-            if (row.categoryName !== currentCategory) {
-                currentCategory = row.categoryName;
-                const heading = document.createElement("h3");
-                heading.className = "cleaning-group";
-                heading.textContent = row.fromHotel
-                    ? `${row.categoryName} - standard ${row.capacity}${row.extraCapacity ? ` + ${row.extraCapacity} extra` : ""}`
-                    : `${row.categoryName} - no longer in this hotel`;
-                root.append(heading);
-            }
-
-            const line = document.createElement("div");
-            line.className = "rule-row cleaning-row";
-            if (!row.fromHotel) line.classList.add("is-orphaned");
-
-            const occupancy = document.createElement("label");
-            occupancy.textContent = "Guests";
-            const occupancyValue = document.createElement("input");
-            occupancyValue.type = "number";
-            occupancyValue.value = row.occupancy;
-            occupancyValue.readOnly = true;
-            occupancyValue.tabIndex = -1;
-            occupancy.append(occupancyValue);
-            line.append(occupancy);
-
-            for (const [field, label] of [["cleaningMinutes", "Minutes"], ["linenCost", "Linen cost"]]) {
-                const wrap = document.createElement("label");
-                wrap.textContent = label;
-                const input = document.createElement("input");
-                input.type = "number";
-                input.min = "0";
-                input.step = "0.01";
-                input.value = displayValue(field, row[field]);
-                input.dataset.field = field;
-                bindNumberNormalisation(input, field, (value) => { row[field] = value; });
-                wrap.append(input);
-                line.append(wrap);
-            }
-
-            if (!row.fromHotel) {
-                const remove = document.createElement("button");
-                remove.type = "button";
-                remove.className = "remove-rule";
-                remove.textContent = "Remove";
-                remove.onclick = () => {
-                    model.cleaningCategories.splice(index, 1);
-                    renderCleaning();
-                    setDirty(true);
-                };
-                line.append(remove);
-            }
-
-            bindFields(line, row);
-            root.append(line);
+        for (const group of groupCategories(rows)) {
+            root.append(buildCleaningCategory(group));
         }
 
         if (!rows.length) {
@@ -376,6 +525,288 @@
                 ? "Could not load this hotel's room categories."
                 : "No room categories found for this hotel.");
         }
+        refreshCleaningTotals();
+    }
+
+    // A category with no beds anywhere is the one thing an operator has to be
+    // able to spot at a glance, so it is called out on the category and counted
+    // in the section heading.
+    function categoryIsSet(group) {
+        return group.rows.some(row => (row.beds || []).length);
+    }
+
+    function refreshCleaningTotals() {
+        const progress = document.getElementById("cleaningProgress");
+        for (const node of document.querySelectorAll("[data-linen-for]")) {
+            const row = (model.cleaningCategories || [])[Number(node.dataset.linenFor)];
+            if (row) node.textContent = LosFormat.formatSekAmount(effectiveRow(row).linen);
+        }
+        for (const node of document.querySelectorAll("[data-minutes-for]")) {
+            const row = (model.cleaningCategories || [])[Number(node.dataset.minutesFor)];
+            if (!row) continue;
+            const {minutes, inheritsMinutes} = effectiveRow(row);
+            if (!inheritsMinutes) continue;
+            node.placeholder = minutes === null || minutes === undefined || minutes === ""
+                ? "0" : String(minutes);
+        }
+        if (!progress) return;
+        const groups = groupCategories(model.cleaningCategories || []);
+        const set = groups.filter(categoryIsSet).length;
+        progress.textContent = groups.length
+            ? `${set} of ${groups.length} categories have beds set`
+            : "";
+        progress.classList.toggle("is-incomplete", groups.length > 0 && set < groups.length);
+    }
+
+    function buildCleaningCategory(group) {
+        const block = document.createElement("div");
+        block.className = "cleaning-category";
+        if (!group.fromHotel) block.classList.add("is-orphaned");
+
+        const heading = document.createElement("div");
+        heading.className = "cleaning-category-heading";
+        const title = document.createElement("h3");
+        title.textContent = group.name;
+        const detail = document.createElement("span");
+        detail.className = "cleaning-category-detail";
+        detail.textContent = group.fromHotel
+            ? `standard ${group.capacity}${group.extraCapacity ? ` + ${group.extraCapacity} extra` : ""}`
+            : "no longer in this hotel";
+        heading.append(title, detail);
+        if (!categoryIsSet(group)) {
+            const badge = document.createElement("span");
+            badge.className = "cleaning-unset";
+            badge.textContent = "No beds set";
+            heading.append(badge);
+        }
+        block.append(heading);
+
+        const table = document.createElement("div");
+        table.className = "cleaning-grid";
+        const header = document.createElement("div");
+        header.className = "cleaning-grid-head";
+        for (const label of ["Guests", "Beds", "Minutes", "Linen"]) {
+            const cell = document.createElement("span");
+            cell.textContent = label;
+            header.append(cell);
+        }
+        table.append(header);
+        for (const row of group.rows) table.append(buildCleaningRow(row, group));
+        block.append(table);
+        return block;
+    }
+
+    function buildCleaningRow(row, group) {
+        const index = (model.cleaningCategories || []).indexOf(row);
+        const state = effectiveRow(row);
+        const line = document.createElement("div");
+        line.className = "cleaning-grid-row";
+        if (state.isBase) line.classList.add("is-base");
+
+        const guests = document.createElement("span");
+        guests.className = "cleaning-guests";
+        guests.textContent = row.occupancy;
+        line.append(guests);
+
+        // --- Beds -----------------------------------------------------------
+        const beds = document.createElement("div");
+        beds.className = "cleaning-beds";
+        if (state.inheritsBeds) {
+            const inherited = document.createElement("span");
+            inherited.className = "cleaning-inherited";
+            inherited.textContent = state.beds.length
+                ? `Same as ${state.base.occupancy} guest${Number(state.base.occupancy) === 1 ? "" : "s"}: ${describeBeds(state.beds)}`
+                : `Same as ${state.base.occupancy} guest${Number(state.base.occupancy) === 1 ? "" : "s"}`;
+            beds.append(inherited);
+            const edit = document.createElement("button");
+            edit.type = "button";
+            edit.className = "text-button cleaning-override";
+            edit.textContent = "Edit this count";
+            edit.onclick = () => {
+                // Start the override from what it was inheriting, so switching
+                // it on never blanks the setup that was already in force.
+                row.overridesBase = true;
+                row.beds = state.beds.map(bed => ({...bed}));
+                renderCleaning();
+                setDirty(true);
+            };
+            beds.append(edit);
+        }
+        else {
+            beds.append(buildBedChips(row));
+            if (!state.isBase) {
+                const revert = document.createElement("button");
+                revert.type = "button";
+                revert.className = "text-button cleaning-override";
+                revert.textContent = "Inherit again";
+                revert.onclick = () => {
+                    row.overridesBase = false;
+                    row.beds = [];
+                    renderCleaning();
+                    setDirty(true);
+                };
+                beds.append(revert);
+            }
+        }
+        line.append(beds);
+
+        // --- Minutes ----------------------------------------------------------
+        const minutes = document.createElement("input");
+        minutes.type = "number";
+        minutes.min = "0";
+        minutes.step = "0.01";
+        minutes.className = "cleaning-minutes";
+        minutes.setAttribute(
+            "aria-label", `Cleaning minutes for ${row.categoryName} at ${row.occupancy} guests`
+        );
+        minutes.value = row.cleaningMinutes === null || row.cleaningMinutes === undefined
+            ? "" : row.cleaningMinutes;
+        if (state.isBase) {
+            minutes.required = true;
+            if (minutes.value === "") minutes.value = "0";
+        }
+        else {
+            // The inherited figure sits in the box as a placeholder, so the
+            // number that will be used is visible and it is obvious that typing
+            // one here is optional.
+            minutes.placeholder = state.minutes === null || state.minutes === undefined
+                || state.minutes === "" ? "0" : String(state.minutes);
+            minutes.dataset.minutesFor = String(index);
+        }
+        minutes.addEventListener("input", () => {
+            row.cleaningMinutes = minutes.value === "" ? null : minutes.value;
+            setDirty(true);
+            refreshCleaningTotals();
+        });
+        minutes.addEventListener("blur", () => {
+            if (minutes.value === "") return;
+            const normalised = toFixedDecimals(minutes.value);
+            if (normalised === minutes.value) return;
+            minutes.value = normalised;
+            row.cleaningMinutes = normalised;
+        });
+        line.append(minutes);
+
+        // --- Linen ------------------------------------------------------------
+        const linen = document.createElement("span");
+        linen.className = "cleaning-linen";
+        linen.dataset.linenFor = String(index);
+        linen.textContent = LosFormat.formatSekAmount(state.linen);
+        if (!state.beds.length && state.linen > 0) {
+            linen.classList.add("is-legacy");
+            linen.title =
+                "Typed in before bed types existed. Assign beds to this category "
+                + "and the linen cost will follow them.";
+        }
+        line.append(linen);
+
+        // Marked and removable per ROW, not per category: a category that is
+        // still in the hotel can lose an occupancy - Mews dropping an extra bed
+        // shrinks 1-3 to 1-2 - and that stale row is otherwise indistinguishable
+        // from a real one, cannot be deleted, and keeps skewing the blended
+        // per-departure cost.
+        if (!row.fromHotel) {
+            line.classList.add("is-orphaned-row");
+            const remove = iconButton("×", `Remove ${row.categoryName} at ${row.occupancy} guests`);
+            remove.classList.add("cleaning-remove");
+            remove.onclick = () => {
+                const at = model.cleaningCategories.indexOf(row);
+                if (at >= 0) model.cleaningCategories.splice(at, 1);
+                renderCleaning();
+                setDirty(true);
+            };
+            line.append(remove);
+        }
+        return line;
+    }
+
+    function describeBeds(beds) {
+        return beds
+            .map((bed) => {
+                const name = resolveRowBed(bed).name || "(unnamed bed)";
+                return (Number(bed.quantity) || 1) > 1
+                    ? `${name} x${bed.quantity}` : name;
+            })
+            .join(", ");
+    }
+
+    function buildBedChips(row) {
+        const wrap = document.createElement("div");
+        wrap.className = "bed-chips";
+        (row.beds || []).forEach((bed, bedIndex) => {
+            const resolved = resolveRowBed(bed);
+            const chip = document.createElement("span");
+            chip.className = "bed-chip";
+            if (!resolved.bed) chip.classList.add("is-unknown");
+            const label = document.createElement("span");
+            label.textContent = resolved.name || "(unnamed bed)";
+            chip.append(label);
+
+            const quantity = document.createElement("input");
+            quantity.type = "number";
+            quantity.min = "1";
+            quantity.step = "1";
+            quantity.className = "bed-chip-quantity";
+            quantity.value = bed.quantity || 1;
+            quantity.setAttribute("aria-label", `${resolved.name} count`);
+            quantity.required = true;
+            quantity.addEventListener("input", () => {
+                bed.quantity = quantity.value;
+                setDirty(true);
+                refreshCleaningTotals();
+            });
+            // An emptied box is one bed, not "no number". Left as an empty
+            // string it passed the browser's check, then failed the whole save
+            // server-side with a message naming the bed rather than the box.
+            quantity.addEventListener("blur", () => {
+                if (quantity.value !== "" && Number(quantity.value) >= 1) return;
+                quantity.value = "1";
+                bed.quantity = 1;
+                refreshCleaningTotals();
+            });
+            chip.append(quantity);
+
+            const drop = iconButton("×", `Remove ${resolved.name}`, "rate-chip-remove");
+            drop.onclick = () => {
+                row.beds.splice(bedIndex, 1);
+                renderCleaning();
+                setDirty(true);
+            };
+            chip.append(drop);
+            wrap.append(chip);
+        });
+
+        const available = bedTypeList().filter(bed =>
+            String(bed.bedName || "").trim()
+            && !(row.beds || []).some(existing => existing.bedKey === bed.bedKey)
+        );
+        if (available.length) {
+            const picker = document.createElement("select");
+            picker.className = "bed-add";
+            picker.setAttribute("aria-label", "Add a bed to this room");
+            picker.add(new Option("+ Bed", ""));
+            for (const bed of available) picker.add(new Option(bed.bedName, bed.bedKey));
+            picker.onchange = () => {
+                const chosen = bedByKey(picker.value);
+                if (!chosen) return;
+                row.beds = row.beds || [];
+                row.beds.push({
+                    bedKey: chosen.bedKey, bedName: chosen.bedName, quantity: 1
+                });
+                renderCleaning();
+                setDirty(true);
+            };
+            wrap.append(picker);
+        }
+        else if (!(row.beds || []).length) {
+            const empty = document.createElement("span");
+            empty.className = "tree-field-empty";
+            empty.textContent = bedTypeList().length
+                ? "All bed types are already on this row."
+                : "Add a bed type above first.";
+            wrap.append(empty);
+        }
+        return wrap;
     }
 
     // ======================================================================
@@ -1202,6 +1633,19 @@
             if (row.linenCost === "" || row.linenCost === null || row.linenCost === undefined) continue;
             row.linenCost = LosFormat.normalizeSekInputValue(row.linenCost);
         }
+        for (const bed of model.bedTypes || []) {
+            bed.linenCost = LosFormat.normalizeSekInputValue(bed.linenCost);
+        }
+        // The key is how the editor tracks a bed type; the name is what the
+        // database stores. This is where the two are reconciled, once, so a
+        // rename reaches every room that uses the bed without any of them
+        // having been rewritten while it was being typed.
+        for (const row of model.cleaningCategories || []) {
+            for (const bed of row.beds || []) {
+                const resolved = resolveRowBed(bed);
+                if (resolved.bed) bed.bedName = resolved.bed.bedName;
+            }
+        }
         // A half-finished row carries no meaning and the backend rejects a
         // blank value outright, which previously failed the entire save. An
         // empty search term is likewise a row someone started and abandoned,
@@ -1214,6 +1658,9 @@
         // neighbour's typed value instead.
         return {
             ...model,
+            bedTypes: (model.bedTypes || []).filter(
+                bed => String(bed.bedName || "").trim()
+            ),
             distributionGroups: (model.distributionGroups || []).map(group => ({
                 ...group,
                 rules: (group.rules || []).filter(
@@ -1281,6 +1728,7 @@
             );
             model = payload.data;
             model.distributionOriginGroups = model.distributionOriginGroups || [];
+            model.bedTypes = model.bedTypes || [];
             loadedEnterpriseId = model.enterpriseId;
             render();
             setDirty(false);
@@ -1382,6 +1830,11 @@
         button.onclick = () => showSection(button.dataset.section);
     });
     document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));renderRows(key);setDirty(true);syncSectionSwitches()});
+    document.querySelector("[data-add-bed-type]").onclick = () => {
+        bedTypeList().push({bedName: "", linenCost: 0});
+        renderCleaning();
+        setDirty(true);
+    };
     document.querySelector("[data-add-origin-group]").onclick = () => {
         model.distributionOriginGroups.push(newOriginGroup());
         renderDistributionTree();

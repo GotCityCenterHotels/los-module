@@ -176,6 +176,30 @@ ALL_DISTRIBUTION_TREES_SQL = (
 )
 
 
+# Cleaning rows with the beds made up in each one. The beds are nested in json
+# rather than read as a second collection, so the editor gets the whole shape in
+# one round trip and the rows cannot arrive without their beds.
+CLEANING_CATEGORIES_SQL = """
+    SELECT
+        c.enterprise_id,
+        c.category_name,
+        c.resource_category_id,
+        c.occupancy,
+        c.cleaning_minutes,
+        c.linen_cost,
+        c.overrides_base,
+        coalesce((
+            SELECT json_agg(json_build_object(
+                'bedName', b.bed_name,
+                'quantity', b.quantity
+            ) ORDER BY b.bed_name)
+            FROM functions.cost_cleaning_beds b
+            WHERE b.cleaning_category_id = c.cleaning_category_id
+        ), '[]') AS beds
+    FROM functions.cost_cleaning_categories c
+"""
+
+
 def _camel(name):
     parts = name.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
@@ -183,6 +207,94 @@ def _camel(name):
 
 def _json_row(row):
     return {_camel(key): str(value) if isinstance(value, Decimal) else value for key, value in row.items()}
+
+
+def _decimal_or_zero(value):
+    if value in (None, ""):
+        return Decimal(0)
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return Decimal(0)
+
+
+def _resolve_cleaning_inheritance(rows, bed_types):
+    """Fill in what each cleaning row actually costs, following inheritance.
+
+    Most room categories are cleaned the same way whatever the occupancy, so the
+    lowest occupancy in a category carries the real configuration and the rows
+    above it inherit from it:
+
+      * beds, unless that row has its own override switched on;
+      * minutes, whenever that row's own figure is blank.
+
+    The two rules are deliberately different. Switching an override on is a
+    statement that this occupancy is made up differently; leaving a minutes box
+    empty is just not having typed a number, which is the common case and should
+    not require a decision.
+
+    Every row comes back with effectiveCleaningMinutes and effectiveLinenCost -
+    what the cost algorithm should use - alongside the raw values the editor
+    needs in order to show what was actually entered.
+    """
+    linen_by_bed = {
+        str(bed.get("bedName", "")).casefold(): _decimal_or_zero(bed.get("linenCost"))
+        for bed in bed_types or []
+        if bed.get("bedName")
+    }
+
+    def linen_of(beds):
+        return sum(
+            (
+                linen_by_bed.get(str(bed.get("bedName", "")).casefold(), Decimal(0))
+                * int(bed.get("quantity") or 1)
+                for bed in beds or []
+            ),
+            Decimal(0),
+        )
+
+    bases = {}
+    for row in sorted(rows, key=lambda entry: int(entry["occupancy"])):
+        bases.setdefault(str(row["categoryName"]).casefold(), row)
+
+    resolved = []
+    for row in rows:
+        base = bases.get(str(row["categoryName"]).casefold(), row)
+        is_base = base is row
+        inherits_beds = not is_base and not row.get("overridesBase")
+        beds = (base if inherits_beds else row).get("beds") or []
+
+        minutes = row.get("cleaningMinutes")
+        inherits_minutes = minutes in (None, "") and not is_base
+        if inherits_minutes:
+            minutes = base.get("cleaningMinutes")
+
+        # With no beds in play the row keeps its OWN linen cost, exactly as it
+        # was costed before bed types existed. Reading the base's figure here
+        # instead would silently re-cost every property the day this shipped -
+        # a category whose occupancies were 55 and 90 would quietly become 55
+        # and 55, with no bed configured anywhere to explain it. Inheritance
+        # governs the bed-derived cost only.
+        linen = linen_of(beds) if beds else _decimal_or_zero(row.get("linenCost"))
+
+        resolved.append({
+            **row,
+            "isBase": is_base,
+            "inheritsBeds": inherits_beds,
+            "inheritsMinutes": inherits_minutes,
+            "effectiveBeds": beds,
+            "effectiveCleaningMinutes": (
+                "0" if minutes in (None, "") else str(minutes)
+            ),
+            "effectiveLinenCost": str(linen),
+        })
+    return resolved
+
+
+def _cleaning_row_json(row):
+    payload = _json_row(row)
+    payload["beds"] = list(payload.get("beds") or [])
+    return payload
 
 
 def _origin_group_json(row):
@@ -530,12 +642,20 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
                 # sort_order holds the Mews category ordering captured when the
                 # rows were saved. Ordering by category_name here would undo it
                 # on every reload.
-                "cleaningCategories": "SELECT category_name, resource_category_id, occupancy, cleaning_minutes, linen_cost FROM functions.cost_cleaning_categories WHERE enterprise_id = %s ORDER BY sort_order, category_name, occupancy, cleaning_category_id",
+                "cleaningCategories": CLEANING_CATEGORIES_SQL + " WHERE c.enterprise_id = %s ORDER BY c.sort_order, c.category_name, c.occupancy, c.cleaning_category_id",
+                "bedTypes": "SELECT bed_name, linen_cost FROM functions.cost_bed_types WHERE enterprise_id = %s ORDER BY sort_order, bed_name",
                 "arrivalTiers": "SELECT min_arrivals, max_arrivals, reception_hours FROM functions.cost_arrival_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, arrival_tier_id",
                 "breakfastTiers": "SELECT min_guests, max_guests, staff_hours FROM functions.cost_breakfast_staffing_tiers WHERE enterprise_id = %s ORDER BY sort_order, breakfast_tier_id",
             }.items():
                 cursor.execute(query, (enterprise_id,))
-                collections[name] = [_json_row(row) for row in cursor.fetchall()]
+                collections[name] = [
+                    _cleaning_row_json(row) if name == "cleaningCategories"
+                    else _json_row(row)
+                    for row in cursor.fetchall()
+                ]
+            collections["cleaningCategories"] = _resolve_cleaning_inheritance(
+                collections["cleaningCategories"], collections["bedTypes"]
+            )
 
             # Appended after the collections above, deliberately: the bulk
             # settings tests feed result sets positionally, so a query inserted
@@ -560,13 +680,13 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
 
 
 COLLECTION_QUERIES = {
-    "cleaningCategories": """
-        SELECT enterprise_id, category_name, resource_category_id, occupancy,
-               cleaning_minutes, linen_cost
-        FROM functions.cost_cleaning_categories
-        ORDER BY enterprise_id, sort_order, category_name, occupancy,
-                 cleaning_category_id
-    """,
+    "cleaningCategories": (
+        CLEANING_CATEGORIES_SQL
+        + """
+        ORDER BY c.enterprise_id, c.sort_order, c.category_name, c.occupancy,
+                 c.cleaning_category_id
+    """
+    ),
     "arrivalTiers": """
         SELECT enterprise_id, min_arrivals, max_arrivals, reception_hours
         FROM functions.cost_arrival_staffing_tiers
@@ -576,6 +696,14 @@ COLLECTION_QUERIES = {
         SELECT enterprise_id, min_guests, max_guests, staff_hours
         FROM functions.cost_breakfast_staffing_tiers
         ORDER BY enterprise_id, sort_order, breakfast_tier_id
+    """,
+    # Appended last on purpose. The bulk settings tests feed result sets
+    # positionally, so a query inserted in the middle of this mapping silently
+    # hands one table's rows to another collection with no error.
+    "bedTypes": """
+        SELECT enterprise_id, bed_name, linen_cost
+        FROM functions.cost_bed_types
+        ORDER BY enterprise_id, sort_order, bed_name
     """,
 }
 
@@ -629,9 +757,17 @@ def fetch_all_cost_settings():
         )
     for name, rows in collections.items():
         for row in rows:
+            owned = {key: value for key, value in row.items() if key != "enterprise_id"}
             by_enterprise[row["enterprise_id"]][name].append(
-                _json_row({key: value for key, value in row.items() if key != "enterprise_id"})
+                _cleaning_row_json(owned) if name == "cleaningCategories"
+                else _json_row(owned)
             )
+    # Inheritance is resolved per property: the base row is the lowest occupancy
+    # within one property's category, never across properties.
+    for owned in by_enterprise.values():
+        owned["cleaningCategories"] = _resolve_cleaning_inheritance(
+            owned.get("cleaningCategories", []), owned.get("bedTypes", [])
+        )
 
     settings_by_hotel = {}
     for profile_row in profiles:
@@ -770,6 +906,43 @@ def _texts(value, label):
         if not isinstance(entry, str):
             raise ValueError(f"Each entry in {label} must be text")
     return value
+
+
+def _validate_row_beds(row, known_bed_names):
+    """The beds made up in one (category, occupancy) row.
+
+    A bed the property has not defined is rejected rather than stored: the row
+    references the bed by name, so an unknown name would contribute nothing to
+    the linen cost while still looking configured in the editor.
+    """
+    beds = []
+    seen = set()
+    label = f"{row.get('categoryName') or 'Cleaning category'} beds"
+    for bed in _entries(row.get("beds"), label):
+        bed_name = str(bed.get("bedName") or "").strip()
+        if not bed_name:
+            continue
+        if bed_name.casefold() not in known_bed_names:
+            raise ValueError(
+                f"\"{bed_name}\" is not one of this property's bed types. "
+                "Add it under Bed types, or remove it from the room category."
+            )
+        if bed_name.casefold() in seen:
+            continue
+        seen.add(bed_name.casefold())
+        # A cleared quantity box sends an empty string, and dict.get's default
+        # only fires on a missing key - so this used to reject the entire save
+        # with a message naming the bed rather than the box. One bed is the only
+        # sensible reading of "a bed is on this row with no number".
+        raw_quantity = bed.get("quantity")
+        quantity = _number(
+            1 if raw_quantity in (None, "") else raw_quantity,
+            f"{bed_name} quantity", integer=True,
+        )
+        if quantity < 1:
+            raise ValueError(f"{bed_name} quantity must be at least 1")
+        beds.append({"bedName": bed_name, "quantity": quantity})
+    return beds
 
 
 def _validate_distribution_tree(origin_groups):
@@ -952,7 +1125,22 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
     # extra beds has three rows, because linen and minutes differ per occupancy.
     # Guest bands are gone, so there are no ranges to check for overlap - only
     # that the same category/occupancy pair is not entered twice.
-    cleaning = payload.get("cleaningCategories") or []
+    # The property's bed types. Linen cost lives here now, once per bed, rather
+    # than as a number retyped into every room category row.
+    bed_types = []
+    bed_names = set()
+    for index, bed in enumerate(_entries(payload.get("bedTypes"), "bedTypes")):
+        bed_name = _required_text(bed.get("bedName"), f"Bed type {index + 1} name", 250)
+        if bed_name.casefold() in bed_names:
+            raise ValueError("Bed type names must be unique")
+        bed_names.add(bed_name.casefold())
+        bed_types.append({
+            "bedName": bed_name,
+            "linenCost": _number(bed.get("linenCost"), f"{bed_name} linen cost", money=True),
+        })
+    result["bedTypes"] = bed_types
+
+    cleaning = _entries(payload.get("cleaningCategories"), "cleaningCategories")
     result["cleaningCategories"] = [{
         "categoryName": _required_text(row.get("categoryName"), "Cleaning category name"),
         "resourceCategoryId": (
@@ -960,8 +1148,22 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
             else _required_text(row.get("resourceCategoryId"), "Room category ID", 250)
         ),
         "occupancy": _number(row.get("occupancy"), "Occupancy", integer=True),
-        "cleaningMinutes": _number(row.get("cleaningMinutes"), "Cleaning minutes"),
-        "linenCost": _number(row.get("linenCost"), "Linen cost", money=True),
+        # Blank is not zero: it means "use the lowest occupancy's figure". Only
+        # the lowest occupancy itself falls back to zero, because it has nothing
+        # above it to inherit from.
+        "cleaningMinutes": (
+            None if row.get("cleaningMinutes") in (None, "")
+            else _number(row.get("cleaningMinutes"), "Cleaning minutes")
+        ),
+        # Superseded by the beds assigned to the row, and kept only as the
+        # fallback for a row that has none yet, so it is no longer something
+        # the editor has to send.
+        "linenCost": _number(
+            row.get("linenCost") if row.get("linenCost") not in (None, "") else 0,
+            "Linen cost", money=True,
+        ),
+        "overridesBase": _boolean(row.get("overridesBase")),
+        "beds": _validate_row_beds(row, bed_names),
     } for row in cleaning]
     if any(row["occupancy"] < 1 for row in result["cleaningCategories"]):
         raise ValueError("Cleaning occupancy must be at least 1")
@@ -1117,7 +1319,7 @@ def save_cost_settings(enterprise_id, payload):
                 p["franchiseEnabled"], p["franchisePercent"], p["franchiseBasis"],
                 p["franchiseRevenueBase"], p["franchiseVatPercent"],
             ))
-            for table in ("cost_distribution_groups", "cost_distribution_origin_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers"):
+            for table in ("cost_distribution_groups", "cost_distribution_origin_groups", "cost_bed_types", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers"):
                 cursor.execute(f"DELETE FROM functions.{table} WHERE enterprise_id = %s", (data["enterpriseId"],))
             _insert_distribution_tree(
                 cursor, data["enterpriseId"], data["distributionOriginGroups"]
@@ -1125,9 +1327,47 @@ def save_cost_settings(enterprise_id, payload):
             for order, group in enumerate(data["distributionGroups"]):
                 cursor.execute("INSERT INTO functions.cost_distribution_groups (enterprise_id, group_name, cost_percent, sort_order) VALUES (%s,%s,%s,%s) RETURNING distribution_group_id", (data["enterpriseId"], group["groupName"], group["costPercent"], order)); group_id = cursor.fetchone()[0]
                 cursor.executemany("INSERT INTO functions.cost_distribution_rules (distribution_group_id, match_type, match_value) VALUES (%s,%s,%s)", [(group_id, r["matchType"], r["matchValue"]) for r in group["rules"]])
+            cursor.executemany(
+                "INSERT INTO functions.cost_bed_types "
+                "(enterprise_id, bed_name, linen_cost, sort_order) VALUES (%s,%s,%s,%s)",
+                [
+                    (data["enterpriseId"], bed["bedName"], bed["linenCost"], order)
+                    for order, bed in enumerate(data["bedTypes"])
+                ],
+            )
             # min_guests/max_guests are retained by the table's legacy CHECK
             # constraints; occupancy is the value the algorithm now reads.
-            cursor.executemany("INSERT INTO functions.cost_cleaning_categories (enterprise_id, category_name, resource_category_id, occupancy, min_guests, max_guests, cleaning_minutes, linen_cost, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["categoryName"], r["resourceCategoryId"], r["occupancy"], r["occupancy"], r["occupancy"], r["cleaningMinutes"], r["linenCost"], i) for i,r in enumerate(data["cleaningCategories"])])
+            #
+            # Written one row at a time rather than with executemany, because
+            # each row's beds key off the identity column the insert returns.
+            for order, row in enumerate(data["cleaningCategories"]):
+                cursor.execute(
+                    """
+                    INSERT INTO functions.cost_cleaning_categories (
+                        enterprise_id, category_name, resource_category_id,
+                        occupancy, min_guests, max_guests, cleaning_minutes,
+                        linen_cost, overrides_base, sort_order
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING cleaning_category_id
+                    """,
+                    (
+                        data["enterpriseId"], row["categoryName"],
+                        row["resourceCategoryId"], row["occupancy"],
+                        row["occupancy"], row["occupancy"],
+                        row["cleaningMinutes"], row["linenCost"],
+                        row["overridesBase"], order,
+                    ),
+                )
+                cleaning_category_id = cursor.fetchone()[0]
+                cursor.executemany(
+                    "INSERT INTO functions.cost_cleaning_beds "
+                    "(cleaning_category_id, bed_name, quantity) VALUES (%s,%s,%s)",
+                    [
+                        (cleaning_category_id, bed["bedName"], bed["quantity"])
+                        for bed in row["beds"]
+                    ],
+                )
             cursor.executemany("INSERT INTO functions.cost_arrival_staffing_tiers (enterprise_id, min_arrivals, max_arrivals, reception_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minArrivals"], r["maxArrivals"], r["receptionHours"], i) for i,r in enumerate(data["arrivalTiers"])])
             cursor.executemany("INSERT INTO functions.cost_breakfast_staffing_tiers (enterprise_id, min_guests, max_guests, staff_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minGuests"], r["maxGuests"], r["staffHours"], i) for i,r in enumerate(data["breakfastTiers"])])
     return fetch_cost_settings(data["enterpriseId"], data["hotelName"])

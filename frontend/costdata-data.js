@@ -245,9 +245,16 @@
     function averageCleaningCost(cleaningCategories, costPerMinute) {
         const rows = cleaningCategories || [];
         if (!rows.length) return null;
+        // The effective figures are the ones inheritance has already resolved:
+        // a row that takes its bed setup or its minutes from the category's
+        // lowest occupancy has no figures of its own, and reading its raw
+        // fields would cost it at zero. Older payloads carry only the raw
+        // fields, so those still stand in.
         const total = rows.reduce((running, row) =>
-            running + numberOf(row.cleaningMinutes) * numberOf(costPerMinute)
-                + numberOf(row.linenCost), 0);
+            running
+            + numberOf(row.effectiveCleaningMinutes ?? row.cleaningMinutes)
+                * numberOf(costPerMinute)
+            + numberOf(row.effectiveLinenCost ?? row.linenCost), 0);
         return total / rows.length;
     }
 
