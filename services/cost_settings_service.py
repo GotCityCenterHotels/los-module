@@ -2,6 +2,7 @@ import logging
 import os
 
 from collections import defaultdict
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from threading import Lock
 from time import monotonic
@@ -400,14 +401,30 @@ def _reset_property_memo():
         _preloaded_memo.clear()
 
 
-def _upsert_mirrored_properties(properties):
+@contextmanager
+def _writable_connection(connection=None):
+    """The caller's connection when it has one, otherwise a fresh checkout.
+
+    check=ConnectionPool.check_connection runs a real round trip on every
+    checkout, so a settings load that took one for the read and one for each of
+    the two bootstrap writes spent three on a pair of writes that in steady
+    state change nothing. Callers that already hold a connection pass it in.
+    """
+    if connection is not None:
+        yield connection
+        return
+    with cost_pool.connection() as pooled:
+        yield pooled
+
+
+def _upsert_mirrored_properties(properties, connection=None):
     if not properties:
         return
     properties, remember = _memo_unseen(_mirrored_memo, properties)
     if not properties:
         return
-    with cost_pool.connection() as connection:
-        with connection.cursor() as cursor:
+    with _writable_connection(connection) as active:
+        with active.cursor() as cursor:
             cursor.executemany(
                 """
                 INSERT INTO functions.hotels (
@@ -466,7 +483,7 @@ def _get_preloaded_property(enterprise_id):
     return _property_json(row) if row is not None else None
 
 
-def _preload_property_settings(properties):
+def _preload_property_settings(properties, connection=None):
     if not properties:
         return
 
@@ -475,8 +492,8 @@ def _preload_property_settings(properties):
         return
 
     ensure_cost_settings_schema()
-    with cost_pool.connection() as connection:
-        with connection.cursor() as cursor:
+    with _writable_connection(connection) as active:
+        with active.cursor() as cursor:
             cursor.executemany(
                 """
                 INSERT INTO functions.cost_property_settings (enterprise_id)

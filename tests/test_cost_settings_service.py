@@ -326,6 +326,74 @@ class CostSettingsValidationTests(unittest.TestCase):
         self.assertEqual(result["enterpriseId"], "property-42")
         self.assertEqual(result["hotelName"], "Hotel A")
 
+    def test_settings_load_runs_the_real_bootstrap_writes(self):
+        """The bootstrap writes are exercised, not mocked.
+
+        test_settings_load_persists_property_pair_in_database_a patches both of
+        them, so a MagicMock swallows whatever keywords the call site passes.
+        That is how fetch_cost_settings shipped calling them with
+        connection=connection while both still took one positional argument -
+        every settings load raised TypeError and the suite stayed green.
+        """
+        class Cursor:
+            def __init__(self, owner): self.owner = owner
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql, parameters=None):
+                self.owner.statements.append(sql)
+            def executemany(self, sql, parameters=None):
+                self.owner.statements.append(sql)
+            def fetchone(self): return None
+            def fetchall(self): return []
+
+        class Connection:
+            # Deliberately no pipeline attribute: _read_cost_settings branches on
+            # hasattr, and this fake hands out one cursor per call like the real
+            # sequential path expects.
+            def __init__(self): self.statements = []
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self, **kwargs): return Cursor(self)
+
+        connection = Connection()
+
+        class Pool:
+            def __init__(self): self.checkouts = 0
+            def connection(self):
+                self.checkouts += 1
+                return connection
+
+        pool = Pool()
+        # The memo is process-wide and another test may already have recorded
+        # this property, which would skip the writes this test is here to run.
+        cost_settings_service._reset_property_memo()
+
+        with patch.object(
+            cost_settings_service,
+            "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service,
+            "cost_pool",
+            pool,
+        ):
+            result = cost_settings_service.fetch_cost_settings(
+                "property-77", "Hotel B"
+            )
+
+        self.assertEqual(result["enterpriseId"], "property-77")
+        self.assertEqual(result["hotelName"], "Hotel B")
+        # Both writes ran, and on the read's own connection rather than taking a
+        # checkout each - one checkout for the whole load.
+        self.assertEqual(pool.checkouts, 1)
+        self.assertTrue(any(
+            "INSERT INTO functions.hotels" in sql
+            for sql in connection.statements
+        ), "the mirrored-property upsert did not run")
+        self.assertTrue(any(
+            "INSERT INTO functions.cost_property_settings" in sql
+            for sql in connection.statements
+        ), "the settings preload did not run")
+
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(
             "00000000-0000-0000-0000-000000000001", "Hotel A", {}
