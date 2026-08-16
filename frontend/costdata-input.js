@@ -362,17 +362,12 @@
         const rawMinutes = row.cleaningMinutes;
         const inheritsMinutes = !isBase && (rawMinutes === null || rawMinutes === undefined || rawMinutes === "");
         const minutes = inheritsMinutes ? (base ? base.cleaningMinutes : null) : rawMinutes;
-        // With no beds in play the row keeps its OWN linen cost, exactly as it
-        // was costed before bed types existed. Taking the base's figure here
-        // would re-cost every property the day this shipped, with no bed
-        // configured anywhere to explain the change. Inheritance governs the
-        // bed-derived cost only.
-        const linen = beds.length
-            ? beds.reduce(
-                (total, bed) =>
-                    total + resolveRowBed(bed).linenCost * (Number(bed.quantity) || 1), 0
-            )
-            : numberValue(row.linenCost);
+        // Linen cost is the beds and nothing else - there is no typed figure
+        // anywhere in this editor to fall back on.
+        const linen = beds.reduce(
+            (total, bed) =>
+                total + resolveRowBed(bed).linenCost * (Number(bed.quantity) || 1), 0
+        );
         return {base, isBase, inheritsBeds, inheritsMinutes, beds, minutes, linen};
     }
 
@@ -476,7 +471,6 @@
                     // Blank, not zero: an occupancy with nothing typed in it
                     // takes the lowest occupancy's figure.
                     cleaningMinutes: existing ? existing.cleaningMinutes : null,
-                    linenCost: existing ? existing.linenCost : 0,
                     overridesBase: existing ? Boolean(existing.overridesBase) : false,
                     beds: existing ? (existing.beds || []).map(bed => ({...bed})) : [],
                     fromHotel: true
@@ -692,12 +686,6 @@
         linen.className = "cleaning-linen";
         linen.dataset.linenFor = String(index);
         linen.textContent = LosFormat.formatSekAmount(state.linen);
-        if (!state.beds.length && state.linen > 0) {
-            linen.classList.add("is-legacy");
-            linen.title =
-                "Typed in before bed types existed. Assign beds to this category "
-                + "and the linen cost will follow them.";
-        }
         line.append(linen);
 
         // Marked and removable per ROW, not per category: a category that is
@@ -1629,10 +1617,6 @@
                 ? LosFormat.normalizeSekInputValue(input.value)
                 : input.value;
         }
-        for (const row of model.cleaningCategories || []) {
-            if (row.linenCost === "" || row.linenCost === null || row.linenCost === undefined) continue;
-            row.linenCost = LosFormat.normalizeSekInputValue(row.linenCost);
-        }
         for (const bed of model.bedTypes || []) {
             bed.linenCost = LosFormat.normalizeSekInputValue(bed.linenCost);
         }
@@ -1830,16 +1814,32 @@
         button.onclick = () => showSection(button.dataset.section);
     });
     document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));renderRows(key);setDirty(true);syncSectionSwitches()});
-    document.querySelector("[data-add-bed-type]").onclick = () => {
+    // A missing element must not take the page down with it. These lookups run
+    // during bootstrap, before loadHotels(), so a null here used to throw and
+    // leave the page stuck on "Loading properties..." with no clue why - which
+    // is what a half-deployed HTML/JS pair looks like.
+    function onClick(selector, handler) {
+        const element = document.querySelector(selector);
+        if (!element) {
+            console.warn(
+                `${selector} is missing from this page - it is probably serving a `
+                + "cached copy of the HTML. Hard refresh; the rest still works."
+            );
+            return;
+        }
+        element.onclick = handler;
+    }
+
+    onClick("[data-add-bed-type]", () => {
         bedTypeList().push({bedName: "", linenCost: 0});
         renderCleaning();
         setDirty(true);
-    };
-    document.querySelector("[data-add-origin-group]").onclick = () => {
+    });
+    onClick("[data-add-origin-group]", () => {
         model.distributionOriginGroups.push(newOriginGroup());
         renderDistributionTree();
         setDirty(true);
-    };
+    });
     // The two switches and the franchise basis all change which controls are
     // live, so they re-sync before the generic dirty handler runs.
     form.addEventListener("change", (event) => {

@@ -269,13 +269,10 @@ def _resolve_cleaning_inheritance(rows, bed_types):
         if inherits_minutes:
             minutes = base.get("cleaningMinutes")
 
-        # With no beds in play the row keeps its OWN linen cost, exactly as it
-        # was costed before bed types existed. Reading the base's figure here
-        # instead would silently re-cost every property the day this shipped -
-        # a category whose occupancies were 55 and 90 would quietly become 55
-        # and 55, with no bed configured anywhere to explain it. Inheritance
-        # governs the bed-derived cost only.
-        linen = linen_of(beds) if beds else _decimal_or_zero(row.get("linenCost"))
+        # Linen cost is the beds and nothing else. There is no typed figure to
+        # fall back on: a row with no beds costs no linen, and the "No beds set"
+        # badge in the editor is what points at the rows still to configure.
+        linen = linen_of(beds)
 
         resolved.append({
             **row,
@@ -1155,18 +1152,21 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
             None if row.get("cleaningMinutes") in (None, "")
             else _number(row.get("cleaningMinutes"), "Cleaning minutes")
         ),
-        # Superseded by the beds assigned to the row, and kept only as the
-        # fallback for a row that has none yet, so it is no longer something
-        # the editor has to send.
-        "linenCost": _number(
-            row.get("linenCost") if row.get("linenCost") not in (None, "") else 0,
-            "Linen cost", money=True,
-        ),
         "overridesBase": _boolean(row.get("overridesBase")),
         "beds": _validate_row_beds(row, bed_names),
     } for row in cleaning]
     if any(row["occupancy"] < 1 for row in result["cleaningCategories"]):
         raise ValueError("Cleaning occupancy must be at least 1")
+
+    # linen_cost is derived, so the server computes it rather than trusting a
+    # figure from the client. Storing it keeps the column meaningful for
+    # anything reading the table directly; the read path recomputes it anyway,
+    # so a change to a bed type's price shows immediately without a re-save.
+    for row, resolved in zip(
+        result["cleaningCategories"],
+        _resolve_cleaning_inheritance(result["cleaningCategories"], bed_types),
+    ):
+        row["linenCost"] = _round_sek(Decimal(resolved["effectiveLinenCost"]))
 
     for source, target, min_key, max_key, hours_key, label in (
         (payload.get("arrivalTiers") or [], "arrivalTiers", "minArrivals", "maxArrivals", "receptionHours", "Arrival staffing"),

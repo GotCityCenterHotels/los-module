@@ -434,3 +434,34 @@ test("the cost calculation reads the resolved figures, not the raw ones", () => 
         statement.lines.find((line) => line.key === "cleaningCost").amount, 2250
     );
 });
+
+test("linen cost is derived from beds only, with nothing to type per row", () => {
+    const script = read("costdata-input.js");
+    const html = read("costdata-input.html");
+    const service = fs.readFileSync(
+        path.join(__dirname, "..", "services", "cost_settings_service.py"), "utf8"
+    );
+
+    // The only linen input on the page belongs to a bed type; a room row shows
+    // a derived figure and offers nothing to type into.
+    const cleaning = /data-settings-section="cleaning"[\s\S]*?<\/section>/.exec(html)[0];
+    assert.doesNotMatch(cleaning, /name="linenCost"/);
+    assert.match(script, /const linen = beds\.reduce\(/);
+    assert.doesNotMatch(script, /numberValue\(row\.linenCost\)/);
+    assert.doesNotMatch(script, /linenCost: existing/);
+
+    // The server derives the stored column too, rather than trusting a figure
+    // the client sent.
+    assert.match(service, /linen = linen_of\(beds\)/);
+    assert.match(service, /row\["linenCost"\] = _round_sek/);
+});
+
+test("a missing control warns instead of killing the page bootstrap", () => {
+    const script = read("costdata-input.js");
+
+    // These lookups run before loadHotels(), so a null threw and left the page
+    // stuck on "Loading properties..." - which is what a half-deployed
+    // HTML/JS pair looked like.
+    assert.match(script, /function onClick\(selector, handler\)/);
+    assert.doesNotMatch(script, /document\.querySelector\("\[data-add-[^"]*\]"\)\.onclick/);
+});

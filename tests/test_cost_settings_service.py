@@ -397,9 +397,13 @@ class MoneyRoundingTests(unittest.TestCase):
                     "breakfastFoodCostPerGuest": "41.4",
                     "breakfastStaffCostPerHour": "249.5",
                 },
+                # Linen cost is derived from the beds, so the rounding under
+                # test happens on the bed's price, not on a per-row figure.
+                "bedTypes": [{"bedName": "Double bed", "linenCost": "74.6"}],
                 "cleaningCategories": [{
                     "categoryName": "Double", "occupancy": 1,
-                    "cleaningMinutes": "22.5", "linenCost": "74.6",
+                    "cleaningMinutes": "22.5",
+                    "beds": [{"bedName": "Double bed", "quantity": 1}],
                 }],
             }
         )
@@ -410,6 +414,9 @@ class MoneyRoundingTests(unittest.TestCase):
         self.assertEqual(profile["receptionCostPerHour"], Decimal("313"))
         self.assertEqual(profile["breakfastFoodCostPerGuest"], Decimal("41"))
         self.assertEqual(profile["breakfastStaffCostPerHour"], Decimal("250"))
+        self.assertEqual(result["bedTypes"][0]["linenCost"], Decimal("75"))
+        # The row's stored figure is the server's own derivation from that bed,
+        # never a number the client supplied.
         self.assertEqual(result["cleaningCategories"][0]["linenCost"], Decimal("75"))
         # Minutes and percentages are not money and keep their precision.
         self.assertEqual(
@@ -964,12 +971,11 @@ class CleaningInheritanceTests(unittest.TestCase):
         self.assertTrue(three["inheritsMinutes"])
         self.assertEqual(three["effectiveCleaningMinutes"], "30")
 
-    def test_a_row_with_no_beds_keeps_its_own_pre_bed_types_linen_cost(self):
-        # Every property is in this state on the day bed types ship, so this is
-        # the case that decides whether the release re-costs the estate. Each
-        # row keeps exactly the figure it was costed at before: inheritance
-        # governs the bed-derived cost, not the legacy one. Taking the base's
-        # figure here would quietly turn 55/90 into 55/55.
+    def test_a_row_with_no_beds_costs_no_linen(self):
+        # Linen comes from the beds and nothing else. Any figure typed in
+        # before bed types existed is ignored, so every property reads zero
+        # linen until its categories have beds - which is what the "No beds
+        # set" badge in the editor exists to point at.
         base, second = self._rows(
             {"categoryName": "Single", "occupancy": 1, "cleaningMinutes": "20",
              "linenCost": "55", "overridesBase": False, "beds": []},
@@ -977,11 +983,11 @@ class CleaningInheritanceTests(unittest.TestCase):
              "linenCost": "90", "overridesBase": False, "beds": []},
         )
 
-        self.assertEqual(base["effectiveLinenCost"], "55")
-        self.assertEqual(second["effectiveLinenCost"], "90")
+        self.assertEqual(base["effectiveLinenCost"], "0")
+        self.assertEqual(second["effectiveLinenCost"], "0")
         # Minutes are a different question: those really were blank, so they do
         # inherit. Existing rows all carry a number, so nothing changes there
-        # either until someone clears a box.
+        # until someone clears a box.
         self.assertEqual(second["effectiveCleaningMinutes"], "20")
 
     def test_beds_on_the_base_row_drive_every_inheriting_row(self):
@@ -993,8 +999,6 @@ class CleaningInheritanceTests(unittest.TestCase):
              "linenCost": "90", "overridesBase": False, "beds": []},
         )
 
-        # Once the base has beds the inheriting row follows them, and its own
-        # stale legacy figure stops being used.
         self.assertEqual(second["effectiveLinenCost"], "75")
 
     def test_each_category_has_its_own_base(self):
