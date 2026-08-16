@@ -11,6 +11,12 @@
     const dirtyState = document.getElementById("dirtyState"), importButton = document.getElementById("runImportButton");
     let model = null, dirty = false, loadedEnterpriseId = "";
 
+    if (typeof CostCleaning === "undefined") {
+        throw new Error(
+            "costdata-cleaning.js did not load - hard refresh the page, and check "
+            + "that the script deployed alongside costdata-input.js."
+        );
+    }
     if (typeof LosFormat === "undefined") {
         throw new Error(
             "los-format.js did not load - hard refresh the page, and check that "
@@ -257,18 +263,26 @@
         );
 
         const franchiseSwitch = form.elements.namedItem("franchiseEnabled");
+        const franchiseCard = document.getElementById("franchiseCard");
         const franchiseFields = document.getElementById("franchiseFields");
         const franchiseOn = Boolean(franchiseSwitch && franchiseSwitch.checked);
+        if (franchiseCard) franchiseCard.classList.toggle("is-switched-off", !franchiseOn);
         if (franchiseFields) {
-            franchiseFields.classList.toggle("is-switched-off", !franchiseOn);
             for (const control of franchiseFields.querySelectorAll("input, select")) {
                 control.disabled = !franchiseOn;
             }
-            // VAT only participates in a gross calculation. Leaving it live on
-            // a net basis invites someone to change a number that does nothing.
+            // VAT only takes part in a gross calculation, so on a net basis it
+            // is not a field to grey out - it is a field that does not apply.
+            // It is hidden as well as disabled: disabling exempts it from
+            // constraint validation, which is what keeps a blank one from
+            // failing a save, and collect() keeps the last saved value because
+            // it only skips a disabled field that is also empty.
             const basis = form.elements.namedItem("franchiseBasis");
+            const grossBasis = Boolean(basis) && basis.value === "gross";
             const vat = form.elements.namedItem("franchiseVatPercent");
-            if (vat) vat.disabled = !franchiseOn || !basis || basis.value !== "gross";
+            const vatField = document.getElementById("franchiseVatField");
+            if (vat) vat.disabled = !franchiseOn || !grossBasis;
+            if (vatField) vatField.hidden = !grossBasis;
         }
         const offNote = document.getElementById("franchiseOffNote");
         if (offNote) offNote.hidden = franchiseOn;
@@ -329,46 +343,17 @@
     // whose bed type no longer exists keeps its saved name so it stays visible
     // and removable rather than vanishing from the editor.
     function resolveRowBed(rowBed) {
-        const bed = bedByKey(rowBed.bedKey);
-        return {
-            bed,
-            name: bed ? bed.bedName : rowBed.bedName,
-            linenCost: bed ? numberValue(bed.linenCost) : 0
-        };
+        return CostCleaning.resolveRowBed(rowBed, bedTypeList());
     }
 
-    function numberValue(value) {
-        const parsed = Number(value);
-        return Number.isFinite(parsed) ? parsed : 0;
-    }
-
-    // What this row is actually made up with, following inheritance. Mirrors
-    // _resolve_cleaning_inheritance on the server; the two must agree, because
-    // the editor shows one and the Cost Data page costs the other.
-    function baseRowFor(categoryName) {
-        let base = null;
-        for (const row of model.cleaningCategories || []) {
-            if (String(row.categoryName).toLowerCase() !== String(categoryName).toLowerCase()) continue;
-            if (!base || Number(row.occupancy) < Number(base.occupancy)) base = row;
-        }
-        return base;
-    }
-
+    // What this row is actually made up with, following inheritance. The rules
+    // live in costdata-cleaning.js, which services/cost_settings_service.py
+    // mirrors: the editor shows one and the Cost Data page costs the other, so
+    // they have to agree.
     function effectiveRow(row) {
-        const base = baseRowFor(row.categoryName);
-        const isBase = base === row;
-        const inheritsBeds = !isBase && !row.overridesBase;
-        const beds = ((inheritsBeds ? base : row) || {}).beds || [];
-        const rawMinutes = row.cleaningMinutes;
-        const inheritsMinutes = !isBase && (rawMinutes === null || rawMinutes === undefined || rawMinutes === "");
-        const minutes = inheritsMinutes ? (base ? base.cleaningMinutes : null) : rawMinutes;
-        // Linen cost is the beds and nothing else - there is no typed figure
-        // anywhere in this editor to fall back on.
-        const linen = beds.reduce(
-            (total, bed) =>
-                total + resolveRowBed(bed).linenCost * (Number(bed.quantity) || 1), 0
+        return CostCleaning.resolveRow(
+            model.cleaningCategories || [], row, bedTypeList()
         );
-        return {base, isBase, inheritsBeds, inheritsMinutes, beds, minutes, linen};
     }
 
     function renderBedTypes() {

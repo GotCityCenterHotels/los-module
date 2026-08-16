@@ -994,6 +994,129 @@ tbody tr:hover {
     font-size: 13px;
 }
 
+/* Query settings and the statement read as one unit: the settings decide what
+   the statement says, so they sit beside it rather than above it, and the
+   chart - which restates the same figures period by period - runs the full
+   width underneath both. */
+.cost-overview {
+    display: grid;
+    grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+    gap: 20px;
+    align-items: start;
+    margin-bottom: 20px;
+}
+
+.cost-query {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px 12px;
+    align-items: start;
+    align-content: start;
+    padding: 18px 18px 20px;
+}
+
+.cost-query .filter-field {
+    min-width: 0;
+}
+
+.cost-query-heading,
+.cost-query .hotel-filter,
+.cost-query .filter-action,
+.cost-query .line-toggles {
+    grid-column: 1 / -1;
+}
+
+.cost-query-heading h2 {
+    margin: 0;
+    color: var(--cost-ink);
+    font-size: 17px;
+    letter-spacing: -0.02em;
+}
+
+.cost-query-heading .section-eyebrow {
+    margin-bottom: 5px;
+}
+
+.cost-query .filter-action button {
+    width: 100%;
+}
+
+/* One checkbox per statement line. Clearing one takes the line out of the
+   statement, out of GOP and out of the chart at the same time. */
+/* A fieldset defaults to min-inline-size:min-content, which refuses to shrink
+   inside a grid column and drags the whole row wider than its track. */
+.line-toggles {
+    min-width: 0;
+    margin: 2px 0 0;
+    padding: 14px 0 0;
+    border: 0;
+    border-top: 1px solid #e4e7ec;
+}
+
+.line-toggles legend {
+    padding: 0;
+    color: #475467;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.line-toggles-note {
+    margin: 2px 0 10px;
+    color: #98a2b3;
+    font-size: 11.5px;
+    line-height: 1.45;
+}
+
+.line-toggle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.line-toggle {
+    display: flex;
+    gap: 9px;
+    align-items: center;
+
+    padding: 5px 7px;
+    border-radius: 5px;
+
+    color: #344054;
+    font-size: 12.5px;
+    cursor: pointer;
+}
+
+.line-toggle:hover {
+    background: #f4f7f7;
+}
+
+.line-toggle input {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: var(--cost-accent);
+    cursor: pointer;
+}
+
+.line-toggle.is-revenue span {
+    font-weight: 650;
+}
+
+.line-toggle.is-cost span {
+    color: #667085;
+}
+
+.line-toggle:has(input:not(:checked)) span {
+    color: #98a2b3;
+    text-decoration: line-through;
+}
+
+.line-toggles .text-button {
+    margin: 9px 0 0;
+    height: 28px;
+    font-weight: 650;
+}
+
 #costScope {
     color: #475467;
     text-align: right;
@@ -1002,9 +1125,13 @@ tbody tr:hover {
 /* Gross Operating Profit statement. Net figures only: revenue reads as ink,
    costs are set apart in red and signed, and GOP is separated from both by a
    heavier rule so the result is never mistaken for another line item. */
+/* The statement is a two-column read - label, then amount - so the card is
+   capped rather than stretched to whatever the grid column happens to be:
+   past this width the eye stops being able to carry a label across to its
+   figure. */
 .gop-statement {
-    max-width: 620px;
-    margin: 4px 0 28px;
+    max-width: 760px;
+    margin: 0;
     padding: 20px 22px 18px;
     border: 1px solid #dfe5e4;
     border-radius: 8px;
@@ -1108,10 +1235,21 @@ tbody tr:hover {
     margin-top: 6px;
 }
 
-/* The chart needs the full width the statement column deliberately gives up,
-   so the panel widens only while the chart is the active view. */
-.gop-statement.is-chart {
-    max-width: none;
+/* The chart is not a second view of the statement any more, it is the panel
+   below it, and it takes the full width the statement column gives up. */
+.gop-chart-panel {
+    margin: 0 0 28px;
+    padding: 20px 22px 18px;
+    border: 1px solid #dfe5e4;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.72);
+
+    animation: cost-rise 320ms 65ms ease-out both;
+}
+
+.gop-chart-panel .gop-heading {
+    align-items: center;
+    margin-bottom: 2px;
 }
 
 .gop-heading-actions {
@@ -1124,7 +1262,7 @@ tbody tr:hover {
 
 .gop-chart-legend {
     gap: 20px;
-    margin: 16px 0 0;
+    margin: 0;
     font-size: 12px;
 }
 
@@ -1165,9 +1303,12 @@ tbody tr:hover {
     stroke-width: 1;
 }
 
+/* Butt caps, not round: a round cap adds half the stroke width at each end,
+   which put the marker back over the neighbouring bars it was narrowed to
+   clear. */
 .gop-bar-revenue {
     stroke-width: 3;
-    stroke-linecap: round;
+    stroke-linecap: butt;
 }
 
 /* Only drawn when a correction period pushes revenue or cost below zero and
@@ -2102,6 +2243,26 @@ tbody tr:hover {
 .is-switched-off .setting-grid,
 .is-switched-off .rule-list,
 .is-switched-off .section-actions { opacity:.5; }
+
+/* --- Franchise ----------------------------------------------------------
+   One card holds the switch and every field it governs. The switch used to
+   sit in the section heading, a long way from the inputs it turns off, so
+   nothing on screen connected the two. */
+.franchise-card { margin:20px 0 0; padding:18px; border:1px solid #e4e7ec;
+    border-radius:8px; background:white; }
+.franchise-card-heading { display:flex; flex-wrap:wrap; justify-content:space-between;
+    align-items:center; gap:12px 20px; }
+.franchise-card-heading h3 { margin:0; color:var(--cost-ink); font-size:16px;
+    letter-spacing:-.01em; }
+.franchise-card-heading p { max-width:520px; margin:5px 0 0; color:#667085;
+    font-size:12.5px; }
+.franchise-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:16px; margin:16px 0 0; }
+.franchise-fields > label { display:flex; flex-direction:column; gap:6px;
+    color:#475467; font-size:12px; font-weight:650; }
+.franchise-fields small { color:#98a2b3; font-weight:400; }
+.franchise-card.is-switched-off .franchise-fields { opacity:.5; }
+@media (max-width:700px) { .franchise-fields { grid-template-columns:minmax(0,1fr); } }
 .settings-editor .is-switched-off input:disabled,
 .settings-editor .is-switched-off select:disabled { background:#f9fafb;
     cursor:not-allowed; }
@@ -3353,6 +3514,24 @@ tbody tr:hover {
 
     .detail-layout {
         grid-template-columns: 1fr;
+    }
+
+    /* Below this the statement no longer has a readable column left beside
+       the settings, so the two stack in the order they are used. */
+    .cost-overview {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .cost-query {
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+
+    .cost-query .line-toggle-list {
+        flex-flow: row wrap;
+    }
+
+    .cost-query .line-toggle {
+        flex: 0 0 auto;
     }
 }
 

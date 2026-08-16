@@ -15,13 +15,19 @@ const read = (file) => fs.readFileSync(path.join(frontend, file), "utf8");
 // already happened once - a rewritten Cost Input shipped under a token from
 // before the rewrite, and the new controls simply did nothing, with no error
 // anywhere to explain it.
+//
+// Stamping is mechanical, so it is not left to anyone to remember: package.json
+// runs it as `pretest`, which means it happens before every local test run and
+// before the deploy workflow's own `npm test`. This test is the assertion that
+// it did - it should never fail on its own, and if it does, the pretest hook
+// has been removed or the stamper is broken.
 test("every asset reference carries a hash of the file it points at", () => {
     for (const page of pages()) {
         assert.equal(
             stamp(read(page)),
             read(page),
             `${page} references a stale asset version. `
-                + "Run: node scripts/stamp-assets.js"
+                + "Run: npm run stamp (this normally happens automatically)"
         );
     }
 });

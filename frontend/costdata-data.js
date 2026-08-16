@@ -49,6 +49,7 @@
         Object.freeze({key: "breakfastCost", label: "Breakfast cost", type: "cost"}),
         Object.freeze({key: "distributionCost", label: "Distribution cost", type: "cost"}),
         Object.freeze({key: "franchiseCardCost", label: "Franchise & card cost", type: "cost"}),
+        Object.freeze({key: "rentCost", label: "Rent cost", type: "cost"}),
         Object.freeze({key: "cleaningCost", label: "Cleaning cost", type: "cost"}),
         Object.freeze({key: "arrivalCost", label: "Arrival cost", type: "cost"}),
         Object.freeze({key: "gop", label: "Gross Operating Profit (GOP)", type: "result"})
@@ -56,6 +57,19 @@
 
     const REVENUE_KEYS = GOP_LINES.filter(({type}) => type === "revenue").map(({key}) => key);
     const COST_KEYS = GOP_LINES.filter(({type}) => type === "cost").map(({key}) => key);
+    // Everything the operator can switch on and off. GOP is the result of the
+    // ones that are on, so it is never one of them.
+    const TOGGLEABLE_KEYS = Object.freeze([...REVENUE_KEYS, ...COST_KEYS]);
+
+    // Which lines take part in this reading of the statement. Anything absent
+    // from the caller's list is left out of the rows, out of GOP, and out of
+    // the chart's bars - an omitted list means all of them, so the default is
+    // always the whole statement.
+    function activeLineSet(activeLines) {
+        if (!activeLines) return new Set(TOGGLEABLE_KEYS);
+        const wanted = new Set(activeLines);
+        return new Set(TOGGLEABLE_KEYS.filter((key) => wanted.has(key)));
+    }
 
     function periodKey(dateValue, grain) {
         if (grain === "year") return `${dateValue.slice(0, 4)}-01-01`;
@@ -373,13 +387,15 @@
                 flag(
                     `${hotel}: breakfast is configured to calculate from sold products, but `
                     + "the cost facts expose only a breakfast count. The guest count was used "
-                    + "for both the food cost and the staffing threshold."
+                    + "for both the food cost and the staffing threshold.",
+                    "breakfastCost"
                 );
             }
             if (!breakfastTiers.length && breakfastGuests > 0) {
                 flag(
                     `${hotel}: no breakfast staffing thresholds are configured, so breakfast `
-                    + "cost covers food only."
+                    + "cost covers food only.",
+                    "breakfastCost"
                 );
             }
             totals.breakfastCost +=
@@ -397,16 +413,16 @@
                     `${hotel}: the fallback distribution % was applied to all room revenue. `
                     + "The per-origin, per-agency and per-rate percentages need a reservation "
                     + "level breakdown, which the cost fact tables do not carry - they hold one "
-                    + "revenue total per stay date."
+                    + "revenue total per stay date.",
+                    "distributionCost"
                 );
             }
 
             // --- Franchise & card ----------------------------------------------
-            // The franchise fee on its configured revenue base, the card cost
-            // percentage on gross payments, and the three rent percentages on
-            // their matching net revenue stream. Franchise is skipped entirely
-            // when the property has it switched off, rather than costed at 0%,
-            // so an unconfigured percentage cannot quietly become a real one.
+            // The franchise fee on its configured revenue base and the card cost
+            // percentage on gross payments. Franchise is skipped entirely when
+            // the property has it switched off, rather than costed at 0%, so an
+            // unconfigured percentage cannot quietly become a real one.
             let franchiseCost = 0;
             if (isEnabled(profile.franchiseEnabled, false)) {
                 franchiseCost = percentOf(
@@ -421,21 +437,30 @@
                     flag(
                         `${hotel}: the franchise fee is charged on a gross basis, so its net `
                         + `revenue base was grossed up by ${numberOf(profile.franchiseVatPercent)}% `
-                        + "VAT. Every revenue column in the cost facts is net of VAT."
+                        + "VAT. Every revenue column in the cost facts is net of VAT.",
+                        "franchiseCardCost"
                     );
                 }
             }
             totals.franchiseCardCost +=
                 franchiseCost
-                + percentOf(roomRevenue, profile.roomRentPercent)
-                + percentOf(breakfastRevenue, profile.breakfastRentPercent)
-                + percentOf(parkingRevenue, profile.parkingRentPercent)
                 + percentOf(paymentsGross, profile.cardCostPercent);
+
+            // --- Rent ------------------------------------------------------------
+            // The three rent percentages, each on its matching net revenue
+            // stream. Rent is its own line rather than part of franchise & card:
+            // it is a different agreement, it is usually the larger of the two,
+            // and folding it in left the statement with no rent on it at all.
+            totals.rentCost +=
+                percentOf(roomRevenue, profile.roomRentPercent)
+                + percentOf(breakfastRevenue, profile.breakfastRentPercent)
+                + percentOf(parkingRevenue, profile.parkingRentPercent);
             if (numberOf(profile.breakfastRentPercent) > 0) {
                 flag(
                     `${hotel}: breakfast rent % was applied to the source column `
                     + "breakfast_net_cost, the only breakfast money figure in the cost facts. "
-                    + "Confirm it is breakfast revenue and not a cost before relying on this line."
+                    + "Confirm it is breakfast revenue and not a cost before relying on this line.",
+                    "rentCost"
                 );
             }
 
@@ -448,7 +473,8 @@
                 if (departures > 0) {
                     flag(
                         `${hotel}: no cleaning rows are configured for its room categories, so `
-                        + "cleaning cost is zero. Set cleaning minutes and linen cost in Cost Input."
+                        + "cleaning cost is zero. Set cleaning minutes and linen cost in Cost Input.",
+                        "cleaningCost"
                     );
                 }
             }
@@ -457,7 +483,8 @@
                 flag(
                     "Cleaning cost is departures x the average of the configured category and "
                     + "occupancy rows. The cost facts carry a total departure count only, with "
-                    + "no per-category or per-occupancy breakdown."
+                    + "no per-category or per-occupancy breakdown.",
+                    "cleaningCost"
                 );
             }
 
@@ -480,7 +507,8 @@
             if (!arrivalTiers.length && totalArrivals > 0) {
                 flag(
                     `${hotel}: no reception staffing thresholds are configured, so arrival cost `
-                    + "is zero. Switch arrival cost off in Cost Input if that is deliberate."
+                    + "is zero. Switch arrival cost off in Cost Input if that is deliberate.",
+                    "arrivalCost"
                 );
             }
             totals.arrivalCost += receptionHours * numberOf(profile.receptionCostPerHour);
@@ -491,16 +519,24 @@
 
     // Rounds one set of unrounded totals into the statement rows. Each line is
     // rounded to whole kronor once and GOP is derived from the rounded lines,
-    // so the statement always adds up on screen.
-    function toAmounts(totals) {
+    // so the statement always adds up on screen. Every line is still computed
+    // when some are switched off - only GOP is narrowed to the active ones, so
+    // switching a line back on cannot change the figures on the others.
+    function toAmounts(totals, active) {
         const amounts = {};
         for (const {key} of GOP_LINES) {
             if (key === "gop") continue;
             amounts[key] = Format.roundSek(totals[key]) || 0;
         }
-        amounts.gop = REVENUE_KEYS.reduce((running, key) => running + amounts[key], 0)
-            - COST_KEYS.reduce((running, key) => running + amounts[key], 0);
+        amounts.gop = sumActive(amounts, REVENUE_KEYS, active)
+            - sumActive(amounts, COST_KEYS, active);
         return amounts;
+    }
+
+    function sumActive(amounts, keys, active) {
+        return keys.reduce(
+            (running, key) => (active.has(key) ? running + amounts[key] : running), 0
+        );
     }
 
     // The same rows, split into the buckets the chart draws. Every dataset is
@@ -526,23 +562,29 @@
     }
 
     function calculateGop(
-        data, { hotelName = "", settingsByHotel = {}, grain = "" } = {}
+        data, { hotelName = "", settingsByHotel = {}, grain = "", activeLines = null } = {}
     ) {
         const source = data || {};
         const settingsIndex = settingsByHotel || {};
         const hotels = hotelsInScope(source, hotelName);
-        const flags = [];
+        const active = activeLineSet(activeLines);
+        const raised = [];
         const seenFlags = new Set();
         const currencies = new Set();
 
-        function flag(message) {
+        // A flag belongs to the line it explains. A line that is switched off is
+        // not on the statement, so a warning about how it was derived is noise
+        // rather than something to act on; a flag with no line (a currency
+        // exclusion, an unconfigured property) is about the scope and always
+        // stands.
+        function flag(message, lineKey) {
             if (seenFlags.has(message)) return;
             seenFlags.add(message);
-            flags.push(message);
+            raised.push({message, lineKey});
         }
 
         const totals = accumulate(source, hotels, settingsIndex, flag, currencies);
-        const amounts = toAmounts(totals);
+        const amounts = toAmounts(totals, active);
 
         // Periods are only computed when a grain is asked for: the statement
         // itself needs one set of numbers, and bucketing every dataset is not
@@ -555,16 +597,12 @@
                     bucket, hotelsInScope(bucket, hotelName), settingsIndex,
                     ignore, new Set()
                 );
-                const bucketAmounts = toAmounts(bucketTotals);
+                const bucketAmounts = toAmounts(bucketTotals, active);
                 periods.push({
                     periodKey: key,
                     amounts: bucketAmounts,
-                    revenue: REVENUE_KEYS.reduce(
-                        (running, name) => running + bucketAmounts[name], 0
-                    ),
-                    cost: COST_KEYS.reduce(
-                        (running, name) => running + bucketAmounts[name], 0
-                    ),
+                    revenue: sumActive(bucketAmounts, REVENUE_KEYS, active),
+                    cost: sumActive(bucketAmounts, COST_KEYS, active),
                     gop: bucketAmounts.gop
                 });
             }
@@ -573,16 +611,21 @@
         return {
             currency: currencies.size === 1 ? Array.from(currencies)[0] : "SEK",
             hotels,
-            lines: GOP_LINES.map((line) => ({...line, amount: amounts[line.key]})),
+            lines: GOP_LINES
+                .filter((line) => line.key === "gop" || active.has(line.key))
+                .map((line) => ({...line, amount: amounts[line.key]})),
             gop: amounts.gop,
             periods,
-            flags
+            flags: raised
+                .filter(({lineKey}) => !lineKey || active.has(lineKey))
+                .map(({message}) => message)
         };
     }
 
     const api = {
         DATASET_RULES,
         GOP_LINES,
+        TOGGLEABLE_KEYS,
         FRANCHISE_REVENUE_BASES,
         periodKey,
         aggregate,

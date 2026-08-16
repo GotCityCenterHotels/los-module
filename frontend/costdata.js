@@ -71,12 +71,13 @@
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
         gop: document.getElementById("gopStatement"),
-        gopTable: document.getElementById("gopTableView"),
         gopRows: document.getElementById("gopRows"),
         gopFlags: document.getElementById("gopFlags"),
         gopScope: document.getElementById("gopScopeNote"),
-        gopChart: document.getElementById("gopChartView"),
+        gopChart: document.getElementById("gopChartPanel"),
         gopChartCanvas: document.getElementById("gopChart"),
+        lineToggles: document.getElementById("gopLineToggles"),
+        lineReset: document.getElementById("gopLineResetButton"),
         results: document.getElementById("costResults"),
         error: document.getElementById("costError"),
         title: document.getElementById("costTableTitle"),
@@ -105,7 +106,10 @@
     let loadedData = null;
     let loadedSettings = {};
     let activeDataset = "roomRevenue";
-    let gopView = "statement";
+    // Every group counts until it is switched off in Query settings. Clearing
+    // one takes it out of the statement, out of GOP and out of the chart, so
+    // the two views never disagree about what is being counted.
+    const activeLines = new Set(CostData.TOGGLEABLE_KEYS);
 
     function localIsoDate(date) {
         const offset = date.getTimezoneOffset() * 60000;
@@ -201,7 +205,50 @@
             `${elements.startDate.value} – ${elements.endDate.value}`
         ].join(" · ");
         elements.gop.hidden = false;
+        elements.gopChart.hidden = false;
         elements.results.hidden = false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Which groups are counted
+    //
+    // One checkbox per statement line, built from the statement's own line
+    // list so a line added to the calculation cannot be missing here. All of
+    // them start on: the default reading of the page is the whole statement.
+    // ---------------------------------------------------------------------
+    function buildLineToggles() {
+        elements.lineToggles.replaceChildren(...CostData.GOP_LINES
+            .filter((line) => line.key !== "gop")
+            .map((line) => {
+                const row = document.createElement("label");
+                row.className = `line-toggle is-${line.type}`;
+                const box = document.createElement("input");
+                box.type = "checkbox";
+                box.checked = activeLines.has(line.key);
+                box.value = line.key;
+                box.addEventListener("change", () => {
+                    if (box.checked) activeLines.add(line.key);
+                    else activeLines.delete(line.key);
+                    syncLineToggles();
+                    render();
+                });
+                const name = document.createElement("span");
+                name.textContent = line.label;
+                row.append(box, name);
+                return row;
+            }));
+        syncLineToggles();
+    }
+
+    function syncLineToggles() {
+        elements.lineReset.hidden = activeLines.size === CostData.TOGGLEABLE_KEYS.length;
+    }
+
+    function showEveryLine() {
+        for (const key of CostData.TOGGLEABLE_KEYS) activeLines.add(key);
+        for (const box of elements.lineToggles.querySelectorAll("input")) box.checked = true;
+        syncLineToggles();
+        render();
     }
 
     // A cost is money out; showing it as a bare positive number next to revenue
@@ -224,7 +271,8 @@
         const statement = CostData.calculateGop(loadedData, {
             hotelName: elements.hotel.value,
             settingsByHotel: loadedSettings,
-            grain: elements.grain.value
+            grain: elements.grain.value,
+            activeLines: Array.from(activeLines)
         });
 
         elements.gopScope.textContent = statement.hotels.length
@@ -256,18 +304,6 @@
         elements.gopFlags.hidden = statement.flags.length === 0;
 
         renderGopChart(statement);
-    }
-
-    function setGopView(view) {
-        gopView = view;
-        for (const button of document.querySelectorAll("[data-gop-view]")) {
-            button.setAttribute(
-                "aria-pressed", String(button.dataset.gopView === view)
-            );
-        }
-        elements.gopTable.hidden = view !== "statement";
-        elements.gopChart.hidden = view !== "chart";
-        elements.gop.classList.toggle("is-chart", view === "chart");
     }
 
     // ---------------------------------------------------------------------
@@ -408,7 +444,10 @@
                 }));
             }
 
-            const marker = barWidth / 2 + 5;
+            // The marker spans the bar and nothing more. It used to overhang by
+            // 5px each side, which at a daily grain - where the bars are only a
+            // few pixels apart - drew it straight across its neighbours.
+            const marker = barWidth / 2;
             svg.append(svgNode("line", {
                 x1: centre(index) - marker, x2: centre(index) + marker,
                 y1: y(revenue), y2: y(revenue),
@@ -576,9 +615,7 @@
     // The grain decides the chart's buckets as well as the table's, so it can
     // no longer redraw the table alone.
     elements.grain.addEventListener("change", render);
-    for (const button of document.querySelectorAll("[data-gop-view]")) {
-        button.addEventListener("click", () => setGopView(button.dataset.gopView));
-    }
+    elements.lineReset.addEventListener("click", showEveryLine);
     for (const tab of document.querySelectorAll("[data-dataset]")) {
         tab.addEventListener("click", () => selectDataset(tab));
         tab.addEventListener("keydown", (event) => {
@@ -598,5 +635,5 @@
     }
 
     setDefaultDates();
-    setGopView(gopView);
+    buildLineToggles();
 }());

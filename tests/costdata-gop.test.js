@@ -66,21 +66,25 @@ function lineFor(statement, key) {
     return statement.lines.find((line) => line.key === key).amount;
 }
 
-test("the statement is exactly the eight rows, in the required order", () => {
+test("the statement is exactly the nine rows, in the required order", () => {
     const statement = CostData.calculateGop(data, { settingsByHotel: settings });
 
+    // Rent is its own line rather than part of franchise & card: a different
+    // agreement, usually the larger of the two, and folding it in left the
+    // statement with no rent on it at all.
     assert.deepEqual(statement.lines.map(({ label }) => label), [
         "Room revenue incl products",
         "Parking revenue",
         "Breakfast cost",
         "Distribution cost",
         "Franchise & card cost",
+        "Rent cost",
         "Cleaning cost",
         "Arrival cost",
         "Gross Operating Profit (GOP)"
     ]);
     assert.deepEqual(statement.lines.map(({ type }) => type), [
-        "revenue", "revenue", "cost", "cost", "cost", "cost", "cost", "result"
+        "revenue", "revenue", "cost", "cost", "cost", "cost", "cost", "cost", "result"
     ]);
 });
 
@@ -97,8 +101,10 @@ test("every cost comes from the saved cost input values", () => {
     // 10% of room revenue incl products.
     assert.equal(lineFor(statement, "distributionCost"), 1600);
 
-    // Card 2% of 20000 gross payments, plus 5% room rent on 16000.
-    assert.equal(lineFor(statement, "franchiseCardCost"), 400 + 800);
+    // Card 2% of 20000 gross payments. Franchise is off in the fixture.
+    assert.equal(lineFor(statement, "franchiseCardCost"), 400);
+    // 5% room rent on 16000, on its own line.
+    assert.equal(lineFor(statement, "rentCost"), 800);
 
     // 50 departures x the mean of (20x5 + 50) and (30x5 + 70) = 185.
     assert.equal(lineFor(statement, "cleaningCost"), 50 * 185);
@@ -110,8 +116,10 @@ test("every cost comes from the saved cost input values", () => {
 test("GOP is revenue minus every cost, and matches the rows shown", () => {
     const statement = CostData.calculateGop(data, { settingsByHotel: settings });
     const revenue = lineFor(statement, "roomRevenue") + lineFor(statement, "parkingRevenue");
-    const costs = ["breakfastCost", "distributionCost", "franchiseCardCost", "cleaningCost", "arrivalCost"]
-        .reduce((total, key) => total + lineFor(statement, key), 0);
+    const costs = [
+        "breakfastCost", "distributionCost", "franchiseCardCost", "rentCost",
+        "cleaningCost", "arrivalCost"
+    ].reduce((total, key) => total + lineFor(statement, key), 0);
 
     assert.equal(statement.gop, revenue - costs);
     assert.equal(lineFor(statement, "gop"), statement.gop);
@@ -191,8 +199,8 @@ test("a disabled franchise costs nothing even with a percentage saved", () => {
         settingsByHotel: withProfile({ franchiseEnabled: false, franchisePercent: "8" })
     });
 
-    // Card 2% of 20000 plus 5% room rent on 16000, exactly as before.
-    assert.equal(lineFor(off, "franchiseCardCost"), 400 + 800);
+    // Card 2% of 20000 and nothing else; rent is a separate line.
+    assert.equal(lineFor(off, "franchiseCardCost"), 400);
 });
 
 test("an enabled franchise is charged on the configured revenue base", () => {
@@ -204,7 +212,7 @@ test("an enabled franchise is charged on the configured revenue base", () => {
             franchiseRevenueBase: "roomInclProducts"
         })
     });
-    assert.equal(lineFor(inclProducts, "franchiseCardCost"), 400 + 800 + 1600);
+    assert.equal(lineFor(inclProducts, "franchiseCardCost"), 400 + 1600);
 
     // The same 10% on room revenue with the products taken out: the fixture
     // has no roomRevenueExclProducts1Net at all, so the base is zero and the
@@ -217,7 +225,7 @@ test("an enabled franchise is charged on the configured revenue base", () => {
             franchiseRevenueBase: "roomExclProducts"
         })
     });
-    assert.equal(lineFor(exclProducts, "franchiseCardCost"), 400 + 800);
+    assert.equal(lineFor(exclProducts, "franchiseCardCost"), 400);
 });
 
 test("a gross franchise basis grosses the net revenue up by the VAT rate", () => {
@@ -232,7 +240,7 @@ test("a gross franchise basis grosses the net revenue up by the VAT rate", () =>
     });
 
     // 16000 net grossed to 17920, then 10% of that.
-    assert.equal(lineFor(statement, "franchiseCardCost"), 400 + 800 + 1792);
+    assert.equal(lineFor(statement, "franchiseCardCost"), 400 + 1792);
     assert.equal(statement.flags.some((message) => /grossed up by 12%/.test(message)), true);
 });
 
@@ -326,6 +334,70 @@ test("periods are only computed when a grain is asked for, and sum to the total"
     assert.equal(byMonth.periods.length, 1);
     assert.equal(byMonth.periods[0].periodKey, "2026-01-01");
     assert.equal(byMonth.periods[0].gop, byMonth.gop);
+});
+
+// ---------------------------------------------------------------------------
+// Switching a group off
+// ---------------------------------------------------------------------------
+
+test("every group counts unless the caller narrows the list", () => {
+    const all = CostData.calculateGop(data, { settingsByHotel: settings });
+    const listed = CostData.calculateGop(data, {
+        settingsByHotel: settings, activeLines: CostData.TOGGLEABLE_KEYS
+    });
+
+    // No list at all and the full list are the same reading: the default is
+    // the whole statement, not an empty one.
+    assert.deepEqual(listed.lines, all.lines);
+    assert.equal(listed.gop, all.gop);
+    assert.equal(CostData.TOGGLEABLE_KEYS.includes("gop"), false);
+});
+
+test("a group switched off leaves the rows, GOP and every period", () => {
+    const all = CostData.calculateGop(data, { settingsByHotel: settings, grain: "day" });
+    const withoutCleaning = CostData.calculateGop(data, {
+        settingsByHotel: settings,
+        grain: "day",
+        activeLines: CostData.TOGGLEABLE_KEYS.filter((key) => key !== "cleaningCost")
+    });
+
+    assert.equal(
+        withoutCleaning.lines.some((line) => line.key === "cleaningCost"), false,
+        "a switched-off group has no row"
+    );
+    // A cost that is not counted is a cost that is not subtracted, in the
+    // statement and in every bar of the chart alike.
+    assert.equal(withoutCleaning.gop, all.gop + lineFor(all, "cleaningCost"));
+    for (const [index, period] of withoutCleaning.periods.entries()) {
+        assert.equal(period.cost, all.periods[index].cost - all.periods[index].amounts.cleaningCost);
+        assert.equal(period.gop, all.periods[index].gop + all.periods[index].amounts.cleaningCost);
+    }
+    // The blended-rate caveat explains a line that is no longer on the page.
+    assert.equal(
+        withoutCleaning.flags.some((message) => /no per-category or per-occupancy/.test(message)),
+        false
+    );
+    // Warnings about the scope itself are not tied to a line and still stand.
+    const noSettings = CostData.calculateGop(data, {
+        settingsByHotel: {}, activeLines: ["roomRevenue"]
+    });
+    assert.equal(
+        noSettings.flags.some((message) => /no Cost Input configuration/.test(message)), true
+    );
+});
+
+test("switching a group off does not change what the other groups cost", () => {
+    const all = CostData.calculateGop(data, { settingsByHotel: settings });
+    const revenueOnly = CostData.calculateGop(data, {
+        settingsByHotel: settings, activeLines: ["roomRevenue", "parkingRevenue"]
+    });
+
+    assert.equal(lineFor(revenueOnly, "roomRevenue"), lineFor(all, "roomRevenue"));
+    assert.equal(revenueOnly.gop, 16000 + 2000);
+    assert.deepEqual(
+        revenueOnly.lines.map(({ key }) => key),
+        ["roomRevenue", "parkingRevenue", "gop"]
+    );
 });
 
 test("a period's own thresholds are still evaluated per stay date", () => {

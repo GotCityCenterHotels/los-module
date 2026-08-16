@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data</title>
-    <link rel="stylesheet" href="styles.css?v=fd5378049e">
+    <link rel="stylesheet" href="styles.css?v=69c5bf0518">
 </head>
 <body>
     <main class="container cost-workspace">
@@ -28,80 +28,96 @@
             </div>
         </header>
 
-        <section class="filter-panel cost-filters" aria-label="Cost data filters">
-            <div class="filter-field">
-                <label for="costStartDate">Start date</label>
-                <input id="costStartDate" type="date">
-            </div>
-            <div class="filter-field">
-                <label for="costEndDate">End date</label>
-                <input id="costEndDate" type="date">
-            </div>
-            <div class="filter-field hotel-filter">
-                <label for="costHotel">Hotel</label>
-                <select id="costHotel" disabled>
-                    <option value="">All hotels</option>
-                </select>
-            </div>
-            <div class="filter-field">
-                <label for="costGrain">Group by</label>
-                <select id="costGrain">
-                    <option value="day">Day</option>
-                    <option value="week">Week</option>
-                    <option value="month" selected>Month</option>
-                    <option value="year">Year</option>
-                </select>
-            </div>
-            <div class="filter-action">
-                <button id="costLoadButton" type="button">Update data</button>
-            </div>
-        </section>
-
         <div class="cost-status-line">
             <span id="costStatus" role="status" aria-live="polite">Choose a period, then update the data.</span>
             <span id="costScope"></span>
         </div>
 
-        <section id="gopStatement" class="gop-statement" aria-labelledby="gopTitle" hidden>
-            <div class="gop-heading">
-                <div>
-                    <span class="section-eyebrow">NET · EXCL. VAT</span>
-                    <h2 id="gopTitle">Gross Operating Profit</h2>
+        <div class="cost-overview">
+            <section class="filter-panel cost-filters cost-query" aria-labelledby="costQueryTitle">
+                <div class="cost-query-heading">
+                    <span class="section-eyebrow">QUERY</span>
+                    <h2 id="costQueryTitle">Query settings</h2>
                 </div>
-                <div class="gop-heading-actions">
-                    <span id="gopScopeNote" class="gop-scope"></span>
-                    <div class="view-switcher" role="group" aria-label="Gross Operating Profit view">
-                        <button type="button" data-gop-view="statement" aria-pressed="true">Statement</button>
-                        <button type="button" data-gop-view="chart" aria-pressed="false">Chart</button>
-                    </div>
+                <div class="filter-field">
+                    <label for="costStartDate">Start date</label>
+                    <input id="costStartDate" type="date">
                 </div>
-            </div>
+                <div class="filter-field">
+                    <label for="costEndDate">End date</label>
+                    <input id="costEndDate" type="date">
+                </div>
+                <div class="filter-field hotel-filter">
+                    <label for="costHotel">Hotel</label>
+                    <select id="costHotel" disabled>
+                        <option value="">All hotels</option>
+                    </select>
+                </div>
+                <div class="filter-field">
+                    <label for="costGrain">Group by</label>
+                    <select id="costGrain">
+                        <option value="day">Day</option>
+                        <option value="week">Week</option>
+                        <option value="month" selected>Month</option>
+                        <option value="year">Year</option>
+                    </select>
+                </div>
+                <div class="filter-action">
+                    <button id="costLoadButton" type="button">Update data</button>
+                </div>
 
-            <div id="gopTableView">
+                <fieldset class="line-toggles">
+                    <legend>Groups shown</legend>
+                    <p class="line-toggles-note">
+                        Every group counts towards GOP unless it is cleared here.
+                    </p>
+                    <div id="gopLineToggles" class="line-toggle-list"></div>
+                    <button type="button" id="gopLineResetButton" class="text-button" hidden>
+                        Show every group
+                    </button>
+                </fieldset>
+            </section>
+
+            <section id="gopStatement" class="gop-statement" aria-labelledby="gopTitle" hidden>
+                <div class="gop-heading">
+                    <div>
+                        <span class="section-eyebrow">NET · EXCL. VAT</span>
+                        <h2 id="gopTitle">Gross Operating Profit</h2>
+                    </div>
+                    <span id="gopScopeNote" class="gop-scope"></span>
+                </div>
+
                 <table class="gop-table">
                     <caption class="visually-hidden">
                         Net revenue, operating costs, and gross operating profit for the selected scope
                     </caption>
                     <tbody id="gopRows"></tbody>
                 </table>
-            </div>
 
-            <div id="gopChartView" hidden>
+                <ul id="gopFlags" class="gop-flags" aria-label="Calculation notes" hidden></ul>
+            </section>
+        </div>
+
+        <section id="gopChartPanel" class="gop-chart-panel" aria-labelledby="gopChartTitle" hidden>
+            <div class="gop-heading">
+                <div>
+                    <span class="section-eyebrow">PER PERIOD</span>
+                    <h2 id="gopChartTitle">Cost against revenue</h2>
+                </div>
                 <div class="chart-legend gop-chart-legend" aria-label="Chart legend">
                     <span><i class="legend-swatch gop-legend-base"></i>Base amount</span>
                     <span><i class="legend-swatch gop-legend-profit"></i>Profit</span>
                     <span><i class="legend-swatch gop-legend-loss"></i>Loss</span>
                     <span><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
                 </div>
-                <div id="gopChart" class="los-chart gop-chart"></div>
-                <p class="gop-chart-note">
-                    One bar per period, using the <strong>Group by</strong> setting above.
-                    The bar is what the period cost to run; the purple marker is the
-                    revenue it earned.
-                </p>
             </div>
 
-            <ul id="gopFlags" class="gop-flags" aria-label="Calculation notes" hidden></ul>
+            <div id="gopChart" class="los-chart gop-chart"></div>
+            <p class="gop-chart-note">
+                One bar per period, using the <strong>Group by</strong> setting on the left.
+                The bar is what the period cost to run; the purple marker is the
+                revenue it earned.
+            </p>
         </section>
 
         <section id="costResults" class="cost-results" hidden>
@@ -135,7 +151,7 @@
 
     <script src="los-api.js?v=73ab0a7665"></script>
     <script src="los-format.js?v=5c3cad90fe"></script>
-    <script src="costdata-data.js?v=0fa5de9460"></script>
-    <script src="costdata.js?v=b166cd7d36"></script>
+    <script src="costdata-data.js?v=93e6797f20"></script>
+    <script src="costdata.js?v=472e402f64"></script>
 </body>
 </html>

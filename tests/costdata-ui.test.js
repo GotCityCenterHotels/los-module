@@ -128,6 +128,41 @@ test("card and franchise live in their own section, and rent no longer holds the
     assert.match(html, /data-section="cardFranchise"/, "the nav must reach the new section");
 });
 
+// The switch used to sit in the section heading, at the far right of the page
+// and a long way above the fields it governs, so nothing on screen connected
+// the two.
+test("the franchise switch sits in one card with the fields it governs", () => {
+    const html = read("costdata-input.html");
+    const section = /data-settings-section="cardFranchise"[\s\S]*?<\/section>/.exec(html)[0];
+    const heading = /<div class="editor-heading">[\s\S]*?<\/div><\/div>/.exec(section)[0];
+    const card = /<div class="franchise-card"[\s\S]*?\n {16}<\/div>/.exec(section)[0];
+
+    assert.doesNotMatch(heading, /franchiseEnabled/, "the switch has left the heading");
+    assert.match(card, /<input type="checkbox" name="franchiseEnabled"/);
+    // One card, holding every franchise field - not a card per field.
+    for (const field of [
+        "franchisePercent", "franchiseBasis", "franchiseRevenueBase", "franchiseVatPercent"
+    ]) {
+        assert.match(card, new RegExp(`name="${field}"`), `${field} belongs in the card`);
+    }
+    assert.match(read("styles.css"), /\.franchise-card \{/);
+});
+
+test("the VAT field only appears when the franchise is calculated on gross", () => {
+    const html = read("costdata-input.html");
+    const script = read("costdata-input.js");
+
+    // Hidden to start with: net is the default basis, and a field that does
+    // nothing is worse than no field at all.
+    assert.match(html, /<label id="franchiseVatField" hidden>/);
+    assert.match(script, /const grossBasis = Boolean\(basis\) && basis\.value === "gross"/);
+    assert.match(script, /if \(vatField\) vatField\.hidden = !grossBasis;/);
+    // Hidden and disabled together: disabling is what exempts a blank required
+    // field from constraint validation, so hiding alone would block the save.
+    assert.match(script, /if \(vat\) vat\.disabled = !franchiseOn \|\| !grossBasis;/);
+    assert.match(script, /event\.target\.name === "franchiseBasis"/);
+});
+
 test("the distribution editor is a three-level tree, not a flat group list", () => {
     const html = read("costdata-input.html");
     const script = read("costdata-input.js");
@@ -169,16 +204,71 @@ test("the agency filter searches the source without regard to case", () => {
     assert.match(script, /debounce\(suggest, \d+\)/, "keystrokes must not each fire a request");
 });
 
-test("the Cost Data page offers a chart view of the same statement", () => {
+test("the Cost Data page charts the same statement it tabulates", () => {
     const html = read("costdata.html");
 
-    assert.match(html, /data-gop-view="statement"/);
-    assert.match(html, /data-gop-view="chart"/);
+    assert.match(html, /id="gopChartPanel"/);
     assert.match(html, /id="gopChart"/);
-    // The four marks the chart draws must each be named in the legend.
+    // Every mark the chart draws is named in the legend, or a reader has no
+    // way to tell the base from the profit sitting on top of it.
     for (const key of ["Base amount", "Profit", "Loss", "Revenue level"]) {
         assert.match(html, new RegExp(key), `missing legend entry ${key}`);
     }
+    // The statement and the chart show the same set of lines, so the control
+    // that narrows them has to drive both.
+    assert.match(html, /id="gopLineToggles"/);
+});
+
+// The chart used to be the other half of a Statement/Chart switcher, so it was
+// only ever seen by someone who knew to go looking for it.
+test("query settings sit beside the statement, and the chart under both", () => {
+    const html = read("costdata.html");
+    const overview = /<div class="cost-overview">[\s\S]*?\n {8}<\/div>/.exec(html)[0];
+
+    // Settings on the left, statement on the right, inside one row.
+    assert.ok(
+        overview.indexOf('class="filter-panel cost-filters cost-query"')
+            < overview.indexOf('id="gopStatement"'),
+        "the query settings must come before the statement in the overview row"
+    );
+    // And the chart below that row, not inside it.
+    assert.doesNotMatch(overview, /id="gopChartPanel"/);
+    assert.ok(
+        html.indexOf('class="cost-overview"') < html.indexOf('id="gopChartPanel"'),
+        "the chart panel belongs under the settings and the statement"
+    );
+    // Nothing hides the chart behind a view any more.
+    assert.doesNotMatch(html, /data-gop-view/);
+    assert.doesNotMatch(read("costdata.js"), /setGopView/);
+    assert.match(read("styles.css"), /\.cost-overview \{/);
+});
+
+test("the revenue marker is exactly as wide as the bar it marks", () => {
+    const script = read("costdata.js");
+    const css = read("styles.css");
+
+    // It used to overhang by 5px each side, which at a daily grain - where the
+    // bars are only a few pixels apart - drew it across its neighbours.
+    assert.match(script, /const marker = barWidth \/ 2;/);
+    assert.doesNotMatch(script, /barWidth \/ 2 \+ \d/);
+    // A round cap puts half the stroke width back on each end, so the CSS has
+    // to agree with the geometry.
+    const revenueRule = /\.gop-bar-revenue \{[\s\S]*?\}/.exec(css)[0];
+    assert.match(revenueRule, /stroke-linecap: butt/);
+});
+
+test("every group starts shown and can be switched off from the settings", () => {
+    const script = read("costdata.js");
+    const html = read("costdata.html");
+
+    // Built from the statement's own line list, so a line added to the
+    // calculation cannot be missing a switch.
+    assert.match(script, /CostData\.GOP_LINES\s*\n?\s*\.filter\(\(line\) => line\.key !== "gop"\)/);
+    assert.match(script, /const activeLines = new Set\(CostData\.TOGGLEABLE_KEYS\)/);
+    assert.match(script, /activeLines: Array\.from\(activeLines\)/);
+    // Switching one re-renders both views from the same set.
+    assert.match(script, /box\.addEventListener\("change"/);
+    assert.match(html, /class="line-toggles"/);
 });
 
 // "−0" is a rounding artefact, not a quantity, and a column of them reads as a
@@ -321,6 +411,7 @@ test("rooms are bound to a bed type by a stable key, never by its name", () => {
     assert.match(script, /function ensureBedKeys\(\)/);
     assert.match(script, /function bedByKey\(key\)/);
     assert.match(script, /function resolveRowBed\(rowBed\)/);
+    assert.match(read("costdata-cleaning.js"), /function resolveRowBed\(rowBed, bedTypes\)/);
     assert.doesNotMatch(script, /renameBedEverywhere/);
     assert.match(script, /function removeBedEverywhere\(bedKey\)/);
     assert.match(script, /bed\.bedKey !== bedKey/);
@@ -354,17 +445,18 @@ test("an emptied bed count settles at one instead of failing the save", () => {
 });
 
 test("the lowest guest count carries the setup and the rest inherit it", () => {
+    const rules = read("costdata-cleaning.js");
     const script = read("costdata-input.js");
 
-    assert.match(script, /function baseRowFor\(categoryName\)/);
-    assert.match(script, /function effectiveRow\(row\)/);
+    // The rules live in one place and are unit-tested against real bed setups
+    // in costdata-cleaning.test.js; the editor only calls them.
+    assert.match(rules, /function baseRowFor\(rows, categoryName\)/);
+    assert.match(rules, /function resolveRow\(rows, row, bedTypes\)/);
     // Beds inherit unless the row's override is switched on; minutes inherit
     // whenever the box is empty. The two rules are deliberately different.
-    assert.match(script, /const inheritsBeds = !isBase && !row\.overridesBase/);
-    assert.match(
-        script,
-        /const inheritsMinutes = !isBase && \(rawMinutes === null \|\| rawMinutes === undefined \|\| rawMinutes === ""\)/
-    );
+    assert.match(rules, /const inheritsBeds = !isBase && !row\.overridesBase/);
+    assert.match(rules, /const inheritsMinutes = !isBase && isBlank\(row\.cleaningMinutes\)/);
+    assert.match(script, /CostCleaning\.resolveRow\(/);
     // Switching the override on must start from what was being inherited, not
     // from an empty row.
     assert.match(script, /row\.beds = state\.beds\.map\(bed => \(\{\.\.\.bed\}\)\)/);
@@ -446,7 +538,9 @@ test("linen cost is derived from beds only, with nothing to type per row", () =>
     // a derived figure and offers nothing to type into.
     const cleaning = /data-settings-section="cleaning"[\s\S]*?<\/section>/.exec(html)[0];
     assert.doesNotMatch(cleaning, /name="linenCost"/);
-    assert.match(script, /const linen = beds\.reduce\(/);
+    // The arithmetic lives in costdata-cleaning.js, which is unit-tested
+    // against real bed setups; the editor only calls it.
+    assert.match(read("costdata-cleaning.js"), /linen: bedsLinenCost\(beds, bedTypes\)/);
     assert.doesNotMatch(script, /numberValue\(row\.linenCost\)/);
     assert.doesNotMatch(script, /linenCost: existing/);
 
