@@ -316,8 +316,13 @@ class CostSettingsValidationTests(unittest.TestCase):
                 property_record["hotelName"],
             )
 
-        mirror.assert_called_once_with([property_record])
-        preload.assert_called_once_with([property_record])
+        # Both bootstrap writes now travel on the read's own pooled connection,
+        # so the connection keyword is part of every call. Assert on the payload
+        # only: which connection carried it is not what this test is about.
+        mirror.assert_called_once()
+        self.assertEqual(mirror.call_args.args[0], [property_record])
+        preload.assert_called_once()
+        self.assertEqual(preload.call_args.args[0], [property_record])
         self.assertEqual(result["enterpriseId"], "property-42")
         self.assertEqual(result["hotelName"], "Hotel A")
 

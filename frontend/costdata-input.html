@@ -8,7 +8,7 @@
          preceding stylesheet is still loading, so putting this after the link
          would put the whole of styles.css in front of the first API call. -->
     <script src="costdata-boot.js?v=627fe31331"></script>
-    <link rel="stylesheet" href="styles.css?v=69c5bf0518">
+    <link rel="stylesheet" href="styles.css?v=c0beb452ef">
 </head>
 <body>
 <main class="container cost-workspace settings-workspace">
@@ -27,7 +27,7 @@
         </div>
     </header>
 
-    <div id="settingsStatus" class="cost-status-line" role="status" aria-live="polite">Select a property to begin.</div>
+    <div id="settingsStatus" class="cost-status-line" role="status" aria-live="polite">Select a hotel to begin.</div>
     <section id="settingsError" class="error-panel" role="alert" hidden></section>
     <div class="settings-maintenance">
         <div>
@@ -101,13 +101,13 @@
                         <label>Revenue base<select name="franchiseRevenueBase"><option value="roomInclProducts">Room revenue incl. products</option><option value="roomExclProducts">Room revenue &minus; products</option><option value="roomExclProductsPlusParking">Room revenue &minus; products, plus parking</option><option value="totalRevenue">Total revenue (room incl. products + parking)</option></select><small>Products include breakfast sold on the room</small></label>
                         <label id="franchiseVatField" hidden>VAT % used for gross<input name="franchiseVatPercent" type="number" min="0" max="100" step="0.01" required><small>Used to convert net revenue to gross</small></label>
                     </div>
-                    <p class="section-off-note" id="franchiseOffNote" hidden>The franchise fee is switched off for this property, so nothing in this card is charged.</p>
+                    <p class="section-off-note" id="franchiseOffNote" hidden>The franchise fee is off for this hotel, so nothing in this card is charged.</p>
                 </div>
             </section>
             <div class="settings-savebar"><span id="dirtyState">No unsaved changes</span><button id="saveSettings" type="submit">Save property settings</button></div>
         </form>
     </div>
 </main>
-<script src="los-api.js?v=7a6e7f351b"></script><script src="los-format.js?v=5c3cad90fe"></script><script src="costdata-cleaning.js?v=0db8517c1b"></script><script src="costdata-match.js?v=b276a6fc99"></script><script src="costdata-input.js?v=78bb265773"></script>
+<script src="los-api.js?v=7a6e7f351b"></script><script src="los-format.js?v=5c3cad90fe"></script><script src="costdata-cleaning.js?v=0db8517c1b"></script><script src="costdata-match.js?v=b276a6fc99"></script><script src="costdata-input.js?v=3848e52d53"></script>
 </body>
 </html>

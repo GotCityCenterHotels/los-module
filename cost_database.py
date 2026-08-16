@@ -64,9 +64,12 @@ def apply_background_timeouts(cursor):
     )
 
 
+# See the note beside the integration_db pool in database.py: min_size stays 0
+# in code so the test processes do not open reconnect threads, and is raised to
+# 1 by the deployed app settings, where it pairs with an always-ready instance.
 cost_pool = ConnectionPool(
     conninfo=connection_string,
-    min_size=0,
+    min_size=int(os.environ.get("APP_DB_POOL_MIN_SIZE", "0")),
     max_size=int(os.environ.get("APP_DB_POOL_MAX_SIZE", "4")),
     timeout=float(os.environ.get("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "10")),
     max_waiting=int(os.environ.get("DB_POOL_MAX_WAITING", "16")),

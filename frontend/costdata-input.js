@@ -41,8 +41,21 @@
         arrivalTiers: [["minArrivals","Min arrivals","number"],["maxArrivals","Max arrivals","number"],["receptionHours","Reception hours","number"]],
         breakfastTiers: [["minGuests","From guests","number"],["maxGuests","To guests","number"],["staffHours","Staff hours","number"]]
     };
-    const rowClasses = { breakfastTiers: "tier-row is-compact" };
+    // Arrivals is listed second so the two threshold lists render identically.
+    // Order matters only because it is asserted: the breakfast entry has to stay
+    // first in the literal.
+    const rowClasses = { breakfastTiers: "tier-row is-compact", arrivalTiers: "tier-row is-compact" };
     const defaults = { arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0} };
+    // An empty section is a real configuration, not a mistake, so each one says
+    // what having no rows actually costs rather than the same "No rules added
+    // yet." in both places.
+    const emptyMessages = {
+        arrivalTiers:
+            "No thresholds yet. No reception cost is charged for arrivals until you add one.",
+        breakfastTiers:
+            "No thresholds yet. Staff hours are not costed until you add one — "
+            + "food cost per guest still applies."
+    };
 
     // Rates, channels, origins and room categories for the selected hotel, from
     // /api/costdata/sources. Null until loaded; an empty object after a failed
@@ -103,16 +116,25 @@
         });
     }
 
-    async function loadHotels() {
-        status.textContent = "Loading properties...";
+    async function loadHotels(options) {
+        const fresh = Boolean(options && options.forceRefresh);
+        status.textContent = "Loading hotels…";
         hotel.disabled = true;
         try {
-            const payload = await LosApi.fetchJson(PROPERTIES_API, {cache: "no-store"});
+            // No cache directive on the ordinary path: the route sends
+            // private, max-age=300 and the list only changes when the nightly
+            // import runs. An operator who has just imported a new hotel must
+            // see it at once, so that caller asks for a reload - the one thing
+            // that actually bypasses an HTTP cache. Clearing a storage key,
+            // which an earlier draft of this did, would not have.
+            const payload = await LosApi.fetchJson(
+                PROPERTIES_API, fresh ? {cache: "reload"} : undefined
+            );
             const properties = (payload.data || []).filter((property) =>
                 property && property.enterpriseId != null && String(property.enterpriseId).trim()
                 && property.hotelName && String(property.hotelName).trim()
             );
-            hotel.replaceChildren(new Option("Select property", ""));
+            hotel.replaceChildren(new Option("Select hotel", ""));
             for (const property of properties) {
                 hotel.add(new Option(property.hotelName, String(property.enterpriseId)));
             }
@@ -127,12 +149,16 @@
                 await loadSettings(hotel.value);
             }
             else {
-                layout.hidden = true;
-                status.textContent = "No properties were found in the source or imported cost data.";
+                setEditorState("empty");
+                status.textContent = "No hotels were found in the source or imported cost data.";
                 hotel.disabled = false;
             }
         }
-        catch (error) { hotel.disabled = false; showError(error, "Loading properties"); }
+        catch (error) {
+            hotel.disabled = false;
+            setEditorState("empty");
+            showError(error, "Loading hotels");
+        }
     }
 
     const PROPERTY_STORAGE = "costdata-input-property";
@@ -143,22 +169,48 @@
         try { localStorage.setItem(PROPERTY_STORAGE, enterpriseId); } catch { /* private mode */ }
     }
 
+    // costdata-boot.js may already have this hotel's rulebook in flight, started
+    // from <head> before the stylesheet and this file had finished downloading.
+    // It is consumed once and then discarded: a second read must go to the
+    // network, or saving and reloading would show the pre-save copy.
+    function bootPayloadFor(enterpriseId) {
+        const boot = window.__costBoot;
+        if (!boot || String(boot.enterpriseId) !== String(enterpriseId)) return null;
+        window.__costBoot = null;
+        return boot.settings;
+    }
+
     async function loadSettings(name) {
         if (!name || name === "undefined" || name === "null") {
-            layout.hidden = true;
-            status.textContent = "Select a property to begin.";
+            setEditorState("empty");
+            status.textContent = "Select a hotel to begin.";
             return;
         }
         setBusy(true); errorPanel.hidden = true;
         const selectedOption = hotel.options[hotel.selectedIndex];
+        // Said before the awaits, not after: switching hotel used to leave the
+        // header reading "Editing <previous hotel>" over the previous hotel's
+        // fully rendered rules for the whole of both round trips.
+        status.textContent = selectedOption
+            ? `Loading ${selectedOption.textContent}…`
+            : "Loading…";
+        setEditorState("loading");
         const parameters = new URLSearchParams({
             hotelName: selectedOption ? selectedOption.textContent : ""
         });
         try {
-            const [payload] = await Promise.all([
-                LosApi.fetchJson(`${API}/${encodeURIComponent(name)}?${parameters}`, {cache: "no-store"}),
-                loadSources(name)
-            ]);
+            const sourcesLoaded = loadSources(name);
+            // The prefetch resolves to null when it was for another hotel, or
+            // when it failed - it never throws, so a bad prefetch costs one
+            // ordinary request rather than the page.
+            let payload = await bootPayloadFor(name);
+            if (!payload) {
+                payload = await LosApi.fetchJson(
+                    `${API}/${encodeURIComponent(name)}?${parameters}`,
+                    {cache: "no-store"}
+                );
+            }
+            await sourcesLoaded;
             model = payload.data;
             model.distributionOriginGroups = model.distributionOriginGroups || [];
             model.bedTypes = model.bedTypes || [];
@@ -168,7 +220,7 @@
             agencyCache.clear();
             originDrafts = new WeakMap();
             render();
-            layout.hidden = false;
+            setEditorState("ready");
             setDirty(false);
             if (sources && sources.error) {
                 // Rates, channels, origins and room categories all come from
@@ -187,7 +239,14 @@
                 status.textContent = `Editing ${model.hotelName}`;
             }
         }
-        catch (error) { showError(error, "Loading this property's settings"); } finally { setBusy(false); }
+        catch (error) {
+            // The editor goes away with the failure. Leaving the previous
+            // hotel's rules on screen under the new hotel's name is how wrong
+            // numbers get copied into a report.
+            setEditorState("empty");
+            showError(error, "Loading this hotel's settings");
+        }
+        finally { setBusy(false); }
     }
     function render() {
         for (const [key, value] of Object.entries(model.profile)) {
@@ -218,9 +277,18 @@
         }
         syncSectionSwitches();
         if (failures.length) {
+            // The section names stay in the message. A bare "Something went
+            // wrong" here used to hide both the cause and the fact that every
+            // other section was fine. The exception text itself is already
+            // logged per section just above.
             showError(
-                new Error(`${failures.join(" | ")}. The other sections are still editable.`),
-                "Rendering the editor"
+                new Error(
+                    `These sections could not be opened: `
+                    + `${failures.map(failure => failure.split(": ")[0]).join(", ")}. `
+                    + "The rest of the form still works. Reload the page, and tell "
+                    + "IT if it happens again."
+                ),
+                "Loading the form"
             );
         }
     }
@@ -965,7 +1033,7 @@
         manual.className = "tree-manual";
         const entry = document.createElement("input");
         entry.type = "text";
-        entry.placeholder = "Add an origin by name...";
+        entry.placeholder = "Add an origin by name…";
         entry.setAttribute("aria-label", "Add an origin by name");
         // Half-typed text is not in the model, and every edit anywhere in the
         // tree rebuilds this input from scratch - so ticking a checkbox used to
@@ -1134,7 +1202,7 @@
         input.type = "text";
         input.className = "combo-input";
         input.value = rule.containsValue || "";
-        input.placeholder = "Part of the agency name...";
+        input.placeholder = "Part of the agency name…";
         input.setAttribute("aria-label", "Travel agency contains");
         input.setAttribute("autocomplete", "off");
 
@@ -1296,6 +1364,9 @@
     // hatch for a rate that has not been sold yet, and is deliberately a
     // separate button so the narrowed list is never quietly replaced by the
     // full one.
+    // aria-controls needs an id, and the tree rebuilds these pickers freely, so
+    // the ids are simply serial rather than derived from a path that changes.
+    let ratePopupCount = 0;
     function buildRatePicker(mode, label, originGroup, agency, rateGroup, path) {
         const combo = document.createElement("div");
         combo.className = "combo rate-picker";
@@ -1308,14 +1379,27 @@
         const popup = document.createElement("div");
         popup.className = "combo-popup rate-popup";
         popup.setAttribute("role", "listbox");
+        popup.id = `rate-popup-${++ratePopupCount}`;
         popup.hidden = true;
 
         const search = document.createElement("input");
         search.type = "text";
         search.className = "combo-input rate-search";
-        search.placeholder = "Search rates...";
+        search.placeholder = "Search rates…";
         search.setAttribute("aria-label", `Search ${mode === "all" ? "all" : "matching"} rates`);
         search.setAttribute("autocomplete", "off");
+        // Assigning a rate was mouse-only: the options were non-focusable divs
+        // carrying nothing but a pointerdown handler, so there was no keyboard
+        // path to the page's core task at all.
+        search.setAttribute("role", "combobox");
+        search.setAttribute("aria-autocomplete", "list");
+        search.setAttribute("aria-controls", popup.id);
+        search.setAttribute("aria-expanded", "false");
+
+        function setExpanded(open) {
+            popup.hidden = !open;
+            search.setAttribute("aria-expanded", String(open));
+        }
 
         const list = document.createElement("div");
         list.className = "rate-options";
@@ -1334,8 +1418,27 @@
         }
 
         function close() {
-            popup.hidden = true;
+            setExpanded(false);
             search.value = "";
+        }
+
+        // Roving focus rather than aria-activedescendant: the two patterns are
+        // mutually exclusive, and moving real focus is what makes the existing
+        // .combo-option:focus styling and Enter/Space work without a second
+        // bookkeeping attribute to keep in step.
+        function selectableOptions() {
+            return Array.from(
+                list.querySelectorAll(".combo-option:not([aria-disabled='true'])")
+            );
+        }
+        function moveOption(step) {
+            const items = selectableOptions();
+            if (!items.length) return;
+            const current = items.indexOf(document.activeElement);
+            const next = current < 0
+                ? (step > 0 ? 0 : items.length - 1)
+                : (current + step + items.length) % items.length;
+            items[next].focus();
         }
 
         function draw() {
@@ -1378,8 +1481,8 @@
             if (sources && sources.error) return "This hotel's rate list could not be loaded.";
             if (mode === "all") return "This hotel has no rates in the source.";
             if (!sourceCapability("rateFromReservations")) {
-                return "Reservations in this mirror carry no rate, so matching "
-                    + "rates cannot be narrowed. Use \"Add any rate\" instead.";
+                return "Reservations here have no rate recorded, so there is "
+                    + "nothing to narrow. Use \"Add any rate on the property\" instead.";
             }
             return "No reservations under these filters were sold on a rate.";
         }
@@ -1401,8 +1504,8 @@
                 option.append(badge);
                 return option;
             }
-            option.addEventListener("pointerdown", (event) => {
-                event.preventDefault();
+            option.tabIndex = -1;
+            const choose = () => {
                 rateGroup.rates = rateGroup.rates || [];
                 rateGroup.rates.push({
                     // partitionOptions rebuilds its results as {name} / {name,
@@ -1415,6 +1518,25 @@
                 closeOpenCombo();
                 renderDistributionTree();
                 setDirty(true);
+            };
+            option.addEventListener("pointerdown", (event) => {
+                event.preventDefault();
+                choose();
+            });
+            option.addEventListener("keydown", (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    choose();
+                    return;
+                }
+                if (event.key === "ArrowDown") { event.preventDefault(); moveOption(1); }
+                else if (event.key === "ArrowUp") { event.preventDefault(); moveOption(-1); }
+                else if (event.key === "Escape") {
+                    event.stopPropagation();
+                    close();
+                    openCombo = null;
+                    trigger.focus();
+                }
             });
             return option;
         }
@@ -1422,7 +1544,7 @@
         trigger.onclick = async () => {
             if (!popup.hidden) { close(); openCombo = null; return; }
             closeOpenCombo();
-            popup.hidden = false;
+            setExpanded(true);
             openCombo = api;
             list.replaceChildren(loadingRow());
             options = mode === "all"
@@ -1434,8 +1556,21 @@
         };
         search.addEventListener("input", draw);
         search.addEventListener("keydown", (event) => {
-            if (event.key === "Enter") event.preventDefault();
-            if (event.key === "Escape") { event.stopPropagation(); close(); openCombo = null; }
+            if (event.key === "Enter") {
+                // Enter used to be swallowed to stop it submitting the form,
+                // which left the keyboard user with a filtered list and no way
+                // to take anything from it. Committing the first match is the
+                // whole difference between the picker being operable and not.
+                event.preventDefault();
+                const [first] = selectableOptions();
+                if (first) first.dispatchEvent(
+                    new KeyboardEvent("keydown", {key: "Enter", bubbles: false})
+                );
+                return;
+            }
+            if (event.key === "ArrowDown") { event.preventDefault(); moveOption(1); }
+            else if (event.key === "ArrowUp") { event.preventDefault(); moveOption(-1); }
+            else if (event.key === "Escape") { event.stopPropagation(); close(); openCombo = null; }
         });
 
         popup.append(search, list, note);
@@ -1446,7 +1581,7 @@
     function loadingRow() {
         const row = document.createElement("div");
         row.className = "combo-empty";
-        row.textContent = "Looking up rates...";
+        row.textContent = "Looking up rates…";
         return row;
     }
 
@@ -1497,7 +1632,11 @@
         const terms = (filters || [])
             .map(rule => String(rule.containsValue || "").trim())
             .filter(Boolean);
-        const key = `${originParameter(origins)}|${terms.join("|").toLowerCase()}`;
+        // The hotel has to be part of the key, for the same reason it is part of
+        // the agency cache key twenty lines above: without it, the same origin
+        // and search terms on the next hotel are served the previous hotel's
+        // rates. Only the clear() on load was hiding this.
+        const key = `${loadedEnterpriseId}|${originParameter(origins)}|${terms.join("|").toLowerCase()}`;
         if (rateCache.has(key)) return rateCache.get(key);
 
         const requests = (terms.length ? terms : [""]).map(async (term) => {
@@ -1577,7 +1716,7 @@
             bindFields(row, item);
             root.append(row);
         });
-        emptyMessage(root, "No rules added yet.");
+        emptyMessage(root, emptyMessages[key] || "No rules added yet.");
     }
     function bindFields(root,item){root.querySelectorAll("[data-field]").forEach(input=>input.addEventListener("input",()=>{item[input.dataset.field]=input.type==="checkbox"?input.checked:input.value;setDirty(true)}))}
     function emptyMessage(root,text){if(!root.children.length){const p=document.createElement("p");p.className="rules-empty";p.textContent=text;root.append(p)}}
@@ -1652,29 +1791,108 @@
         const section = element.closest("[data-settings-section]");
         return section ? section.dataset.settingsSection : null;
     }
+    // Section order is taken from the markup rather than restated here, so the
+    // first section stays the default even if the rail is reordered.
+    const SECTIONS = Array.from(
+        document.querySelectorAll("[data-settings-section]"),
+        (section) => section.dataset.settingsSection
+    );
+    function sectionFromHash() {
+        const requested = decodeURIComponent(location.hash.slice(1));
+        return SECTIONS.includes(requested) ? requested : SECTIONS[0];
+    }
+    function railButton(name) {
+        return document.querySelector(
+            `.settings-nav button[data-section="${name}"]`
+        );
+    }
+    // The rail selects a panel, so it is a tablist and marks the open one with
+    // aria-selected. It used to claim aria-current="page", which the Cost Input
+    // link in the main nav also claims - two current pages at once, and neither
+    // one trustworthy.
     function showSection(name) {
         for (const button of document.querySelectorAll(".settings-nav button")) {
-            if (button.dataset.section === name) button.setAttribute("aria-current", "page");
-            else button.removeAttribute("aria-current");
+            button.setAttribute(
+                "aria-selected", String(button.dataset.section === name)
+            );
         }
         for (const section of document.querySelectorAll("[data-settings-section]")) {
             section.hidden = section.dataset.settingsSection !== name;
         }
+    }
+    // The shell - the rail, the section headings, the fixed strips and the rent
+    // and franchise grids - is already correct before any data arrives, so it
+    // stays on screen while the requests are in flight. Hiding all of it until
+    // the last response landed was most of why this page felt like the slowest
+    // one: for the whole round trip the operator saw a header, an empty select
+    // and a line of status text.
+    //
+    // Individual inputs are deliberately left alone. syncSectionSwitches() owns
+    // their disabled state, and a blanket re-enable here would quietly turn a
+    // switched-off section back on.
+    const skeleton = document.getElementById("settingsSkeleton");
+    function setEditorState(state) {
+        if (skeleton) skeleton.hidden = state !== "loading";
+        layout.hidden = state === "empty";
+        for (const button of document.querySelectorAll(".settings-nav button")) {
+            // A rail click during the first load moved the selection but changed
+            // nothing on screen, because the sections it toggles were not built
+            // yet.
+            button.disabled = state !== "ready";
+        }
+    }
+    // A row that appears with every field blank and no focus in it is a row the
+    // user has to go back and find. The new row is always the last child:
+    // emptyMessage only appends its paragraph when the list is empty, so there
+    // is nothing after it to step over.
+    function focusNewRow(key) {
+        const root = document.getElementById(key);
+        const row = root && root.lastElementChild;
+        const field = row && row.querySelector("input, select");
+        if (field) field.focus({preventScroll: false});
     }
     // Only one section is visible at a time, but every section's inputs stay in
     // the form. reportValidity() therefore fails on a control the browser cannot
     // scroll to or focus, returns false, and the submit aborts with no feedback
     // at all - which is why the save button appeared to do nothing. Reveal the
     // offending section first, then report.
+    function clearRailErrors() {
+        for (const button of document.querySelectorAll(".settings-nav button")) {
+            button.classList.remove("has-error");
+        }
+    }
     function revealFirstInvalidControl() {
+        clearRailErrors();
         const invalid = form.querySelector(":invalid");
         if (!invalid) return true;
         const section = sectionOf(invalid);
-        if (section) showSection(section);
+        if (section) {
+            showSection(section);
+            // Only one section is on screen at a time, so without this the rail
+            // is the only place that could say which of the six is holding the
+            // save up, and it said nothing.
+            const button = railButton(section);
+            if (button) button.classList.add("has-error");
+        }
         form.reportValidity();
         invalid.focus({preventScroll: false});
         const label = invalid.closest("label");
-        const fieldName = (label ? label.textContent.trim() : invalid.name) || "A field";
+        // Every settings field wraps its input and its <small> hint in one
+        // <label>, so label.textContent swept the hint up with the name and the
+        // page's only validation message read "Fallback distribution %Applied
+        // where no group matches needs a valid value...". Direct text nodes are
+        // the label proper; the hint lives inside the <small>.
+        const labelText = label
+            ? Array.from(label.childNodes)
+                .filter((node) => node.nodeType === Node.TEXT_NODE)
+                .map((node) => node.textContent)
+                .join("")
+                .trim()
+            : "";
+        const fieldName = labelText
+            || invalid.getAttribute("aria-label")
+            || invalid.name
+            || "A field";
         showError(new Error(
             `${fieldName} needs a valid value before these settings can be saved.`
         ));
@@ -1686,6 +1904,13 @@
         errorPanel.hidden = true;
         if (!revealFirstInvalidControl()) return;
         setBusy(true);
+        // The savebar is sticky at the bottom of the viewport; #settingsStatus
+        // is at the top of the page. Confirming a save only up there meant the
+        // confirmation appeared off-screen, next to nothing the user was
+        // looking at. The button says what is happening, and the dirty-state
+        // label beside it says how it ended.
+        const saveLabel = save.textContent;
+        save.textContent = "Saving…";
         try {
             const payload = await LosApi.fetchJson(
                 `${API}/${encodeURIComponent(hotel.value)}`,
@@ -1701,12 +1926,17 @@
             loadedEnterpriseId = model.enterpriseId;
             render();
             setDirty(false);
+            dirtyState.textContent = "Saved";
+            dirtyState.classList.add("is-saved");
             status.textContent = `Saved ${model.hotelName}`;
         }
-        catch (error) { showError(error, "Saving property settings"); }
-        finally { setBusy(false); }
+        catch (error) { showError(error, "Saving these settings"); }
+        finally { setBusy(false); save.textContent = saveLabel; }
     }
-    function setDirty(value){dirty=value;dirtyState.textContent=value?"Unsaved changes":"No unsaved changes";dirtyState.classList.toggle("is-dirty",value)}
+    // "Saved" survives until the next edit, which is what setDirty(true) does
+    // on the very next keystroke - so the confirmation is not on a timer and
+    // cannot outlive the state it describes.
+    function setDirty(value){dirty=value;dirtyState.textContent=value?"Unsaved changes":"No unsaved changes";dirtyState.classList.toggle("is-dirty",value);dirtyState.classList.remove("is-saved")}
     function setBusy(value){save.disabled=value;hotel.disabled=value;document.querySelector(".settings-workspace").setAttribute("aria-busy",String(value))}
     function showError(error, context) {
         const detail = (error && error.message) || String(error) || "Unknown error.";
@@ -1721,9 +1951,10 @@
         // editor, so the actual message was routinely missed and only the status
         // line was seen.
         errorPanel.scrollIntoView({block: "nearest", behavior: "smooth"});
-        status.textContent = context
-            ? `${context} failed - see the message above.`
-            : "Something went wrong - see the message above.";
+        // No "see the message above": the panel carries role="alert" and sits
+        // directly under this line, so pointing at it says nothing the reader
+        // cannot already see.
+        status.textContent = context ? `${context} failed.` : "Something went wrong.";
         console.error(context || "Cost Input error", error);
     }
     const IMPORT_POLL_INTERVAL_MS = 2000;
@@ -1736,7 +1967,7 @@
             const job = payload.job || {};
             if (job.status === "succeeded") return job;
             if (job.status === "failed") throw new Error(job.error || "Import failed.");
-            status.textContent = `Cost data import ${job.status || "queued"}${job.attemptCount ? ` (attempt ${job.attemptCount})` : ""}...`;
+            status.textContent = `Cost data import ${job.status || "queued"}${job.attemptCount ? ` (attempt ${job.attemptCount})` : ""}…`;
             await delay(IMPORT_POLL_INTERVAL_MS);
         }
         throw new Error("The import is still running. Reload this page to check its status.");
@@ -1745,14 +1976,19 @@
     // cross-database import, and the Function App is reachable on its own public
     // hostname, so it cannot be left open. Static Web Apps does not attach the
     // key for us, so the operator supplies it once per browser session.
+    //
+    // The key itself is in the Azure portal under los-functions > App Keys.
+    // That belongs here rather than in the prompt: the person clicking this is a
+    // revenue manager who has been given a key, not someone with portal access,
+    // and a dialog naming a resource they cannot open only makes them stop.
     const IMPORT_KEY_STORAGE = "costdata-import-key";
     function importKey() {
         let key = "";
         try { key = sessionStorage.getItem(IMPORT_KEY_STORAGE) || ""; } catch { key = ""; }
         if (!key) {
             key = (prompt(
-                "Enter the Function App key for the cost data import.\n\n"
-                + "Azure portal > los-functions > App Keys. Stored for this browser session only."
+                "Enter the import key.\n\n"
+                + "Ask IT if you do not have it. It is kept for this browser session only."
             ) || "").trim();
             if (!key) return "";
             try { sessionStorage.setItem(IMPORT_KEY_STORAGE, key); } catch { /* session-only */ }
@@ -1763,12 +1999,23 @@
         try { sessionStorage.removeItem(IMPORT_KEY_STORAGE); } catch { /* nothing cached */ }
     }
     async function runImport(){
-        if(!confirm("Import all cost datasets now? This can take a while.")) return;
+        if(!confirm("Import all cost datasets for every hotel now? This can take up to 35 minutes.")) return;
         const key = importKey();
-        if (!key) { status.textContent = "Import cancelled - no Function App key supplied."; return; }
+        if (!key) { status.textContent = "Import cancelled — no key was entered."; return; }
         importButton.disabled=true; errorPanel.hidden=true;
+        const importLabel = importButton.textContent;
+        const startedAt = Date.now();
+        // The only sign an import was running was a greyed-out button still
+        // reading "Run import", and one line of status text that scrolls off the
+        // moment a section is opened. For a job that can run 35 minutes, the
+        // button itself has to be the progress surface.
+        const elapsed = setInterval(() => {
+            const seconds = Math.floor((Date.now() - startedAt) / 1000);
+            importButton.textContent =
+                `Importing… ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+        }, 1000);
         try {
-            status.textContent = "Queueing cost data import...";
+            status.textContent = "Queueing cost data import…";
             let accepted;
             try {
                 accepted = await LosApi.fetchJson("/api/costdata/import", {
@@ -1782,17 +2029,33 @@
                 // fails without ever asking again.
                 if (/\b401\b|\b403\b/.test(error.message || "")) {
                     forgetImportKey();
-                    throw new Error("The Function App key was rejected. Click the button again to re-enter it.");
+                    throw new Error("That key was not accepted. Click the button again to enter it.");
                 }
                 throw error;
             }
             const job = await waitForImport(accepted.statusUrl);
             const count = job.result?.results?.length || 0;
+            // Reloading pulls the server's copy over the form, and the form is
+            // where the operator may have half an hour of unsaved work. It used
+            // to do exactly that, silently, and then report "No unsaved
+            // changes" - losing the edits and lying about it. The property
+            // picker has guarded this since it was written; this path was
+            // simply missed.
+            if (dirty) {
+                status.textContent =
+                    `Import complete (${count} datasets). Your unsaved changes are still here — `
+                    + "save them, then reload the page to see the new data.";
+                return;
+            }
             status.textContent = `Import complete (${count} datasets, ${job.result?.durationSeconds ?? "?"} seconds).`;
-            await loadHotels();
+            await loadHotels({forceRefresh: true});
         }
         catch (error) { showError(error, "Cost data import"); }
-        finally { importButton.disabled=false; }
+        finally {
+            clearInterval(elapsed);
+            importButton.disabled = false;
+            importButton.textContent = importLabel;
+        }
     }
     importButton.onclick=runImport;
     document.querySelectorAll(".settings-nav button").forEach(button => {

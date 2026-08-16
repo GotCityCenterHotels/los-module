@@ -474,9 +474,14 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
 )
 def cost_settings_hotels(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        # The property list changes once a day, when CostDataTimer runs, yet it
+        # was the only cost route declaring itself uncacheable - its siblings
+        # already send max-age 300 (sources) and 120 (rates, agencies). An
+        # operator who has just imported a new hotel still sees it immediately:
+        # the Cost Input page requests this with cache "reload" after an import.
         return json_response(
             {"data": list_cost_settings_hotels()},
-            headers={"Cache-Control": "no-store"},
+            headers={"Cache-Control": "private, max-age=300"},
         )
     except CostSettingsSchemaError as error:
         return json_response({"error": str(error)}, 503)
@@ -604,8 +609,13 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
     try:
         if req.method == "GET":
             hotel_name = (req.params.get("hotelName") or "").strip() or None
-            return json_response(
-                {"data": fetch_cost_settings(enterprise_id, hotel_name)}
+            # The rulebook is the largest payload on the Cost Input critical
+            # path and was the only one of the six cost routes still sending it
+            # uncompressed. It is key-per-object JSON with one repeated key set
+            # per rule row, which is the shape that compresses roughly 10:1.
+            return compressed_json_response(
+                req,
+                {"data": fetch_cost_settings(enterprise_id, hotel_name)},
             )
         try:
             payload = req.get_json()

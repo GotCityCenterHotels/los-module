@@ -596,6 +596,55 @@ def _resolve_cost_settings_hotel(enterprise_id, fallback_hotel_name=None):
         }
 
 
+# The seven statements behind one property's rulebook. They are constants
+# rather than literals inside _read_cost_settings so the pipeline and sequential
+# paths below are provably running the same SQL, and so this file's other reader
+# (fetch_all_cost_settings, which asks the same questions without a WHERE) sits
+# beside them for comparison rather than sharing a parameterised builder.
+_PROFILE_SETTINGS_SQL = """
+    SELECT settings.*, hotel.hotel_name
+    FROM functions.cost_property_settings settings
+    JOIN functions.hotels hotel USING (enterprise_id)
+    WHERE settings.enterprise_id = %s
+"""
+
+_DISTRIBUTION_GROUPS_SQL = """
+    SELECT g.distribution_group_id, g.group_name, g.cost_percent,
+        coalesce(json_agg(json_build_object('matchType', r.match_type, 'matchValue', r.match_value)
+            ORDER BY r.distribution_rule_id) FILTER (WHERE r.distribution_rule_id IS NOT NULL), '[]') AS rules
+    FROM functions.cost_distribution_groups g
+    LEFT JOIN functions.cost_distribution_rules r USING (distribution_group_id)
+    WHERE g.enterprise_id = %s GROUP BY g.distribution_group_id ORDER BY g.sort_order, g.distribution_group_id
+"""
+
+# Order is load-bearing on the sequential path: the fakes the tests stand in for
+# a cursor hand back result sets positionally, so a query inserted in the middle
+# silently gives one table's rows to another collection with no error.
+_SETTINGS_COLLECTION_QUERIES = {
+    # sort_order holds the Mews category ordering captured when the rows were
+    # saved. Ordering by category_name here would undo it on every reload.
+    "cleaningCategories": (
+        CLEANING_CATEGORIES_SQL
+        + " WHERE c.enterprise_id = %s ORDER BY c.sort_order, c.category_name,"
+        " c.occupancy, c.cleaning_category_id"
+    ),
+    "bedTypes": (
+        "SELECT bed_name, linen_cost FROM functions.cost_bed_types"
+        " WHERE enterprise_id = %s ORDER BY sort_order, bed_name"
+    ),
+    "arrivalTiers": (
+        "SELECT min_arrivals, max_arrivals, reception_hours"
+        " FROM functions.cost_arrival_staffing_tiers"
+        " WHERE enterprise_id = %s ORDER BY sort_order, arrival_tier_id"
+    ),
+    "breakfastTiers": (
+        "SELECT min_guests, max_guests, staff_hours"
+        " FROM functions.cost_breakfast_staffing_tiers"
+        " WHERE enterprise_id = %s ORDER BY sort_order, breakfast_tier_id"
+    ),
+}
+
+
 def _read_cost_settings(connection, enterprise_id):
     """Every result set one property's rulebook needs, in one pass.
 
