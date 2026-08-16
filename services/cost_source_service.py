@@ -36,6 +36,12 @@ class CostSourceUnavailableError(RuntimeError):
     pass
 
 
+# Resolved column sets, per worker. Given a TTL rather than kept for the life
+# of the process because the source schema is not frozen: a column added to
+# reservation_current today would otherwise stay invisible to an already-warm
+# worker until it happened to recycle, and the feature depending on it would
+# look broken with nothing in the logs to explain why.
+COLUMN_CACHE_TTL_SECONDS = int(os.environ.get("COST_SOURCE_SCHEMA_TTL_SECONDS", "900"))
 _column_cache = {}
 _column_lock = Lock()
 
@@ -69,14 +75,24 @@ RESERVATION_COMPANY_COLUMNS = ("company_id", "corporate_company_id", "account_id
 # occur under these filters" rather than "which rates exist".
 RESERVATION_RATE_COLUMNS = ("rate_id", "reservation_rate_id", "current_rate_id")
 
-# The table the travel-agency foreign key points at, in order of likelihood.
+# The travel agency table. staging.travel_agency is the real one in
+# integration_db and is listed first; it lives outside the search path, so the
+# schema is part of the name and every lookup keeps it qualified. The rest stay
+# as fallbacks for a mirror that landed the data somewhere else - Mews itself
+# has no travel-agency entity, so a deployment that never got this ETL step
+# would have it as a Company.
 AGENCY_TABLES = (
-    "company_current", "companies_current", "travel_agency_current",
-    "agency_current", "account_current", "customer_current",
+    "staging.travel_agency", "travel_agency", "travel_agency_current",
+    "company_current", "companies_current", "agency_current",
+    "account_current", "customer_current",
 )
 AGENCY_NAME_COLUMNS = (
-    "name", "company_name", "legal_name", "display_name", "names", "short_name",
+    "name", "travel_agency_name", "agency_name", "company_name", "legal_name",
+    "display_name", "names", "short_name", "title",
 )
+# The agency's own key, whatever the ETL called it.
+AGENCY_ID_COLUMNS = ("id", "travel_agency_id", "agency_id", "company_id")
+
 
 # A reservation that has not been seen in two years is not a live picker
 # option, and an unbounded scan of reservation_current was what made the Cost
@@ -94,31 +110,60 @@ _source_cache = {}
 _source_cache_lock = Lock()
 
 
+def _split_table(table_name):
+    """("schema", "table") for a qualified name, (None, "table") otherwise."""
+    schema, _, bare = str(table_name).rpartition(".")
+    return (schema or None), bare
+
+
+def table_identifier(table_name):
+    """A composable identifier that keeps an explicit schema qualified."""
+    schema, bare = _split_table(table_name)
+    return Identifier(schema, bare) if schema else Identifier(bare)
+
+
 def _table_columns(cursor, table_name):
     """Column names present on a source table, cached per process.
 
-    The probe is restricted to the schemas the session actually resolves. An
-    unqualified table_name matched every schema, so a same-named table in
-    staging could union its columns into this set and _resolve_column would
-    then "resolve" a column that does not exist on the table being queried -
-    exactly the UndefinedColumn this module exists to prevent.
+    An unqualified name is looked up only in the schemas the session actually
+    resolves: matching every schema meant a same-named table in staging could
+    union its columns into this set, and _resolve_column would then "resolve" a
+    column that does not exist on the table being queried - exactly the
+    UndefinedColumn this module exists to prevent.
+
+    A name written "schema.table" is looked up in that schema and nowhere else,
+    which is how tables outside the search path are reached at all.
     """
-    if table_name in _column_cache:
-        return _column_cache[table_name]
+    now = monotonic()
+    cached = _column_cache.get(table_name)
+    if cached and cached[0] > now:
+        return cached[1]
     with _column_lock:
-        if table_name in _column_cache:
-            return _column_cache[table_name]
-        cursor.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = %s
-              AND table_schema = ANY(current_schemas(false))
-            """,
-            (table_name,),
-        )
+        cached = _column_cache.get(table_name)
+        if cached and cached[0] > now:
+            return cached[1]
+        schema, bare = _split_table(table_name)
+        if schema:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = %s AND table_schema = %s
+                """,
+                (bare, schema),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = %s
+                  AND table_schema = ANY(current_schemas(false))
+                """,
+                (bare,),
+            )
         columns = {row["column_name"] for row in cursor.fetchall()}
-        _column_cache[table_name] = columns
+        _column_cache[table_name] = (now + COLUMN_CACHE_TTL_SECONDS, columns)
         return columns
 
 
@@ -460,8 +505,37 @@ def list_origins(enterprise_id, cursor=None):
         ]
 
 
+class _AgencyJoin:
+    """How to reach the travel agency's name from a reservation.
+
+    Every part is resolved from information_schema, because none of it is
+    knowable from this repository: the reservation's foreign key, the table it
+    points at, that table's own key, and the column holding the name. Falsy
+    when any part is missing, so callers can degrade in one check.
+    """
+
+    __slots__ = ("fk", "table", "key", "name")
+
+    def __init__(self, fk=None, table=None, key=None, name=None):
+        self.fk = fk
+        self.table = table
+        self.key = key
+        self.name = name
+
+    def __bool__(self):
+        return bool(self.fk and self.table and self.key and self.name)
+
+
 def _agency_join(source):
-    """(reservation FK column, agency table, agency name column) or Nones."""
+    """reservation_current.travel_agency_id -> staging.travel_agency.
+
+    The shape is confirmed against integration_db. What stays resolved at
+    runtime is the naming: which column on the reservation holds the key, and
+    which columns on the agency table are its key and its name. That is the
+    same treatment every other source column in this module gets, and it is
+    what keeps a renamed column producing a message naming the candidates
+    tried rather than a bare UndefinedColumn.
+    """
     agency_fk = _resolve_column(
         source,
         "reservation_current",
@@ -469,16 +543,18 @@ def _agency_join(source):
         required=False,
     )
     if agency_fk is None:
-        return None, None, None
+        return _AgencyJoin()
     agency_table = _resolve_table(source, AGENCY_TABLES)
     if agency_table is None:
-        return agency_fk, None, None
-    agency_name = _resolve_column(
-        source, agency_table, AGENCY_NAME_COLUMNS, required=False
+        return _AgencyJoin(fk=agency_fk)
+    return _AgencyJoin(
+        fk=agency_fk,
+        table=agency_table,
+        # staging.travel_agency is an ETL landing table, not a Mews *_current
+        # mirror, so its key is resolved rather than assumed to be "id".
+        key=_resolve_column(source, agency_table, AGENCY_ID_COLUMNS, required=False),
+        name=_resolve_column(source, agency_table, AGENCY_NAME_COLUMNS, required=False),
     )
-    if agency_name is None:
-        return agency_fk, agency_table, None
-    return agency_fk, agency_table, agency_name
 
 
 def list_travel_agencies(enterprise_id, search="", origins=None, cursor=None):
@@ -491,12 +567,12 @@ def list_travel_agencies(enterprise_id, search="", origins=None, cursor=None):
     subgroup filter degrades to a typed value that is matched at cost time.
     """
     with _Session(cursor) as source:
-        agency_fk, agency_table, agency_name = _agency_join(source)
-        if not (agency_fk and agency_table and agency_name):
+        join = _agency_join(source)
+        if not join:
             logging.info(
                 "No travel-agency link on reservation_current "
-                "(fk=%s table=%s name=%s); agency filters stay free text",
-                agency_fk, agency_table, agency_name,
+                "(fk=%s table=%s key=%s name=%s); agency filters stay free text",
+                join.fk, join.table, join.key, join.name,
             )
             return []
 
@@ -507,7 +583,7 @@ def list_travel_agencies(enterprise_id, search="", origins=None, cursor=None):
             SELECT trim(agency.{agency_name})::text AS agency_name,
                    count(*)::bigint AS reservation_count
             {scope}
-              AND reservation.{agency_fk} IS NOT NULL
+              {agency_present}
               {origin_predicate}
               AND nullif(trim(agency.{agency_name}), '') IS NOT NULL
               AND (
@@ -518,9 +594,11 @@ def list_travel_agencies(enterprise_id, search="", origins=None, cursor=None):
             ORDER BY reservation_count DESC, agency_name
             LIMIT {limit}
         """).format(
-            agency_name=Identifier(agency_name),
-            agency_fk=Identifier(agency_fk),
-            scope=_scope_with_agency(agency_table, agency_fk),
+            agency_name=Identifier(join.name),
+            agency_present=SQL("AND reservation.{} IS NOT NULL").format(
+                Identifier(join.fk)
+            ),
+            scope=_scope_with_agency(join),
             origin_predicate=_origin_predicate(origin_column),
             limit=Literal(PICKER_LIMIT),
         )
@@ -540,15 +618,16 @@ def list_travel_agencies(enterprise_id, search="", origins=None, cursor=None):
         ]
 
 
-def _scope_with_agency(agency_table, agency_fk):
-    """The stay scope with the company table joined in for the name search."""
+def _scope_with_agency(join):
+    """The stay scope with the travel agency table joined in for the search."""
     return SQL(
         "{head} JOIN {agency_table} agency "
-        "ON agency.id = reservation.{agency_fk} {tail}"
+        "ON agency.{agency_key} = reservation.{agency_fk} {tail}"
     ).format(
         head=_STAY_SCOPE_HEAD,
-        agency_table=Identifier(agency_table),
-        agency_fk=Identifier(agency_fk),
+        agency_table=table_identifier(join.table),
+        agency_key=Identifier(join.key),
+        agency_fk=Identifier(join.fk),
         tail=_STAY_SCOPE_TAIL,
     )
 
@@ -594,15 +673,15 @@ def list_matching_rates(enterprise_id, origins=None, agencySearch="", cursor=Non
         origin_column = _resolve_column(
             source, "reservation_current", RESERVATION_ORIGIN_COLUMNS, required=False
         )
-        agency_fk, agency_table, agency_name = _agency_join(source)
+        join = _agency_join(source)
         wants_agency = bool(str(agencySearch or "").strip())
-        agency_available = bool(agency_fk and agency_table and agency_name)
+        agency_available = bool(join)
 
         if wants_agency and agency_available:
-            scope = _scope_with_agency(agency_table, agency_fk)
+            scope = _scope_with_agency(join)
             agency_predicate = SQL(
                 "AND agency.{} ILIKE %(agency_pattern)s ESCAPE '\\'"
-            ).format(Identifier(agency_name))
+            ).format(Identifier(join.name))
         else:
             scope = _STAY_SCOPE
             agency_predicate = SQL("")
@@ -670,7 +749,7 @@ def _fetch_cost_sources_uncached(enterprise_id):
         rate_fk = _resolve_column(
             source, "reservation_current", RESERVATION_RATE_COLUMNS, required=False
         )
-        agency_fk, agency_table, agency_name = _agency_join(source)
+        agency_join = _agency_join(source)
     return {
         "rates": rates,
         # A "channel" was only ever the reservation origin under another name -
@@ -687,7 +766,7 @@ def _fetch_cost_sources_uncached(enterprise_id):
         # than offering a search box that silently matches nothing.
         "capabilities": {
             "origin": origin_column is not None,
-            "travelAgency": bool(agency_fk and agency_table and agency_name),
+            "travelAgency": bool(agency_join),
             "rateFromReservations": rate_fk is not None,
         },
     }

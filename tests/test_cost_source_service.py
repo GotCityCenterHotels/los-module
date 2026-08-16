@@ -35,7 +35,11 @@ class FakeCursor:
         text = query.as_string(None) if hasattr(query, "as_string") else str(query)
         self.executed.append(text)
         if "information_schema.columns" in text:
+            # A qualified lookup passes (table, schema) and must only see that
+            # schema's table; an unqualified one passes (table,).
             table = parameters[0]
+            if len(parameters) > 1:
+                table = f"{parameters[1]}.{table}"
             self._result = [
                 {"column_name": name}
                 for name in self.columns_by_table.get(table, set())
@@ -414,6 +418,145 @@ class SourceCacheTests(unittest.TestCase):
         self.assertTrue(first["capabilities"]["origin"])
         self.assertTrue(first["capabilities"]["rateFromReservations"])
         self.assertFalse(first["capabilities"]["travelAgency"])
+
+
+class TravelAgencyTests(unittest.TestCase):
+    """staging.travel_agency is the real source, and it is not on the search
+    path - so the schema is part of the name everywhere it is used."""
+
+    COLUMNS = {
+        "reservation_current": {"id", "service_id", "origin", "travel_agency_id"},
+        "staging.travel_agency": {"id", "name"},
+    }
+
+    def setUp(self):
+        cost_source_service._reset_column_cache()
+
+    def _run(self, call, columns, rows):
+        cursor = FakeCursor(columns, rows)
+        with patch.object(
+            cost_source_service, "get_export_connection",
+            return_value=FakeConnection(cursor)
+        ):
+            return call(), cursor
+
+    def test_the_agency_search_joins_the_staging_table_schema_qualified(self):
+        agencies, cursor = self._run(
+            lambda: cost_source_service.list_travel_agencies("hotel-1", search="exp"),
+            self.COLUMNS,
+            [{"agency_name": "Expedia", "reservation_count": 812}],
+        )
+
+        self.assertEqual(agencies, [
+            {"id": "Expedia", "name": "Expedia", "reservationCount": 812}
+        ])
+        query = " ".join(cursor.executed[-1].split())
+        # Unqualified, this resolves to whatever the search path finds - which
+        # for this table is nothing at all.
+        self.assertIn('JOIN "staging"."travel_agency" agency', query)
+        self.assertIn('ON agency."id" = reservation."travel_agency_id"', query)
+        self.assertIn("ILIKE %(agency_pattern)s", query)
+
+    def test_an_unqualified_probe_never_sees_the_staging_table(self):
+        # The guard that keeps a same-named table in another schema from
+        # unioning its columns in has to keep working now that a qualified
+        # lookup exists.
+        cursor = FakeCursor(self.COLUMNS, [])
+        self.assertEqual(
+            cost_source_service._table_columns(cursor, "travel_agency"), set()
+        )
+        self.assertEqual(
+            cost_source_service._table_columns(cursor, "staging.travel_agency"),
+            {"id", "name"},
+        )
+
+    def test_matching_rates_narrow_by_agency_through_the_same_join(self):
+        columns = dict(self.COLUMNS)
+        columns["reservation_current"] = columns["reservation_current"] | {"rate_id"}
+        columns["rate_current"] = {"id", "service_id", "rate_name"}
+        payload, cursor = self._run(
+            lambda: cost_source_service.list_matching_rates(
+                "hotel-1", origins=["ChannelManager"], agencySearch="expedia"
+            ),
+            columns,
+            [{"rate_id": "r1", "rate_name": "BAR", "reservation_count": 12}],
+        )
+
+        self.assertTrue(payload["agencyFilterApplied"])
+        self.assertTrue(payload["originFilterApplied"])
+        query = " ".join(cursor.executed[-1].split())
+        self.assertIn('JOIN "staging"."travel_agency" agency', query)
+
+    def test_the_capability_flag_reports_the_agency_search_as_available(self):
+        columns = dict(self.COLUMNS)
+        columns["rate_current"] = {"id", "service_id", "rate_name"}
+        columns["resource_category_current"] = {
+            "id", "enterprise_id", "space_name", "capacity", "type", "is_active",
+        }
+        payload, _ = self._run(
+            lambda: cost_source_service.fetch_cost_sources("hotel-1"), columns, []
+        )
+
+        self.assertTrue(payload["capabilities"]["travelAgency"])
+
+    def test_a_column_added_to_the_source_is_picked_up_without_a_restart(self):
+        # travel_agency_id was added to reservation_current after this code was
+        # already running. Caching the column set for the life of the worker
+        # meant an instance that had probed before the change kept reporting
+        # the agency filter unavailable until it happened to recycle.
+        columns = {"reservation_current": {"id", "service_id"}}
+        cursor = FakeCursor(columns, [])
+        with patch.object(
+            cost_source_service, "get_export_connection",
+            return_value=FakeConnection(cursor)
+        ):
+            self.assertIsNone(cost_source_service._resolve_column(
+                cursor, "reservation_current",
+                cost_source_service.RESERVATION_TRAVEL_AGENCY_COLUMNS,
+                required=False,
+            ))
+
+            columns["reservation_current"] = {"id", "service_id", "travel_agency_id"}
+            # Still cached, so still invisible.
+            self.assertIsNone(cost_source_service._resolve_column(
+                cursor, "reservation_current",
+                cost_source_service.RESERVATION_TRAVEL_AGENCY_COLUMNS,
+                required=False,
+            ))
+
+            with patch.object(
+                cost_source_service, "COLUMN_CACHE_TTL_SECONDS", -1
+            ):
+                cost_source_service._column_cache.clear()
+                self.assertEqual(
+                    cost_source_service._resolve_column(
+                        cursor, "reservation_current",
+                        cost_source_service.RESERVATION_TRAVEL_AGENCY_COLUMNS,
+                        required=False,
+                    ),
+                    "travel_agency_id",
+                )
+
+    def test_a_table_present_but_unreachable_degrades(self):
+        # Present but with no key to join on is reported as unavailable, not
+        # silently treated as "no agencies match".
+        agencies, _ = self._run(
+            lambda: cost_source_service.list_travel_agencies("hotel-1", search="exp"),
+            {
+                "reservation_current": {"id", "service_id", "travel_agency_id"},
+                "staging.travel_agency": {"name"},
+            },
+            [],
+        )
+        self.assertEqual(agencies, [])
+
+    def test_a_deployment_without_the_staging_table_still_degrades(self):
+        agencies, _ = self._run(
+            lambda: cost_source_service.list_travel_agencies("hotel-1", search="exp"),
+            {"reservation_current": {"id", "service_id", "travel_agency_id"}},
+            [],
+        )
+        self.assertEqual(agencies, [])
 
 
 if __name__ == "__main__":

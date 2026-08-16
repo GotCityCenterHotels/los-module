@@ -64,14 +64,34 @@ FROM information_schema.columns
 WHERE column_name ~* 'agency|agent|company|corporate|account|booker|iata|rate'
 ORDER BY table_schema, table_name, column_name;
 
--- 8. Which table the travel agency foreign key points at. Mews has no
---    travel-agency entity: Reservation.TravelAgencyId is a Company id, so the
---    searchable name lives on the company table. No code in this repository
---    has ever read it, and the read-only role may not even be granted it.
+-- 8. The travel agency table. This one is ANSWERED: it is staging.travel_agency.
+--    Note the schema - it is outside the search path, so every reference to it
+--    has to be qualified, and an unqualified information_schema probe will not
+--    find it at all.
+--
+--    What is still resolved at runtime is its shape, because the application
+--    supports two and picks whichever the mirror actually has:
+--      * a dimension keyed by its own id, with reservation_current holding the
+--        foreign key (how Mews models it: Reservation.TravelAgencyId); or
+--      * a reservation-scoped landing table, one row per reservation, joined
+--        on reservation_id / reservation_number.
+--    Run this to see which, and confirm the column holding the name.
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'staging' AND table_name = 'travel_agency'
+ORDER BY ordinal_position;
+
+-- 8b. Anything else agency-shaped, in case a second copy exists elsewhere.
 SELECT table_schema, table_name
 FROM information_schema.tables
 WHERE table_name ~* '^(company|companies|travel_agency|agency|account|customer)(_current|_history)?$'
 ORDER BY table_schema, table_name;
+
+-- 8c. Is the read-only role actually granted the staging schema? Without this
+--     the table resolves to "not found" and the agency filter degrades to free
+--     text with nothing obviously wrong.
+SELECT has_schema_privilege(current_user, 'staging', 'USAGE') AS can_use_schema,
+       has_table_privilege(current_user, 'staging.travel_agency', 'SELECT') AS can_select;
 
 -- 9. Distinct origin values and their cardinality, so the picker can be
 --    checked against reality (enum string vs numeric code). Replace the
