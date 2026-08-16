@@ -38,3 +38,64 @@ ORDER BY table_name;
 -- SELECT r.*
 -- FROM rate_current r
 -- LIMIT 20;
+
+-- ---------------------------------------------------------------------------
+-- The distribution tree (origin -> travel agency -> rate) needs three more
+-- answers. Query 3's regex above does NOT cover them: "travel_agent" does not
+-- match "travel_agency", and nothing there looks for a rate on the reservation.
+--
+-- Until these are answered, services/cost_source_service.py resolves each
+-- column against a candidate list and reports what it could not honour in the
+-- "capabilities" block of /api/costdata/sources. The editor stays usable
+-- either way - it falls back to typed values - but the pickers stay empty.
+-- ---------------------------------------------------------------------------
+
+-- 6. Every column on reservation_current, verbatim. Nothing else settles which
+--    of origin / travel_agency_id / rate_id the ETL actually flattened, or
+--    whether the ids are uuid or text.
+SELECT table_schema, column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_name = 'reservation_current'
+ORDER BY table_schema, ordinal_position;
+
+-- 7. Agency, company and rate linkage anywhere in the mirror.
+SELECT table_schema, table_name, column_name, data_type
+FROM information_schema.columns
+WHERE column_name ~* 'agency|agent|company|corporate|account|booker|iata|rate'
+ORDER BY table_schema, table_name, column_name;
+
+-- 8. Which table the travel agency foreign key points at. Mews has no
+--    travel-agency entity: Reservation.TravelAgencyId is a Company id, so the
+--    searchable name lives on the company table. No code in this repository
+--    has ever read it, and the read-only role may not even be granted it.
+SELECT table_schema, table_name
+FROM information_schema.tables
+WHERE table_name ~* '^(company|companies|travel_agency|agency|account|customer)(_current|_history)?$'
+ORDER BY table_schema, table_name;
+
+-- 9. Distinct origin values and their cardinality, so the picker can be
+--    checked against reality (enum string vs numeric code). Replace the
+--    column if query 6 says otherwise.
+-- SELECT origin, count(*)
+-- FROM reservation_current
+-- WHERE start_utc >= now() - interval '2 years'
+-- GROUP BY 1 ORDER BY 2 DESC;
+
+-- 10. Indexes on the driving tables. This decides whether the origin, agency
+--     and matching-rate lookups are index scans or repeated scans of
+--     reservation_current. The lookups are bounded to a two-year window
+--     (COST_SOURCE_WINDOW_DAYS), but the window only helps if start_utc is
+--     indexed alongside the service key.
+SELECT schemaname, tablename, indexname, indexdef
+FROM pg_indexes
+WHERE tablename IN (
+    'reservation_current', 'service_current', 'rate_current', 'company_current'
+)
+ORDER BY tablename, indexname;
+
+-- 11. Is pg_trgm available? The agency search is ILIKE '%term%', which cannot
+--     use a btree index. It is only worth a trigram index if the company table
+--     turns out to be large.
+SELECT name, installed_version
+FROM pg_available_extensions
+WHERE name = 'pg_trgm';

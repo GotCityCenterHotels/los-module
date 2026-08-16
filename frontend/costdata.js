@@ -71,9 +71,12 @@
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
         gop: document.getElementById("gopStatement"),
+        gopTable: document.getElementById("gopTableView"),
         gopRows: document.getElementById("gopRows"),
         gopFlags: document.getElementById("gopFlags"),
         gopScope: document.getElementById("gopScopeNote"),
+        gopChart: document.getElementById("gopChartView"),
+        gopChartCanvas: document.getElementById("gopChart"),
         results: document.getElementById("costResults"),
         error: document.getElementById("costError"),
         title: document.getElementById("costTableTitle"),
@@ -84,6 +87,16 @@
         latestUpdate: document.getElementById("latestUpdate")
     };
 
+    // Colours are declared here rather than only in CSS because the SVG legend
+    // swatches and the tooltip dots are built in JS and must not drift from the
+    // marks they describe.
+    const CHART_COLOURS = Object.freeze({
+        base: "#475467",
+        profit: "#067647",
+        loss: "#b42318",
+        revenue: "#7c3aed"
+    });
+
     const integerFormatter = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 0 });
     const dateTimeFormatter = new Intl.DateTimeFormat("en-SE", {
         year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
@@ -92,6 +105,7 @@
     let loadedData = null;
     let loadedSettings = {};
     let activeDataset = "roomRevenue";
+    let gopView = "statement";
 
     function localIsoDate(date) {
         const offset = date.getTimezoneOffset() * 60000;
@@ -193,10 +207,15 @@
     // A cost is money out; showing it as a bare positive number next to revenue
     // makes the statement impossible to read down the column. A correction
     // period can produce a negative cost, which is a credit and reads as one.
+    //
+    // Zero gets no sign at all. "−0" is not a smaller number than 0, it is a
+    // rounding artefact, and a column of them reads as a column of tiny debits.
     function signedCost(amount) {
-        return amount < 0
-            ? `+${LosFormat.formatSek(-amount)}`
-            : `−${LosFormat.formatSek(amount)}`;
+        const rounded = LosFormat.roundSek(amount) || 0;
+        if (rounded === 0) return LosFormat.formatSek(0);
+        return rounded < 0
+            ? `+${LosFormat.formatSek(-rounded)}`
+            : `−${LosFormat.formatSek(rounded)}`;
     }
 
     // The GOP statement is net of VAT throughout: every figure is a net revenue
@@ -204,7 +223,8 @@
     function renderGop() {
         const statement = CostData.calculateGop(loadedData, {
             hotelName: elements.hotel.value,
-            settingsByHotel: loadedSettings
+            settingsByHotel: loadedSettings,
+            grain: elements.grain.value
         });
 
         elements.gopScope.textContent = statement.hotels.length
@@ -234,6 +254,246 @@
             return item;
         }));
         elements.gopFlags.hidden = statement.flags.length === 0;
+
+        renderGopChart(statement);
+    }
+
+    function setGopView(view) {
+        gopView = view;
+        for (const button of document.querySelectorAll("[data-gop-view]")) {
+            button.setAttribute(
+                "aria-pressed", String(button.dataset.gopView === view)
+            );
+        }
+        elements.gopTable.hidden = view !== "statement";
+        elements.gopChart.hidden = view !== "chart";
+        elements.gop.classList.toggle("is-chart", view === "chart");
+    }
+
+    // ---------------------------------------------------------------------
+    // The period chart
+    //
+    // One bar per period. The dark grey bar is the base amount - what the
+    // period cost to run. Above it, green is profit; where revenue falls short
+    // the red band covers the uncovered part of the cost, so the grey visibly
+    // stops at the revenue line. The purple marker sits at revenue in both
+    // cases, which is what makes a row of bars scannable: anything with grey
+    // showing above the marker lost money.
+    // ---------------------------------------------------------------------
+    const SVG_NS = "http://www.w3.org/2000/svg";
+
+    function svgNode(name, attributes) {
+        const node = document.createElementNS(SVG_NS, name);
+        for (const [key, value] of Object.entries(attributes || {})) {
+            node.setAttribute(key, String(value));
+        }
+        return node;
+    }
+
+    function chartEmpty(message) {
+        elements.gopChartCanvas.replaceChildren();
+        const note = document.createElement("p");
+        note.className = "chart-empty";
+        note.textContent = message;
+        elements.gopChartCanvas.append(note);
+    }
+
+    // Zero rounds up to zero, not to one. Returning a headroom of 1 kr for an
+    // empty side put the baseline of an ordinary all-positive chart at -1 and
+    // drew a zero line one pixel above the axis on every period.
+    function niceCeiling(value) {
+        if (!(value > 0)) return 0;
+        const magnitude = 10 ** Math.floor(Math.log10(value));
+        for (const step of [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10]) {
+            if (value <= step * magnitude) return step * magnitude;
+        }
+        return 10 * magnitude;
+    }
+
+    const compactFormatter = new Intl.NumberFormat("en-SE", {
+        notation: "compact", maximumFractionDigits: 1
+    });
+
+    function renderGopChart(statement) {
+        const periods = statement.periods || [];
+        if (!periods.length) {
+            chartEmpty("No periods to chart for the selected scope.");
+            return;
+        }
+
+        const grain = elements.grain.value;
+        const width = 1100;
+        const height = 380;
+        const margin = { top: 20, right: 24, bottom: 74, left: 76 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        // A correction period can reverse more than it books, so revenue and
+        // cost are both allowed to be negative. The axis therefore has to span
+        // both sides of zero: clamping the scale at zero drew a half-million
+        // krona reversal as a few pixels of red under a tooltip reporting the
+        // real figure.
+        const values = periods.flatMap((period) => [period.revenue, period.cost]);
+        const maxValue = niceCeiling(Math.max(0, ...values));
+        const minValue = -niceCeiling(-Math.min(0, ...values));
+        const span = maxValue - minValue || 1;
+        const y = (value) =>
+            margin.top + plotHeight - ((value - minValue) / span) * plotHeight;
+        const zeroLine = y(0);
+        // Every band is "from one value to another", which keeps the geometry
+        // identical whichever side of zero the two ends fall on.
+        const verticalBand = (from, to) => ({
+            y: Math.min(y(from), y(to)),
+            height: Math.abs(y(from) - y(to))
+        });
+        // Bars keep breathing room at both ends of the band so a single period
+        // is not stretched across the whole plot.
+        const band = plotWidth / periods.length;
+        const barWidth = Math.max(4, Math.min(64, band * 0.62));
+        const centre = (index) => margin.left + band * (index + 0.5);
+
+        const svg = svgNode("svg", {
+            viewBox: `0 0 ${width} ${height}`,
+            role: "img",
+            "aria-label":
+                "Base cost, profit or loss, and revenue level for each period"
+        });
+
+        for (let tick = 0; tick <= 4; tick += 1) {
+            const value = minValue + span * tick / 4;
+            svg.append(svgNode("line", {
+                x1: margin.left, x2: width - margin.right,
+                y1: y(value), y2: y(value), class: "chart-grid-line"
+            }));
+            const label = svgNode("text", {
+                x: margin.left - 12, y: y(value) + 4,
+                class: "chart-axis-label chart-y-label"
+            });
+            label.textContent = compactFormatter.format(value);
+            svg.append(label);
+        }
+
+        // Bars grow from zero in both directions, so the zero line has to be
+        // readable as a baseline rather than as one grid line among five.
+        if (minValue < 0) {
+            svg.append(svgNode("line", {
+                x1: margin.left, x2: width - margin.right,
+                y1: zeroLine, y2: zeroLine, class: "gop-bar-zero"
+            }));
+        }
+
+        const labelStep = Math.max(1, Math.ceil(periods.length / 14));
+        periods.forEach((period, index) => {
+            const revenue = period.revenue;
+            const cost = period.cost;
+            const left = centre(index) - barWidth / 2;
+
+            // The base runs from the zero line to the cost, downwards when a
+            // correction makes the period's cost negative.
+            const base = verticalBand(0, cost);
+            svg.append(svgNode("rect", {
+                x: left, y: base.y, width: barWidth, height: base.height,
+                class: "gop-bar-base", fill: CHART_COLOURS.base
+            }));
+
+            // Profit and loss occupy the same span - cost to revenue - and
+            // differ only in which way round they sit, so only the colour
+            // changes. The loss band is drawn over the base, which is what
+            // makes the grey visibly stop at the revenue level.
+            if (revenue !== cost) {
+                const result = verticalBand(cost, revenue);
+                svg.append(svgNode("rect", {
+                    x: left, y: result.y, width: barWidth, height: result.height,
+                    class: revenue > cost ? "gop-bar-profit" : "gop-bar-loss",
+                    fill: revenue > cost ? CHART_COLOURS.profit : CHART_COLOURS.loss
+                }));
+            }
+
+            const marker = barWidth / 2 + 5;
+            svg.append(svgNode("line", {
+                x1: centre(index) - marker, x2: centre(index) + marker,
+                y1: y(revenue), y2: y(revenue),
+                class: "gop-bar-revenue", stroke: CHART_COLOURS.revenue
+            }));
+
+            if (index % labelStep !== 0 && index !== periods.length - 1) return;
+            const parts = LosFormat.periodLabelParts(period.periodKey, grain);
+            const tick = svgNode("text", {
+                x: centre(index), y: height - 38,
+                class: "chart-axis-label chart-x-label chart-period-label"
+            });
+            tick.textContent = parts.primary;
+            svg.append(tick);
+            if (parts.year) {
+                const year = svgNode("text", {
+                    x: centre(index), y: height - 20,
+                    class: "chart-axis-label chart-x-label chart-year-label"
+                });
+                year.textContent = parts.year;
+                svg.append(year);
+            }
+        });
+
+        const tooltip = document.createElement("div");
+        tooltip.className = "chart-tooltip";
+        tooltip.hidden = true;
+
+        function showPeriod(index) {
+            const period = periods[index];
+            tooltip.hidden = false;
+            tooltip.classList.toggle("align-right", centre(index) > width * 0.72);
+            tooltip.style.left = `${centre(index) / width * 100}%`;
+            tooltip.replaceChildren(
+                tooltipTitle(LosFormat.periodLabel(period.periodKey, grain)),
+                tooltipRow("Revenue", CHART_COLOURS.revenue, period.revenue),
+                tooltipRow("Base cost", CHART_COLOURS.base, period.cost),
+                tooltipRow(
+                    period.gop < 0 ? "Loss" : "Profit",
+                    period.gop < 0 ? CHART_COLOURS.loss : CHART_COLOURS.profit,
+                    period.gop
+                )
+            );
+        }
+
+        periods.forEach((period, index) => {
+            const hit = svgNode("rect", {
+                x: margin.left + band * index, y: margin.top,
+                width: band, height: plotHeight,
+                class: "chart-hit-area", tabindex: "0",
+                "aria-label":
+                    `${LosFormat.periodLabel(period.periodKey, grain)}: `
+                    + `revenue ${LosFormat.formatSek(period.revenue)}, `
+                    + `base cost ${LosFormat.formatSek(period.cost)}, `
+                    + `${period.gop < 0 ? "loss" : "profit"} `
+                    + `${LosFormat.formatSek(Math.abs(period.gop))}`
+            });
+            hit.addEventListener("mouseenter", () => showPeriod(index));
+            hit.addEventListener("focus", () => showPeriod(index));
+            hit.addEventListener("mouseleave", () => { tooltip.hidden = true; });
+            hit.addEventListener("blur", () => { tooltip.hidden = true; });
+            svg.append(hit);
+        });
+
+        elements.gopChartCanvas.replaceChildren(svg, tooltip);
+    }
+
+    function tooltipTitle(text) {
+        const title = document.createElement("strong");
+        title.className = "chart-tooltip-title";
+        title.textContent = text;
+        return title;
+    }
+
+    function tooltipRow(label, colour, amount) {
+        const row = document.createElement("div");
+        row.className = "chart-tooltip-series";
+        const name = document.createElement("span");
+        const swatch = document.createElement("i");
+        swatch.style.background = colour;
+        name.append(swatch, document.createTextNode(label));
+        const value = document.createElement("strong");
+        value.textContent = LosFormat.formatSekAmount(amount);
+        row.append(name, value);
+        return row;
     }
 
     function renderTable() {
@@ -286,7 +546,9 @@
 
     function formatCell(value, type, grain) {
         if (value === null || value === undefined || value === "") return "—";
-        if (type === "integer") return integerFormatter.format(Number(value));
+        // Adding 0 collapses -0 to 0. Intl formats -0 as "-0", which is a
+        // rounding artefact rather than a quantity and reads as an error.
+        if (type === "integer") return integerFormatter.format(Number(value) + 0);
         if (type === "decimal") return LosFormat.formatSek(value);
         if (type === "datetime") return formatDateTime(value);
         if (type === "period") return LosFormat.periodLabel(value, grain);
@@ -311,7 +573,12 @@
 
     elements.loadButton.addEventListener("click", loadData);
     elements.hotel.addEventListener("change", render);
-    elements.grain.addEventListener("change", renderTable);
+    // The grain decides the chart's buckets as well as the table's, so it can
+    // no longer redraw the table alone.
+    elements.grain.addEventListener("change", render);
+    for (const button of document.querySelectorAll("[data-gop-view]")) {
+        button.addEventListener("click", () => setGopView(button.dataset.gopView));
+    }
     for (const tab of document.querySelectorAll("[data-dataset]")) {
         tab.addEventListener("click", () => selectDataset(tab));
         tab.addEventListener("keydown", (event) => {
@@ -331,4 +598,5 @@
     }
 
     setDefaultDates();
+    setGopView(gopView);
 }());

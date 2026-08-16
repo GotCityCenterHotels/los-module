@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data</title>
-    <link rel="stylesheet" href="styles.css?v=20260815-5">
+    <link rel="stylesheet" href="styles.css?v=20260816-1">
 </head>
 <body>
     <main class="container cost-workspace">
@@ -68,15 +68,38 @@
                     <span class="section-eyebrow">NET · EXCL. VAT</span>
                     <h2 id="gopTitle">Gross Operating Profit</h2>
                 </div>
-                <span id="gopScopeNote" class="gop-scope"></span>
+                <div class="gop-heading-actions">
+                    <span id="gopScopeNote" class="gop-scope"></span>
+                    <div class="view-switcher" role="group" aria-label="Gross Operating Profit view">
+                        <button type="button" data-gop-view="statement" aria-pressed="true">Statement</button>
+                        <button type="button" data-gop-view="chart" aria-pressed="false">Chart</button>
+                    </div>
+                </div>
             </div>
 
-            <table class="gop-table">
-                <caption class="visually-hidden">
-                    Net revenue, operating costs, and gross operating profit for the selected scope
-                </caption>
-                <tbody id="gopRows"></tbody>
-            </table>
+            <div id="gopTableView">
+                <table class="gop-table">
+                    <caption class="visually-hidden">
+                        Net revenue, operating costs, and gross operating profit for the selected scope
+                    </caption>
+                    <tbody id="gopRows"></tbody>
+                </table>
+            </div>
+
+            <div id="gopChartView" hidden>
+                <div class="chart-legend gop-chart-legend" aria-label="Chart legend">
+                    <span><i class="legend-swatch gop-legend-base"></i>Base amount</span>
+                    <span><i class="legend-swatch gop-legend-profit"></i>Profit</span>
+                    <span><i class="legend-swatch gop-legend-loss"></i>Loss</span>
+                    <span><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
+                </div>
+                <div id="gopChart" class="los-chart gop-chart"></div>
+                <p class="gop-chart-note">
+                    One bar per period, using the <strong>Group by</strong> setting above.
+                    The bar is what the period cost to run; the purple marker is the
+                    revenue it earned.
+                </p>
+            </div>
 
             <ul id="gopFlags" class="gop-flags" aria-label="Calculation notes" hidden></ul>
         </section>
@@ -111,8 +134,8 @@
     </main>
 
     <script src="los-api.js?v=20260811-2"></script>
-    <script src="los-format.js?v=20260815-5"></script>
-    <script src="costdata-data.js?v=20260815-5"></script>
-    <script src="costdata.js?v=20260815-5"></script>
+    <script src="los-format.js?v=20260816-1"></script>
+    <script src="costdata-data.js?v=20260816-1"></script>
+    <script src="costdata.js?v=20260816-1"></script>
 </body>
 </html>

@@ -29,6 +29,8 @@ from services.cost_schema_service import CostSettingsSchemaError
 from services.cost_source_service import (
     CostSourceUnavailableError,
     fetch_cost_sources,
+    list_matching_rates,
+    list_travel_agencies,
 )
 from services.supplement_schema_service import SupplementSchemaError
 from services.supplement_service import (
@@ -510,6 +512,83 @@ def cost_settings_sources(req: func.HttpRequest) -> func.HttpResponse:
             "Cost source endpoint failed enterprise_id=%s", enterprise_id
         )
         return json_response({"error": "Unable to retrieve property source data"}, 500)
+
+
+def _origin_filter(req: func.HttpRequest):
+    """The repeatable ?origin= parameter, or None for "every origin".
+
+    An empty list and "no filter" are different questions and must not collapse
+    into each other: an origin group that has picked nothing yet must not be
+    offered every rate in the property as if it had.
+    """
+    origins = [
+        value.strip()
+        for value in req.params.get("origins", "").split(",")
+        if value.strip()
+    ]
+    return origins or None
+
+
+@app.route(
+    route="costdata/agencies/{enterprise_id}",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def cost_settings_agencies(req: func.HttpRequest) -> func.HttpResponse:
+    """Travel agencies matching a case-insensitive "contains" search."""
+    enterprise_id = (req.route_params.get("enterprise_id") or "").strip()
+    if not enterprise_id:
+        return json_response({"error": "Enterprise ID is required"}, 400)
+    try:
+        agencies = list_travel_agencies(
+            enterprise_id,
+            search=req.params.get("search", ""),
+            origins=_origin_filter(req),
+        )
+        return compressed_json_response(
+            req,
+            {"data": agencies},
+            headers={"Cache-Control": "private, max-age=120"},
+        )
+    except CostSourceUnavailableError as error:
+        logging.warning("Travel agency lookup unavailable: %s", error)
+        return json_response({"error": str(error)}, 503)
+    except Exception:
+        logging.exception(
+            "Travel agency endpoint failed enterprise_id=%s", enterprise_id
+        )
+        return json_response({"error": "Unable to search travel agencies"}, 500)
+
+
+@app.route(
+    route="costdata/rates/{enterprise_id}",
+    methods=["GET"],
+    auth_level=func.AuthLevel.ANONYMOUS,
+)
+def cost_settings_rates(req: func.HttpRequest) -> func.HttpResponse:
+    """Rates that reservations under the given filters were actually sold on."""
+    enterprise_id = (req.route_params.get("enterprise_id") or "").strip()
+    if not enterprise_id:
+        return json_response({"error": "Enterprise ID is required"}, 400)
+    try:
+        payload = list_matching_rates(
+            enterprise_id,
+            origins=_origin_filter(req),
+            agencySearch=req.params.get("agency", ""),
+        )
+        return compressed_json_response(
+            req,
+            {"data": payload},
+            headers={"Cache-Control": "private, max-age=120"},
+        )
+    except CostSourceUnavailableError as error:
+        logging.warning("Matching rate lookup unavailable: %s", error)
+        return json_response({"error": str(error)}, 503)
+    except Exception:
+        logging.exception(
+            "Matching rate endpoint failed enterprise_id=%s", enterprise_id
+        )
+        return json_response({"error": "Unable to retrieve matching rates"}, 500)
 
 
 @app.route(

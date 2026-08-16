@@ -249,5 +249,172 @@ class RateLookupTests(unittest.TestCase):
         self.assertNotIn("service_current", query)
 
 
+class SourceWindowTests(unittest.TestCase):
+    """Every reservation-derived lookup is bounded.
+
+    The channel picker used to read the hotel's entire reservation history -
+    hundreds of thousands of rows aggregated down to a handful of strings - on
+    every Cost Input page load, and it was the single largest cost in opening
+    the page.
+    """
+
+    def setUp(self):
+        cost_source_service._reset_column_cache()
+
+    def _run(self, call, columns, rows):
+        cursor = FakeCursor(columns, rows)
+        with patch.object(
+            cost_source_service, "get_export_connection",
+            return_value=FakeConnection(cursor)
+        ):
+            return call(), cursor
+
+    def test_the_channel_lookup_is_bounded_by_a_date_window(self):
+        _, cursor = self._run(
+            lambda: cost_source_service.list_channels("hotel-1"),
+            {"reservation_current": {"id", "service_id", "origin"}},
+            [{"channel_name": "ChannelManager"}],
+        )
+        query = " ".join(cursor.executed[-1].lower().split())
+
+        self.assertIn("reservation.start_utc >= %(window_start)s", query)
+        self.assertIn("limit", query)
+
+    def test_origins_come_back_with_how_often_each_occurs(self):
+        origins, cursor = self._run(
+            lambda: cost_source_service.list_origins("hotel-1"),
+            {"reservation_current": {"id", "service_id", "origin"}},
+            [{"origin_name": "ChannelManager", "reservation_count": 1204}],
+        )
+
+        self.assertEqual(origins, [{
+            "id": "ChannelManager",
+            "name": "ChannelManager",
+            "reservationCount": 1204,
+        }])
+        self.assertIn("start_utc >= %(window_start)s", " ".join(cursor.executed[-1].split()))
+
+    def test_a_mirror_without_an_origin_column_degrades_to_no_origins(self):
+        origins, _ = self._run(
+            lambda: cost_source_service.list_origins("hotel-1"),
+            {"reservation_current": {"id", "service_id"}},
+            [],
+        )
+        self.assertEqual(origins, [])
+
+    def test_a_mirror_without_an_agency_link_degrades_to_no_suggestions(self):
+        # No travel_agency_id on the reservation and no company table: the
+        # filter stays free text rather than failing the page.
+        agencies, _ = self._run(
+            lambda: cost_source_service.list_travel_agencies("hotel-1", search="exp"),
+            {"reservation_current": {"id", "service_id", "origin"}},
+            [],
+        )
+        self.assertEqual(agencies, [])
+
+
+class MatchingRateTests(unittest.TestCase):
+    def setUp(self):
+        cost_source_service._reset_column_cache()
+
+    def _run(self, columns, rows, **kwargs):
+        cursor = FakeCursor(columns, rows)
+        with patch.object(
+            cost_source_service, "get_export_connection",
+            return_value=FakeConnection(cursor)
+        ):
+            return cost_source_service.list_matching_rates("hotel-1", **kwargs), cursor
+
+    def test_rates_are_narrowed_to_the_reservations_that_used_them(self):
+        payload, cursor = self._run(
+            {
+                "reservation_current": {"id", "service_id", "origin", "rate_id"},
+                "rate_current": {"id", "service_id", "rate_name"},
+            },
+            [{"rate_id": "r1", "rate_name": "BAR", "reservation_count": 42}],
+            origins=["ChannelManager"],
+        )
+
+        self.assertEqual(payload["rates"], [
+            {"id": "r1", "name": "BAR", "reservationCount": 42}
+        ])
+        self.assertTrue(payload["filtered"])
+        self.assertTrue(payload["originFilterApplied"])
+        query = " ".join(cursor.executed[-1].lower().split())
+        self.assertIn("%(origins)s::text[]", query)
+
+    def test_an_agency_term_the_mirror_cannot_honour_is_reported_not_ignored(self):
+        # A full rate list returned as if it had been filtered reads as truth.
+        payload, _ = self._run(
+            {
+                "reservation_current": {"id", "service_id", "origin", "rate_id"},
+                "rate_current": {"id", "service_id", "rate_name"},
+            },
+            [{"rate_id": "r1", "rate_name": "BAR", "reservation_count": 42}],
+            agencySearch="expedia",
+        )
+
+        self.assertFalse(payload["agencyFilterApplied"])
+
+    def test_reservations_without_a_rate_fall_back_to_every_rate_on_the_property(self):
+        payload, _ = self._run(
+            {
+                "reservation_current": {"id", "service_id", "origin"},
+                "rate_current": {"id", "service_id", "rate_name", "is_active"},
+            },
+            [{"rate_id": "r9", "rate_name": "Corporate"}],
+        )
+
+        self.assertFalse(payload["filtered"])
+        self.assertEqual(payload["rates"], [{"id": "r9", "name": "Corporate"}])
+
+
+class ContainsPatternTests(unittest.TestCase):
+    def test_like_metacharacters_in_the_search_term_are_escaped(self):
+        # A search for "50%" must look for a literal per cent sign, not for
+        # "anything".
+        self.assertEqual(cost_source_service.contains_pattern("50%"), "%50\\%%")
+        self.assertEqual(cost_source_service.contains_pattern("a_b"), "%a\\_b%")
+        self.assertEqual(cost_source_service.contains_pattern("back\\slash"), "%back\\\\slash%")
+        self.assertEqual(cost_source_service.contains_pattern("expedia"), "%expedia%")
+
+
+class SourceCacheTests(unittest.TestCase):
+    """One connection for the whole picker payload, memoized per worker."""
+
+    def setUp(self):
+        cost_source_service._reset_column_cache()
+
+    def tearDown(self):
+        cost_source_service._reset_column_cache()
+
+    def test_every_lookup_shares_one_connection_and_the_result_is_cached(self):
+        cursor = FakeCursor(
+            {
+                "rate_current": {"id", "service_id", "rate_name"},
+                "reservation_current": {"id", "service_id", "origin", "rate_id"},
+                "resource_category_current": {
+                    "id", "enterprise_id", "space_name", "capacity", "type", "is_active",
+                },
+            },
+            [],
+        )
+        with patch.object(
+            cost_source_service, "get_export_connection",
+            return_value=FakeConnection(cursor)
+        ) as connect:
+            first = cost_source_service.fetch_cost_sources("hotel-1")
+            second = cost_source_service.fetch_cost_sources("hotel-1")
+
+        # Four lookups used to mean four TLS handshakes; the second page load
+        # used to mean four more.
+        connect.assert_called_once()
+        self.assertIs(first, second)
+        self.assertIn("origins", first)
+        self.assertTrue(first["capabilities"]["origin"])
+        self.assertTrue(first["capabilities"]["rateFromReservations"])
+        self.assertFalse(first["capabilities"]["travelAgency"])
+
+
 if __name__ == "__main__":
     unittest.main()

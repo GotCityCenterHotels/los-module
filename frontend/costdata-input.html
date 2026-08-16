@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data Input</title>
-    <link rel="stylesheet" href="styles.css?v=20260815-5">
+    <link rel="stylesheet" href="styles.css?v=20260816-1">
 </head>
 <body>
 <main class="container cost-workspace settings-workspace">
@@ -31,14 +31,15 @@
             <button type="button" data-section="cleaning"><span>02</span>Cleaning</button>
             <button type="button" data-section="arrivals"><span>03</span>Arrivals</button>
             <button type="button" data-section="breakfast"><span>04</span>Breakfast</button>
-            <button type="button" data-section="rent"><span>05</span>Rent & cards</button>
+            <button type="button" data-section="rent"><span>05</span>Rent</button>
+            <button type="button" data-section="cardFranchise"><span>06</span>Card &amp; franchise</button>
         </aside>
 
         <form id="settingsForm" class="settings-editor">
             <section data-settings-section="distribution">
-                <div class="editor-heading"><div><span class="section-eyebrow">ROOM REVENUE</span><h2>Distribution costs</h2><p>Group rate or channel values and assign the cost percentage charged to each.</p></div><button type="button" class="secondary-button" data-add="distributionGroups">Add group</button></div>
-                <div class="setting-strip"><label>Fallback distribution %<input name="distributionDefaultPercent" type="number" min="0" max="100" step="0.01" required></label></div>
-                <div id="distributionGroups" class="rule-list"></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">ROOM REVENUE</span><h2>Distribution costs</h2><p>Group reservations by origin, narrow them by travel agency, then set the percentage for specific rates. The most specific level that matches wins.</p></div><button type="button" class="secondary-button" data-add-origin-group>Add origin group</button></div>
+                <div class="setting-strip"><label>Fallback distribution %<input name="distributionDefaultPercent" type="number" min="0" max="100" step="0.01" required><small>Applied where no group matches</small></label></div>
+                <div id="distributionOriginGroups" class="rule-list distribution-tree"></div>
             </section>
             <section data-settings-section="cleaning" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">DEPARTURES</span><h2>Cleaning costs</h2><p>Every room category in this hotel, with one row per possible occupancy. Set cleaning minutes and linen cost for each.</p></div></div>
@@ -46,9 +47,11 @@
                 <div id="cleaningCategories" class="rule-list"></div>
             </section>
             <section data-settings-section="arrivals" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set reception hours required when daily arrivals enter a threshold.</p></div><button type="button" class="secondary-button" data-add="arrivalTiers">Add threshold</button></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">ARRIVALS</span><h2>Reception staffing</h2><p>Set reception hours required when daily arrivals enter a threshold. A count above the highest threshold uses that threshold.</p></div><label class="section-switch"><input type="checkbox" name="arrivalCostEnabled" checked><span>Charge arrival cost</span></label></div>
                 <div class="setting-strip"><label>Reception cost / hour (kr)<input name="receptionCostPerHour" type="number" min="0" step="1" required></label></div>
+                <div class="section-actions"><button type="button" class="secondary-button" data-add="arrivalTiers">Add threshold</button></div>
                 <div id="arrivalTiers" class="rule-list"></div>
+                <p class="section-off-note" hidden>Arrival cost is switched off for this property, so these thresholds are not applied and the Cost Data page will not report them as missing.</p>
             </section>
             <section data-settings-section="breakfast" hidden>
                 <div class="editor-heading"><div><span class="section-eyebrow">BREAKFAST GUESTS</span><h2>Food & staffing</h2><p>Apply direct food cost per guest and staff hours by guest-count threshold.</p></div><button type="button" class="secondary-button" data-add="breakfastTiers">Add threshold</button></div>
@@ -57,13 +60,24 @@
                 <div id="breakfastTiers" class="rule-list is-compact-list"></div>
             </section>
             <section data-settings-section="rent" hidden>
-                <div class="editor-heading"><div><span class="section-eyebrow">REVENUE & PAYMENTS</span><h2>Rent and card costs</h2><p>Percentages apply to the matching net revenue stream or gross payments.</p></div></div>
-                <div class="setting-grid"><label>Room rent %<input name="roomRentPercent" type="number" min="0" max="100" step="0.01" required><small>Room revenue net</small></label><label>Breakfast rent %<input name="breakfastRentPercent" type="number" min="0" max="100" step="0.01" required><small>Breakfast revenue net</small></label><label>Parking rent %<input name="parkingRentPercent" type="number" min="0" max="100" step="0.01" required><small>Parking revenue net</small></label><label>Card cost %<input name="cardCostPercent" type="number" min="0" max="100" step="0.01" required><small>Gross payments; default 2%</small></label></div>
+                <div class="editor-heading"><div><span class="section-eyebrow">REVENUE</span><h2>Rent costs</h2><p>Percentages apply to the matching net revenue stream.</p></div></div>
+                <div class="setting-grid"><label>Room rent %<input name="roomRentPercent" type="number" min="0" max="100" step="0.01" required><small>Room revenue net</small></label><label>Breakfast rent %<input name="breakfastRentPercent" type="number" min="0" max="100" step="0.01" required><small>Breakfast revenue net</small></label><label>Parking rent %<input name="parkingRentPercent" type="number" min="0" max="100" step="0.01" required><small>Parking revenue net</small></label></div>
+            </section>
+            <section data-settings-section="cardFranchise" hidden>
+                <div class="editor-heading"><div><span class="section-eyebrow">PAYMENTS &amp; BRAND</span><h2>Card and franchise costs</h2><p>Card processing is charged on gross payments. The franchise fee is charged on the revenue base you choose below.</p></div><label class="section-switch"><input type="checkbox" name="franchiseEnabled"><span>Charge franchise fee</span></label></div>
+                <div class="setting-grid"><label>Card cost %<input name="cardCostPercent" type="number" min="0" max="100" step="0.01" required><small>Gross payments; default 2%</small></label></div>
+                <div class="setting-grid" id="franchiseFields">
+                    <label>Franchise %<input name="franchisePercent" type="number" min="0" max="100" step="0.01" required><small>Of the revenue base below</small></label>
+                    <label>Calculated from<select name="franchiseBasis"><option value="net">Net revenue</option><option value="gross">Gross revenue (incl. VAT)</option></select><small>Cost facts are net; gross is derived</small></label>
+                    <label>Revenue base<select name="franchiseRevenueBase"><option value="roomInclProducts">Room revenue incl. products</option><option value="roomExclProducts">Room revenue &minus; products</option><option value="roomExclProductsPlusParking">Room revenue &minus; products, plus parking</option><option value="totalRevenue">Total revenue (room incl. products + parking)</option></select><small>Products include breakfast sold on the room</small></label>
+                    <label>VAT % used for gross<input name="franchiseVatPercent" type="number" min="0" max="100" step="0.01" required><small>Only used when the basis is gross</small></label>
+                </div>
+                <p class="section-off-note" id="franchiseOffNote" hidden>The franchise fee is switched off for this property, so nothing below is charged.</p>
             </section>
             <div class="settings-savebar"><span id="dirtyState">No unsaved changes</span><button id="saveSettings" type="submit">Save property settings</button></div>
         </form>
     </div>
 </main>
-<script src="los-api.js?v=20260811-2"></script><script src="los-format.js?v=20260815-5"></script><script src="costdata-match.js?v=20260815-1"></script><script src="costdata-input.js?v=20260815-5"></script>
+<script src="los-api.js?v=20260811-2"></script><script src="los-format.js?v=20260816-1"></script><script src="costdata-match.js?v=20260815-1"></script><script src="costdata-input.js?v=20260816-1"></script>
 </body>
 </html>

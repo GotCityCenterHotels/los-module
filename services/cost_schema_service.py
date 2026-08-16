@@ -36,6 +36,10 @@ MIGRATIONS = (
         "013_cleaning_occupancy_unique_fix",
         APP_ROOT / "sql" / "migrations" / "013_cleaning_occupancy_unique_fix.sql",
     ),
+    (
+        "014_franchise_and_distribution_tree",
+        APP_ROOT / "sql" / "migrations" / "014_franchise_and_distribution_tree.sql",
+    ),
 )
 
 _schema_ready = False
@@ -50,6 +54,26 @@ def _read_sql(path):
     return path.read_text(encoding="utf-8")
 
 
+def _pending_migrations(cursor):
+    """Migrations not yet recorded, in one round trip.
+
+    Checking each of them with its own SELECT cost one network round trip per
+    migration on every cold worker, all to discover that nothing needs doing.
+    Returns None when the bookkeeping table itself is missing, which means the
+    full bootstrap has to run.
+    """
+    cursor.execute("SELECT to_regclass('functions.schema_migrations')")
+    if cursor.fetchone()[0] is None:
+        return None
+    cursor.execute(
+        "SELECT migration_name FROM functions.schema_migrations "
+        "WHERE migration_name = ANY(%s)",
+        ([name for name, _ in MIGRATIONS],),
+    )
+    applied = {row[0] for row in cursor.fetchall()}
+    return [name for name, _ in MIGRATIONS if name not in applied]
+
+
 def ensure_cost_settings_schema():
     global _schema_ready
     if _schema_ready:
@@ -58,6 +82,19 @@ def ensure_cost_settings_schema():
     with _schema_lock:
         if _schema_ready:
             return
+
+        # Fast path: one round trip, no advisory lock. A worker that finds the
+        # schema already current never contends with another worker's
+        # migration, and never pays the lock's own round trip pair.
+        with cost_pool.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT to_regclass('functions.cost_property_settings')"
+                )
+                settings_ready = cursor.fetchone()[0] is not None
+                if settings_ready and _pending_migrations(cursor) == []:
+                    _schema_ready = True
+                    return
 
         with cost_pool.connection() as connection:
             with connection.cursor() as cursor:
@@ -90,13 +127,16 @@ def ensure_cost_settings_schema():
                             BASE_SCHEMA_PATH,
                         )
 
+                    # Re-read under the lock: another worker may have applied
+                    # everything between the fast path above and this point.
+                    pending = _pending_migrations(cursor)
+                    outstanding = (
+                        {name for name, _ in MIGRATIONS}
+                        if pending is None
+                        else set(pending)
+                    )
                     for migration_name, migration_path in MIGRATIONS:
-                        cursor.execute(
-                            "SELECT 1 FROM functions.schema_migrations "
-                            "WHERE migration_name = %s",
-                            (migration_name,),
-                        )
-                        if cursor.fetchone() is not None:
+                        if migration_name not in outstanding:
                             continue
                         cursor.execute(_read_sql(migration_path))
                         logging.info(

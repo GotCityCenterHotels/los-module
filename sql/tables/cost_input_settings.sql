@@ -35,9 +35,28 @@ CREATE TABLE IF NOT EXISTS functions.cost_property_settings (
     breakfast_rent_percent numeric(7, 4) NOT NULL DEFAULT 0,
     parking_rent_percent numeric(7, 4) NOT NULL DEFAULT 0,
     card_cost_percent numeric(7, 4) NOT NULL DEFAULT 2,
+    -- An empty arrival threshold list means "not configured yet"; this flag
+    -- means "this property does not staff reception by arrival volume". The
+    -- Cost Data page reports the first and stays silent about the second.
+    arrival_cost_enabled boolean NOT NULL DEFAULT true,
+    -- Franchise is its own fee, not a share of the rent percentages. 'gross'
+    -- grosses the chosen net revenue up by franchise_vat_percent, because
+    -- every revenue column in the cost facts is net of VAT.
+    franchise_enabled boolean NOT NULL DEFAULT false,
+    franchise_percent numeric(7, 4) NOT NULL DEFAULT 0,
+    franchise_basis text NOT NULL DEFAULT 'net',
+    franchise_revenue_base text NOT NULL DEFAULT 'roomInclProducts',
+    franchise_vat_percent numeric(7, 4) NOT NULL DEFAULT 12,
     updated_at timestamptz NOT NULL DEFAULT now(),
     CHECK (currency ~ '^[A-Z]{3}$'),
     CHECK (breakfast_calculation_basis IN ('guests', 'products')),
+    CHECK (franchise_basis IN ('net', 'gross')),
+    CHECK (franchise_revenue_base IN (
+        'roomInclProducts', 'roomExclProducts',
+        'roomExclProductsPlusParking', 'totalRevenue'
+    )),
+    CHECK (franchise_percent BETWEEN 0 AND 100),
+    CHECK (franchise_vat_percent BETWEEN 0 AND 100),
     CHECK (distribution_default_percent BETWEEN 0 AND 100),
     CHECK (room_rent_percent BETWEEN 0 AND 100),
     CHECK (breakfast_rent_percent BETWEEN 0 AND 100),
@@ -65,6 +84,72 @@ CREATE TABLE IF NOT EXISTS functions.cost_distribution_rules (
     match_type text NOT NULL CHECK (match_type IN ('rate', 'channel')),
     match_value text NOT NULL,
     UNIQUE (distribution_group_id, match_type, match_value)
+);
+
+-- Distribution costs as a three-level tree: origin group -> travel agency
+-- subgroup -> rate group, each level with its own percentage and the deeper
+-- match winning. Migration 014 creates these on an existing database and
+-- carries the flat cost_distribution_groups above into them.
+CREATE TABLE IF NOT EXISTS functions.cost_distribution_origin_groups (
+    origin_group_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    enterprise_id text NOT NULL
+        REFERENCES functions.cost_property_settings(enterprise_id) ON DELETE CASCADE,
+    group_name text NOT NULL,
+    fallback_percent numeric(7, 4) NOT NULL DEFAULT 0,
+    sort_order integer NOT NULL DEFAULT 0,
+    UNIQUE (enterprise_id, group_name),
+    CHECK (fallback_percent BETWEEN 0 AND 100)
+);
+
+CREATE TABLE IF NOT EXISTS functions.cost_distribution_origin_values (
+    origin_value_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    origin_group_id bigint NOT NULL
+        REFERENCES functions.cost_distribution_origin_groups(origin_group_id) ON DELETE CASCADE,
+    origin_value text NOT NULL,
+    UNIQUE (origin_group_id, origin_value)
+);
+
+CREATE TABLE IF NOT EXISTS functions.cost_distribution_agency_groups (
+    agency_group_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    origin_group_id bigint NOT NULL
+        REFERENCES functions.cost_distribution_origin_groups(origin_group_id) ON DELETE CASCADE,
+    group_name text NOT NULL,
+    fallback_percent numeric(7, 4) NOT NULL DEFAULT 0,
+    sort_order integer NOT NULL DEFAULT 0,
+    UNIQUE (origin_group_id, group_name),
+    CHECK (fallback_percent BETWEEN 0 AND 100)
+);
+
+CREATE TABLE IF NOT EXISTS functions.cost_distribution_agency_filters (
+    agency_filter_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    agency_group_id bigint NOT NULL
+        REFERENCES functions.cost_distribution_agency_groups(agency_group_id) ON DELETE CASCADE,
+    match_field text NOT NULL DEFAULT 'travelAgency',
+    contains_value text NOT NULL,
+    UNIQUE (agency_group_id, match_field, contains_value),
+    CHECK (match_field IN ('travelAgency', 'company', 'channel')),
+    CHECK (nullif(trim(contains_value), '') IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS functions.cost_distribution_rate_groups (
+    rate_group_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    agency_group_id bigint NOT NULL
+        REFERENCES functions.cost_distribution_agency_groups(agency_group_id) ON DELETE CASCADE,
+    group_name text NOT NULL,
+    cost_percent numeric(7, 4) NOT NULL DEFAULT 0,
+    sort_order integer NOT NULL DEFAULT 0,
+    UNIQUE (agency_group_id, group_name),
+    CHECK (cost_percent BETWEEN 0 AND 100)
+);
+
+CREATE TABLE IF NOT EXISTS functions.cost_distribution_rate_values (
+    rate_value_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rate_group_id bigint NOT NULL
+        REFERENCES functions.cost_distribution_rate_groups(rate_group_id) ON DELETE CASCADE,
+    rate_id text,
+    rate_name text NOT NULL,
+    UNIQUE (rate_group_id, rate_name),
+    CHECK (nullif(trim(rate_name), '') IS NOT NULL)
 );
 
 CREATE TABLE IF NOT EXISTS functions.cost_cleaning_categories (
@@ -139,6 +224,12 @@ CREATE INDEX IF NOT EXISTS ix_cost_fixed_lines_enterprise ON functions.cost_fixe
 
 CREATE INDEX IF NOT EXISTS ix_hotels_tenant_active_name ON functions.hotels(tenant_key, active, hotel_name, enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_distribution_groups_enterprise ON functions.cost_distribution_groups(enterprise_id);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_origin_groups_enterprise ON functions.cost_distribution_origin_groups(enterprise_id, sort_order);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_origin_values_group ON functions.cost_distribution_origin_values(origin_group_id);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_agency_groups_parent ON functions.cost_distribution_agency_groups(origin_group_id, sort_order);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_agency_filters_group ON functions.cost_distribution_agency_filters(agency_group_id);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_rate_groups_parent ON functions.cost_distribution_rate_groups(agency_group_id, sort_order);
+CREATE INDEX IF NOT EXISTS ix_cost_distribution_rate_values_group ON functions.cost_distribution_rate_values(rate_group_id);
 CREATE INDEX IF NOT EXISTS ix_cost_cleaning_categories_enterprise ON functions.cost_cleaning_categories(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_arrival_tiers_enterprise ON functions.cost_arrival_staffing_tiers(enterprise_id);
 CREATE INDEX IF NOT EXISTS ix_cost_breakfast_tiers_enterprise ON functions.cost_breakfast_staffing_tiers(enterprise_id);

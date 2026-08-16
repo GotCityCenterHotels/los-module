@@ -94,3 +94,91 @@ test("the picker renders assigned options last so they sit at the bottom", () =>
     const rendered = free.concat(taken).map(item => item.name);
     assert.deepEqual(rendered, ["Non-refundable", "BAR", "Corporate"]);
 });
+
+// ---------------------------------------------------------------------------
+// The three-level distribution tree
+// ---------------------------------------------------------------------------
+
+function tree() {
+    return [
+        {
+            groupName: "Channel manager",
+            origins: ["ChannelManager"],
+            agencyGroups: [
+                {
+                    groupName: "Expedia",
+                    filters: [{matchField: "travelAgency", containsValue: "expedia"}],
+                    rateGroups: [
+                        {groupName: "Package", costPercent: 12, rates: [
+                            {rateId: "r1", rateName: "BAR"},
+                            {rateId: null, rateName: "Corporate"}
+                        ]}
+                    ]
+                }
+            ]
+        },
+        {
+            groupName: "Direct",
+            origins: ["Commander"],
+            agencyGroups: [
+                {
+                    groupName: "  ",
+                    filters: [],
+                    rateGroups: [
+                        {groupName: "", costPercent: 0, rates: [
+                            {rateId: null, rateName: "Non-refundable"}
+                        ]}
+                    ]
+                }
+            ]
+        }
+    ];
+}
+
+test("a rate already in the tree names the whole path that owns it", () => {
+    const assigned = CostMatch.rateAssignmentIndex(tree(), {});
+
+    assert.equal(assigned.get("bar"), "Channel manager / Expedia / Package");
+    // Unnamed levels fall back to their position, so the message still says
+    // where to look rather than reading "  /  / ".
+    assert.equal(assigned.get("non-refundable"), "Direct / Subgroup 1 / Rates 1");
+});
+
+test("the rate group being edited does not report itself as a conflict", () => {
+    const editing = {originIndex: 0, agencyIndex: 0, rateGroupIndex: 0};
+    const assigned = CostMatch.rateAssignmentIndex(tree(), editing);
+
+    assert.equal(assigned.has("bar"), false);
+    assert.equal(assigned.has("corporate"), false);
+    // A different branch is still a conflict.
+    assert.equal(assigned.get("non-refundable"), "Direct / Subgroup 1 / Rates 1");
+});
+
+test("tree rate assignments are matched case-insensitively and skip blanks", () => {
+    const messy = [{
+        groupName: "OTA",
+        agencyGroups: [{groupName: "All", rateGroups: [
+            {groupName: "Rates", rates: [{rateName: "  bAr "}, {rateName: "   "}]}
+        ]}]
+    }];
+    const assigned = CostMatch.rateAssignmentIndex(messy, {});
+
+    assert.equal(assigned.get("bar"), "OTA / All / Rates");
+    assert.equal(assigned.size, 1);
+});
+
+test("the same partition powers the tree picker, so taken rates sort last", () => {
+    // Editing the Expedia package group frees its own two rates; the one held
+    // by the other branch stays taken and drops to the bottom of the list.
+    const assigned = CostMatch.rateAssignmentIndex(
+        tree(), {originIndex: 0, agencyIndex: 0, rateGroupIndex: 0}
+    );
+    const {free, taken} = CostMatch.partitionOptions(RATES, assigned, "");
+
+    assert.deepEqual(free.concat(taken).map(item => item.name), [
+        "BAR", "Corporate", "Non-refundable"
+    ]);
+    assert.deepEqual(taken, [
+        {name: "Non-refundable", owner: "Direct / Subgroup 1 / Rates 1"}
+    ]);
+});

@@ -253,6 +253,10 @@ class CostSettingsValidationTests(unittest.TestCase):
             {"enterpriseId": "property-42", "hotelName": "Hotel A"},
             {"enterpriseId": "property-43", "hotelName": "Hotel B"},
         ]
+        # The preload remembers what this worker has already written, so an
+        # earlier test touching the same ids would otherwise make this one see
+        # no write at all - and the order tests run in is not fixed.
+        cost_settings_service._reset_property_memo()
         with patch.object(
             cost_settings_service,
             "ensure_cost_settings_schema",
@@ -559,6 +563,274 @@ class NumericGuardTests(unittest.TestCase):
             cost_settings_service._number("12.50", "Cleaning cost"),
             cost_settings_service.Decimal("12.50"),
         )
+
+
+class ArrivalAndFranchiseProfileTests(unittest.TestCase):
+    """The two new switches, and the fields the franchise switch governs."""
+
+    def _profile(self, **overrides):
+        return cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {"profile": overrides}
+        )["profile"]
+
+    def test_arrivals_default_on_and_franchise_defaults_off(self):
+        profile = self._profile()
+
+        # A property saved before these fields existed must keep costing
+        # arrivals, and must not acquire a franchise fee it never agreed to.
+        self.assertIs(profile["arrivalCostEnabled"], True)
+        self.assertIs(profile["franchiseEnabled"], False)
+        self.assertEqual(profile["franchisePercent"], Decimal("0"))
+        self.assertEqual(profile["franchiseBasis"], "net")
+        self.assertEqual(profile["franchiseRevenueBase"], "roomInclProducts")
+        self.assertEqual(profile["franchiseVatPercent"], Decimal("12"))
+
+    def test_the_string_false_switches_a_cost_off(self):
+        # A form post sends "on" or nothing; JSON sends a real bool. "false" is
+        # a non-empty string and would otherwise be truthy.
+        self.assertIs(self._profile(arrivalCostEnabled="false")["arrivalCostEnabled"], False)
+        self.assertIs(self._profile(arrivalCostEnabled=False)["arrivalCostEnabled"], False)
+        self.assertIs(self._profile(franchiseEnabled="on")["franchiseEnabled"], True)
+        self.assertIs(self._profile(franchiseEnabled=True)["franchiseEnabled"], True)
+
+    def test_franchise_basis_and_revenue_base_are_constrained(self):
+        with self.assertRaisesRegex(ValueError, "franchiseBasis must be one of"):
+            self._profile(franchiseBasis="incl-vat")
+        with self.assertRaisesRegex(ValueError, "franchiseRevenueBase must be one of"):
+            self._profile(franchiseRevenueBase="everything")
+        # The database CHECK accepts exactly these four.
+        for base in (
+            "roomInclProducts", "roomExclProducts",
+            "roomExclProductsPlusParking", "totalRevenue",
+        ):
+            self.assertEqual(
+                self._profile(franchiseRevenueBase=base)["franchiseRevenueBase"], base
+            )
+
+    def test_franchise_percentages_are_bounded_like_every_other_percentage(self):
+        with self.assertRaisesRegex(ValueError, "between 0 and 100"):
+            self._profile(franchisePercent="101")
+        with self.assertRaisesRegex(ValueError, "between 0 and 100"):
+            self._profile(franchiseVatPercent="150")
+
+
+class DistributionTreeValidationTests(unittest.TestCase):
+    """Origin group -> travel agency subgroup -> rate group."""
+
+    def _tree(self, groups):
+        return cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {"distributionOriginGroups": groups}
+        )["distributionOriginGroups"]
+
+    def test_a_complete_tree_is_normalized(self):
+        result = self._tree([{
+            "groupName": " Channel manager ",
+            "fallbackPercent": "15",
+            "origins": ["ChannelManager", "channelmanager", " "],
+            "agencyGroups": [{
+                "groupName": "Expedia",
+                "fallbackPercent": "12.5",
+                "filters": [
+                    {"matchField": "travelAgency", "containsValue": " expedia "},
+                    {"matchField": "travelAgency", "containsValue": "EXPEDIA"},
+                    {"matchField": "travelAgency", "containsValue": "  "},
+                ],
+                "rateGroups": [{
+                    "groupName": "Package",
+                    "costPercent": "9",
+                    "rates": [
+                        {"rateId": "r1", "rateName": "BAR"},
+                        {"rateId": "", "rateName": "bar"},
+                        {"rateId": None, "rateName": "Corporate"},
+                    ],
+                }],
+            }],
+        }])
+
+        group = result[0]
+        self.assertEqual(group["groupName"], "Channel manager")
+        self.assertEqual(group["fallbackPercent"], Decimal("15"))
+        # The same origin twice in one group is one origin, not two.
+        self.assertEqual(group["origins"], ["ChannelManager"])
+        agency = group["agencyGroups"][0]
+        self.assertEqual(
+            [rule["containsValue"] for rule in agency["filters"]], ["expedia"]
+        )
+        rate_group = agency["rateGroups"][0]
+        self.assertEqual(
+            [rate["rateName"] for rate in rate_group["rates"]], ["BAR", "Corporate"]
+        )
+        self.assertEqual(rate_group["rates"][0]["rateId"], "r1")
+        self.assertIsNone(rate_group["rates"][1]["rateId"])
+
+    def test_a_group_that_matches_nothing_is_rejected(self):
+        # Saved as-is it would either swallow every reservation or none of
+        # them, depending on how the cost algorithm reads an empty filter.
+        with self.assertRaisesRegex(ValueError, "no origins and no subgroups"):
+            self._tree([{"groupName": "Empty", "fallbackPercent": "10"}])
+
+        with self.assertRaisesRegex(ValueError, "no travel agency filter and no rate"):
+            self._tree([{
+                "groupName": "Channel manager",
+                "origins": ["ChannelManager"],
+                "agencyGroups": [{"groupName": "Nothing", "fallbackPercent": "5"}],
+            }])
+
+    def test_a_rate_group_without_rates_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "has no rates"):
+            self._tree([{
+                "groupName": "Channel manager",
+                "origins": ["ChannelManager"],
+                "agencyGroups": [{
+                    "groupName": "Expedia",
+                    "filters": [{"matchField": "travelAgency", "containsValue": "expedia"}],
+                    "rateGroups": [{"groupName": "Package", "costPercent": "9", "rates": []}],
+                }],
+            }])
+
+    def test_names_must_be_unique_within_their_own_level(self):
+        def two_groups(name_one, name_two):
+            return [
+                {"groupName": name_one, "fallbackPercent": "1", "origins": ["A"]},
+                {"groupName": name_two, "fallbackPercent": "2", "origins": ["B"]},
+            ]
+
+        # Uniqueness is per level and case-insensitive, matching the database
+        # UNIQUE constraints.
+        with self.assertRaisesRegex(ValueError, "Distribution group names must be unique"):
+            self._tree(two_groups("OTA", "ota"))
+        self.assertEqual(len(self._tree(two_groups("OTA", "Direct"))), 2)
+
+        with self.assertRaisesRegex(ValueError, "names must be unique"):
+            self._tree([{
+                "groupName": "OTA",
+                "origins": ["A"],
+                "agencyGroups": [
+                    {"groupName": "Expedia", "filters": [{"containsValue": "x"}]},
+                    {"groupName": "expedia", "filters": [{"containsValue": "y"}]},
+                ],
+            }])
+
+    def test_an_unknown_filter_field_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "filter field must be one of"):
+            self._tree([{
+                "groupName": "OTA",
+                "origins": ["A"],
+                "agencyGroups": [{
+                    "groupName": "Expedia",
+                    "filters": [{"matchField": "guestName", "containsValue": "x"}],
+                }],
+            }])
+
+    def test_the_tree_is_optional_and_defaults_to_empty(self):
+        result = cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {}
+        )
+        self.assertEqual(result["distributionOriginGroups"], [])
+
+
+class DistributionTreeWriteTests(unittest.TestCase):
+    """The tree is rewritten parent-first, because each child keys off an
+    identity column that only exists once its parent row is in."""
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.batches = []
+            self._next_id = 0
+
+        def execute(self, sql, parameters=None):
+            self.executed.append((" ".join(str(sql).split()), parameters))
+
+        def executemany(self, sql, parameters):
+            self.batches.append((" ".join(str(sql).split()), list(parameters)))
+
+        def fetchone(self):
+            self._next_id += 1
+            return (self._next_id,)
+
+    def test_every_level_is_written_with_its_parents_returned_id(self):
+        cursor = self.Cursor()
+        cost_settings_service._insert_distribution_tree(cursor, "property-42", [{
+            "groupName": "Channel manager",
+            "fallbackPercent": Decimal("15"),
+            "origins": ["ChannelManager"],
+            "agencyGroups": [{
+                "groupName": "Expedia",
+                "fallbackPercent": Decimal("12"),
+                "filters": [{"matchField": "travelAgency", "containsValue": "expedia"}],
+                "rateGroups": [{
+                    "groupName": "Package",
+                    "costPercent": Decimal("9"),
+                    "rates": [{"rateId": "r1", "rateName": "BAR"}],
+                }],
+            }],
+        }])
+
+        inserts = [sql for sql, _ in cursor.executed]
+        self.assertTrue(any("cost_distribution_origin_groups" in sql for sql in inserts))
+        self.assertTrue(any("cost_distribution_agency_groups" in sql for sql in inserts))
+        self.assertTrue(any("cost_distribution_rate_groups" in sql for sql in inserts))
+
+        # Identity ids come back 1, 2, 3 in parent-first order, so each child
+        # batch must carry the id of the row inserted immediately above it.
+        batches = {
+            sql.split("functions.")[1].split(" ")[0]: rows
+            for sql, rows in cursor.batches
+        }
+        self.assertEqual(batches["cost_distribution_origin_values"], [(1, "ChannelManager")])
+        self.assertEqual(
+            batches["cost_distribution_agency_filters"], [(2, "travelAgency", "expedia")]
+        )
+        self.assertEqual(batches["cost_distribution_rate_values"], [(3, "r1", "BAR")])
+
+    def test_an_empty_tree_writes_nothing(self):
+        cursor = self.Cursor()
+        cost_settings_service._insert_distribution_tree(cursor, "property-42", [])
+
+        self.assertEqual(cursor.executed, [])
+        self.assertEqual(cursor.batches, [])
+
+
+class DistributionTreeShapeTests(unittest.TestCase):
+    """The settings endpoint is anonymous, so every nested level checks its
+    own shape rather than trusting the payload."""
+
+    def _tree(self, groups):
+        return cost_settings_service.validate_cost_settings(
+            "property-42", "Hotel A", {"distributionOriginGroups": groups}
+        )["distributionOriginGroups"]
+
+    def test_a_string_where_a_list_of_origins_belongs_is_rejected(self):
+        # Iterating the string walked it character by character and saved nine
+        # single-letter origins, returning 200 on a corrupted rulebook.
+        with self.assertRaisesRegex(ValueError, "origins must be a list"):
+            self._tree([{"groupName": "G", "origins": "ChannelManager"}])
+
+    def test_a_non_text_origin_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "origins must be text"):
+            self._tree([{"groupName": "G", "origins": [{"name": "A"}]}])
+
+    def test_a_string_where_an_object_belongs_is_a_validation_error_not_a_crash(self):
+        # These used to raise AttributeError, which the route maps to 500
+        # rather than to the 400 a malformed request deserves.
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            self._tree([{"groupName": "G", "origins": ["A"], "agencyGroups": ["Expedia"]}])
+
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            self._tree([{
+                "groupName": "G",
+                "origins": ["A"],
+                "agencyGroups": [{
+                    "groupName": "Expedia",
+                    "filters": [{"containsValue": "x"}],
+                    "rateGroups": [{"groupName": "R", "rates": ["BAR"]}],
+                }],
+            }])
+
+    def test_the_whole_tree_must_be_a_list(self):
+        with self.assertRaisesRegex(ValueError, "must be a list"):
+            self._tree({"groupName": "G"})
 
 
 if __name__ == "__main__":

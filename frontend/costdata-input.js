@@ -3,6 +3,8 @@
     const API = "/api/costdata/settings";
     const PROPERTIES_API = "/api/costdata/properties";
     const SOURCES_API = "/api/costdata/sources";
+    const AGENCIES_API = "/api/costdata/agencies";
+    const RATES_API = "/api/costdata/rates";
     const hotel = document.getElementById("settingsHotel"), form = document.getElementById("settingsForm");
     const layout = document.getElementById("settingsLayout"), status = document.getElementById("settingsStatus");
     const errorPanel = document.getElementById("settingsError"), save = document.getElementById("saveSettings");
@@ -23,6 +25,9 @@
     const INTEGER_FIELDS = new Set([
         "minGuests", "maxGuests", "minArrivals", "maxArrivals"
     ]);
+    // Profile fields backed by a checkbox rather than a value. They round-trip
+    // through .checked, not .value - an unchecked box has no value at all.
+    const CHECKBOX_FIELDS = new Set(["arrivalCostEnabled", "franchiseEnabled"]);
     const DECIMALS = 2;
 
     // Each row is [field, label, type]. Optional fourth entry is a row class.
@@ -31,9 +36,9 @@
         breakfastTiers: [["minGuests","From guests","number"],["maxGuests","To guests","number"],["staffHours","Staff hours","number"]]
     };
     const rowClasses = { breakfastTiers: "tier-row is-compact" };
-    const defaults = { arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0}, distributionGroups:{groupName:"",costPercent:0,rules:[]} };
+    const defaults = { arrivalTiers:{minArrivals:0,maxArrivals:"",receptionHours:0}, breakfastTiers:{minGuests:0,maxGuests:"",staffHours:0} };
 
-    // Rates, channels and room categories for the selected hotel, from
+    // Rates, channels, origins and room categories for the selected hotel, from
     // /api/costdata/sources. Null until loaded; an empty object after a failed
     // load, so the page still works with manual entry.
     let sources = null;
@@ -46,28 +51,16 @@
             sources = payload.data || {};
         }
         catch (error) {
-            sources = {rates: [], channels: [], cleaningCategories: [], error: error.message};
+            sources = {
+                rates: [], channels: [], cleaningCategories: [], origins: [],
+                capabilities: {}, error: error.message
+            };
             console.warn("Source lookup failed; manual entry still available.", error);
         }
     }
 
-    function optionsFor(matchType) {
-        if (!sources) return [];
-        return (matchType === "rate" ? sources.rates : sources.channels) || [];
-    }
-    // Which group each value is already assigned to, so the picker can show it
-    // as taken rather than silently allowing a duplicate across groups.
-    // The pure logic lives in costdata-match.js so it can be unit tested.
-    function assignmentIndex(matchType, exceptGroup, exceptRuleIndex) {
-        if (typeof CostMatch === "undefined") {
-            throw new Error(
-                "costdata-match.js did not load - hard refresh the page, and check "
-                + "that the script deployed alongside costdata-input.js."
-            );
-        }
-        return CostMatch.assignmentIndex(
-            model.distributionGroups, matchType, exceptGroup, exceptRuleIndex
-        );
+    function sourceCapability(name) {
+        return Boolean(sources && sources.capabilities && sources.capabilities[name]);
     }
 
     function toFixedDecimals(value) {
@@ -118,7 +111,13 @@
                 hotel.add(new Option(property.hotelName, String(property.enterpriseId)));
             }
             if (properties.length) {
-                hotel.value = String(properties[0].enterpriseId);
+                // Reopening the page on the property last edited also avoids
+                // loading a hotel nobody asked for and then loading the right
+                // one, which was two full source lookups instead of one.
+                const remembered = rememberedProperty();
+                hotel.value = properties.some(
+                    (property) => String(property.enterpriseId) === remembered
+                ) ? remembered : String(properties[0].enterpriseId);
                 await loadSettings(hotel.value);
             }
             else {
@@ -129,6 +128,15 @@
         }
         catch (error) { hotel.disabled = false; showError(error, "Loading properties"); }
     }
+
+    const PROPERTY_STORAGE = "costdata-input-property";
+    function rememberedProperty() {
+        try { return localStorage.getItem(PROPERTY_STORAGE) || ""; } catch { return ""; }
+    }
+    function rememberProperty(enterpriseId) {
+        try { localStorage.setItem(PROPERTY_STORAGE, enterpriseId); } catch { /* private mode */ }
+    }
+
     async function loadSettings(name) {
         if (!name || name === "undefined" || name === "null") {
             layout.hidden = true;
@@ -146,17 +154,22 @@
                 loadSources(name)
             ]);
             model = payload.data;
+            model.distributionOriginGroups = model.distributionOriginGroups || [];
             loadedEnterpriseId = model.enterpriseId;
+            rememberProperty(loadedEnterpriseId);
+            rateCache.clear();
+            agencyCache.clear();
+            originDrafts = new WeakMap();
             render();
             layout.hidden = false;
             setDirty(false);
             if (sources && sources.error) {
-                // Rates, channels and room categories all come from this one
-                // call, so a failure here empties every picker. Say so plainly
-                // instead of leaving empty dropdowns with no explanation.
+                // Rates, channels, origins and room categories all come from
+                // this one call, so a failure here empties every picker. Say so
+                // plainly instead of leaving empty dropdowns with no explanation.
                 showError(
                     new Error(
-                        `${sources.error} Rates, channels and room categories are unavailable, `
+                        `${sources.error} Rates, origins and room categories are unavailable, `
                         + "so those fields must be typed manually."
                     ),
                     "Loading this hotel's rates and room categories"
@@ -173,6 +186,10 @@
         for (const [key, value] of Object.entries(model.profile)) {
             const input = form.elements.namedItem(key);
             if (!input) continue;
+            if (CHECKBOX_FIELDS.has(key)) {
+                input.checked = isEnabled(value, key !== "franchiseEnabled");
+                continue;
+            }
             input.value = input.type === "number" ? displayValue(key, value) : value;
             bindNumberNormalisation(input, key);
         }
@@ -181,7 +198,7 @@
         // the cause and every section that was fine.
         const failures = [];
         const sections = [
-            ["Distribution", renderDistribution],
+            ["Distribution", renderDistributionTree],
             ["Cleaning", renderCleaning],
             ...Object.keys(configs).map(key => [key, () => renderRows(key)])
         ];
@@ -192,12 +209,68 @@
                 console.error(`Failed to render the ${label} section`, error);
             }
         }
+        syncSectionSwitches();
         if (failures.length) {
             showError(
                 new Error(`${failures.join(" | ")}. The other sections are still editable.`),
                 "Rendering the editor"
             );
         }
+    }
+
+    // A checkbox that has never been saved arrives as undefined, a saved one as
+    // a real boolean. "false" is a truthy string, which is what this guards.
+    function isEnabled(value, fallback) {
+        if (value === undefined || value === null || value === "") return fallback;
+        if (typeof value === "boolean") return value;
+        return !["false", "0", "no", "off"].includes(String(value).trim().toLowerCase());
+    }
+
+    // ------------------------------------------------------------------
+    // Section switches
+    //
+    // Switching a cost off greys its inputs out rather than hiding them: the
+    // configuration is still there, still worth reading, and turning the switch
+    // back on must not look like it lost anything.
+    // ------------------------------------------------------------------
+    function setSectionEnabled(section, enabled, keepEnabled) {
+        if (!section) return;
+        section.classList.toggle("is-switched-off", !enabled);
+        for (const control of section.querySelectorAll("input, select, button")) {
+            if (keepEnabled && keepEnabled(control)) continue;
+            control.disabled = !enabled;
+            // A disabled required field is skipped by constraint validation,
+            // which is exactly right: an off section must never block a save.
+        }
+        const note = section.querySelector(".section-off-note");
+        if (note) note.hidden = enabled;
+    }
+
+    function syncSectionSwitches() {
+        const arrivals = document.querySelector('[data-settings-section="arrivals"]');
+        const arrivalSwitch = form.elements.namedItem("arrivalCostEnabled");
+        setSectionEnabled(
+            arrivals,
+            !arrivalSwitch || arrivalSwitch.checked,
+            (control) => control === arrivalSwitch
+        );
+
+        const franchiseSwitch = form.elements.namedItem("franchiseEnabled");
+        const franchiseFields = document.getElementById("franchiseFields");
+        const franchiseOn = Boolean(franchiseSwitch && franchiseSwitch.checked);
+        if (franchiseFields) {
+            franchiseFields.classList.toggle("is-switched-off", !franchiseOn);
+            for (const control of franchiseFields.querySelectorAll("input, select")) {
+                control.disabled = !franchiseOn;
+            }
+            // VAT only participates in a gross calculation. Leaving it live on
+            // a net basis invites someone to change a number that does nothing.
+            const basis = form.elements.namedItem("franchiseBasis");
+            const vat = form.elements.namedItem("franchiseVatPercent");
+            if (vat) vat.disabled = !franchiseOn || !basis || basis.value !== "gross";
+        }
+        const offNote = document.getElementById("franchiseOffNote");
+        if (offNote) offNote.hidden = franchiseOn;
     }
 
     // Cleaning rows are one per (room category, occupancy) and come from the
@@ -304,24 +377,755 @@
                 : "No room categories found for this hotel.");
         }
     }
-    function renderDistribution() {
-        const root=document.getElementById("distributionGroups"); root.replaceChildren();
-        model.distributionGroups.forEach((group,index)=>{
-            const row=document.createElement("div"); row.className="rule-row distribution-rule";
-            row.innerHTML=`<div class="rule-main"><label>Group name<input data-field="groupName" value="${escapeHtml(group.groupName)}" required></label><label>Cost %<input data-field="costPercent" type="number" min="0" max="100" step="0.01" value="${escapeHtml(toFixedDecimals(group.costPercent))}" required></label><button type="button" class="remove-rule" aria-label="Remove group">Remove</button></div><div class="match-list"></div><button type="button" class="text-button add-match">+ Add rate or channel match</button>`;
-            bindNumberNormalisation(
-                row.querySelector('[data-field="costPercent"]'),
-                "costPercent",
-                (value) => { group.costPercent = value; }
-            );
-            row.querySelector(".remove-rule").onclick=()=>removeRow("distributionGroups",index); row.querySelector(".add-match").onclick=()=>{group.rules.push({matchType:"channel",matchValue:""});renderDistribution();setDirty(true)};
-            const matches = row.querySelector(".match-list");
-            group.rules.forEach((rule, ruleIndex) => {
-                matches.append(buildMatchRow(group, index, rule, ruleIndex));
-            });
-            bindFields(row,group); root.append(row);
-        }); emptyMessage(root,"No distribution groups yet.");
+
+    // ======================================================================
+    // Distribution tree
+    //
+    // Origin group -> travel agency subgroup -> rate group, each level with its
+    // own percentage. The deeper a level matches, the more specific it is, so
+    // its percentage wins over its parent's fallback.
+    //
+    // Every level is rebuilt from the model on change rather than patched in
+    // place. The tree is small - a handful of groups per property - and a full
+    // rebuild is the only way to keep the "already assigned" state on every
+    // rate picker honest after an edit anywhere in the tree.
+    // ======================================================================
+    // Text typed into an origin group's free-text box but not yet added. Keyed
+    // by the group object itself so it survives the rebuild and is collected
+    // with the group when it is removed.
+    let originDrafts = new WeakMap();
+
+    function newOriginGroup() {
+        return {groupName: "", fallbackPercent: 0, origins: [], agencyGroups: []};
     }
+    function newAgencyGroup() {
+        return {groupName: "", fallbackPercent: 0, filters: [], rateGroups: []};
+    }
+    function newRateGroup() {
+        return {groupName: "", costPercent: 0, rates: []};
+    }
+
+    function labelledInput(labelText, options) {
+        const wrap = document.createElement("label");
+        wrap.textContent = labelText;
+        const input = document.createElement("input");
+        Object.assign(input, options || {});
+        wrap.append(input);
+        return {wrap, input};
+    }
+
+    function iconButton(text, ariaLabel, className) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = className || "remove-rule";
+        button.textContent = text;
+        button.setAttribute("aria-label", ariaLabel);
+        return button;
+    }
+
+    function textButton(text, onClick) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "text-button";
+        button.textContent = text;
+        button.onclick = onClick;
+        return button;
+    }
+
+    function levelWarning(text) {
+        const note = document.createElement("p");
+        note.className = "tree-warning";
+        note.textContent = text;
+        return note;
+    }
+
+    function renderDistributionTree() {
+        const root = document.getElementById("distributionOriginGroups");
+        if (!root) return;
+        root.replaceChildren();
+        model.distributionOriginGroups.forEach((group, originIndex) => {
+            root.append(buildOriginGroup(group, originIndex));
+        });
+        emptyMessage(
+            root,
+            "No origin groups yet. Every reservation is charged the fallback "
+            + "distribution % above until you add one."
+        );
+    }
+
+    function buildOriginGroup(group, originIndex) {
+        const row = document.createElement("div");
+        row.className = "rule-row tree-group tree-origin-group";
+
+        const main = document.createElement("div");
+        main.className = "rule-main";
+        const name = labelledInput("Origin group name", {
+            type: "text", value: group.groupName || "", required: true
+        });
+        name.input.oninput = () => {
+            group.groupName = name.input.value;
+            setDirty(true);
+        };
+        const percent = labelledInput("Fallback %", {
+            type: "number", min: "0", max: "100", step: "0.01",
+            value: toFixedDecimals(group.fallbackPercent), required: true
+        });
+        bindNumberNormalisation(percent.input, "fallbackPercent", (value) => {
+            group.fallbackPercent = value;
+        });
+        percent.input.oninput = () => {
+            group.fallbackPercent = percent.input.value;
+            setDirty(true);
+        };
+        const remove = iconButton("Remove", "Remove origin group");
+        remove.onclick = () => {
+            model.distributionOriginGroups.splice(originIndex, 1);
+            renderDistributionTree();
+            setDirty(true);
+        };
+        main.append(name.wrap, percent.wrap, remove);
+        row.append(main);
+
+        row.append(buildOriginPicker(group));
+
+        const subgroups = document.createElement("div");
+        subgroups.className = "tree-children tree-agency-list";
+        (group.agencyGroups || []).forEach((agency, agencyIndex) => {
+            subgroups.append(buildAgencyGroup(group, agency, originIndex, agencyIndex));
+        });
+        if (!(group.agencyGroups || []).length) {
+            const empty = document.createElement("p");
+            empty.className = "tree-empty";
+            empty.textContent =
+                "No travel agency subgroups. Everything in this origin group is "
+                + "charged its fallback %.";
+            subgroups.append(empty);
+        }
+        row.append(subgroups);
+        row.append(textButton("+ Add travel agency subgroup", () => {
+            group.agencyGroups = group.agencyGroups || [];
+            group.agencyGroups.push(newAgencyGroup());
+            renderDistributionTree();
+            setDirty(true);
+        }));
+
+        if (!(group.origins || []).length && !(group.agencyGroups || []).length) {
+            row.append(levelWarning(
+                "This group has no origins and no subgroups, so it matches "
+                + "nothing. Pick an origin below or remove the group."
+            ));
+        }
+        return row;
+    }
+
+    // Origins are a short, closed list per property, so checkboxes beat a
+    // combo: everything available is visible at once and the count next to each
+    // says which ones the property actually books through.
+    function buildOriginPicker(group) {
+        const field = document.createElement("div");
+        field.className = "tree-field";
+        const heading = document.createElement("span");
+        heading.className = "tree-field-label";
+        heading.textContent = "Origins";
+        field.append(heading);
+
+        const available = (sources && sources.origins) || [];
+        const selected = new Set((group.origins || []).map(value => value.toLowerCase()));
+        // A saved origin the source no longer reports still has to be visible
+        // and removable - dropping it silently would change the rulebook.
+        const orphans = (group.origins || []).filter(value =>
+            !available.some(option => option.name.toLowerCase() === value.toLowerCase())
+        );
+
+        const choices = document.createElement("div");
+        choices.className = "compact-checks origin-choices";
+        for (const option of available) {
+            choices.append(originChoice(group, option.name, option.reservationCount, selected));
+        }
+        for (const value of orphans) {
+            choices.append(originChoice(group, value, null, selected, true));
+        }
+        if (!available.length && !orphans.length) {
+            const empty = document.createElement("span");
+            empty.className = "tree-field-empty";
+            empty.textContent = sourceCapability("origin")
+                ? "This hotel has no reservation origins in the source window."
+                : "Origins are unavailable for this hotel, so type one below.";
+            choices.append(empty);
+        }
+        field.append(choices);
+
+        // Free text stays available whatever the source says: a mirror without
+        // an origin column must not make the whole level unusable.
+        const manual = document.createElement("div");
+        manual.className = "tree-manual";
+        const entry = document.createElement("input");
+        entry.type = "text";
+        entry.placeholder = "Add an origin by name...";
+        entry.setAttribute("aria-label", "Add an origin by name");
+        // Half-typed text is not in the model, and every edit anywhere in the
+        // tree rebuilds this input from scratch - so ticking a checkbox used to
+        // throw away whatever was being typed here, with no sign it had gone.
+        entry.value = originDrafts.get(group) || "";
+        entry.addEventListener("input", () => {
+            originDrafts.set(group, entry.value);
+        });
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "secondary-button";
+        add.textContent = "Add origin";
+        add.onclick = () => {
+            const value = entry.value.trim();
+            if (!value) return;
+            group.origins = group.origins || [];
+            if (!group.origins.some(existing => existing.toLowerCase() === value.toLowerCase())) {
+                group.origins.push(value);
+            }
+            originDrafts.delete(group);
+            renderDistributionTree();
+            setDirty(true);
+        };
+        entry.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter") return;
+            // Otherwise Enter submits the whole form and the typed origin is lost.
+            event.preventDefault();
+            add.click();
+        });
+        manual.append(entry, add);
+        field.append(manual);
+        return field;
+    }
+
+    function originChoice(group, value, count, selected, orphaned) {
+        const label = document.createElement("label");
+        if (orphaned) label.classList.add("is-orphaned-choice");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = value;
+        box.checked = selected.has(value.toLowerCase());
+        box.onchange = () => {
+            group.origins = (group.origins || []).filter(
+                existing => existing.toLowerCase() !== value.toLowerCase()
+            );
+            if (box.checked) group.origins.push(value);
+            renderDistributionTree();
+            setDirty(true);
+        };
+        label.append(box, document.createTextNode(` ${value}`));
+        if (count !== null && count !== undefined) {
+            const badge = document.createElement("small");
+            badge.textContent = integerLabel(count);
+            label.append(badge);
+        }
+        if (orphaned) {
+            const badge = document.createElement("small");
+            badge.textContent = "not in source";
+            label.append(badge);
+        }
+        return label;
+    }
+
+    const integerFormatter = new Intl.NumberFormat("en-SE", {maximumFractionDigits: 0});
+    function integerLabel(count) {
+        return integerFormatter.format(Number(count) || 0);
+    }
+
+    function buildAgencyGroup(originGroup, agency, originIndex, agencyIndex) {
+        const row = document.createElement("div");
+        row.className = "tree-group tree-agency-group";
+
+        const main = document.createElement("div");
+        main.className = "rule-main";
+        const name = labelledInput("Subgroup name", {
+            type: "text", value: agency.groupName || "", required: true
+        });
+        name.input.oninput = () => { agency.groupName = name.input.value; setDirty(true); };
+        const percent = labelledInput("Fallback %", {
+            type: "number", min: "0", max: "100", step: "0.01",
+            value: toFixedDecimals(agency.fallbackPercent), required: true
+        });
+        bindNumberNormalisation(percent.input, "fallbackPercent", (value) => {
+            agency.fallbackPercent = value;
+        });
+        percent.input.oninput = () => {
+            agency.fallbackPercent = percent.input.value;
+            setDirty(true);
+        };
+        const remove = iconButton("Remove", "Remove travel agency subgroup");
+        remove.onclick = () => {
+            originGroup.agencyGroups.splice(agencyIndex, 1);
+            renderDistributionTree();
+            setDirty(true);
+        };
+        main.append(name.wrap, percent.wrap, remove);
+        row.append(main);
+
+        const filters = document.createElement("div");
+        filters.className = "tree-field";
+        const heading = document.createElement("span");
+        heading.className = "tree-field-label";
+        heading.textContent = "Travel agency contains";
+        filters.append(heading);
+        (agency.filters || []).forEach((rule, filterIndex) => {
+            filters.append(buildAgencyFilter(originGroup, agency, rule, filterIndex));
+        });
+        if (!(agency.filters || []).length) {
+            const empty = document.createElement("span");
+            empty.className = "tree-field-empty";
+            empty.textContent = "No search terms yet.";
+            filters.append(empty);
+        }
+        filters.append(textButton("+ Add search term", () => {
+            agency.filters = agency.filters || [];
+            agency.filters.push({matchField: "travelAgency", containsValue: ""});
+            renderDistributionTree();
+            setDirty(true);
+        }));
+        row.append(filters);
+
+        const rateGroups = document.createElement("div");
+        rateGroups.className = "tree-children tree-rate-list";
+        (agency.rateGroups || []).forEach((rateGroup, rateGroupIndex) => {
+            rateGroups.append(buildRateGroup(
+                originGroup, agency, rateGroup,
+                {originIndex, agencyIndex, rateGroupIndex}
+            ));
+        });
+        if (!(agency.rateGroups || []).length) {
+            const empty = document.createElement("p");
+            empty.className = "tree-empty";
+            empty.textContent =
+                "No rate groups. Everything this subgroup matches is charged its "
+                + "fallback %.";
+            rateGroups.append(empty);
+        }
+        row.append(rateGroups);
+        row.append(textButton("+ Add rate group", () => {
+            agency.rateGroups = agency.rateGroups || [];
+            agency.rateGroups.push(newRateGroup());
+            renderDistributionTree();
+            setDirty(true);
+        }));
+
+        if (!(agency.filters || []).some(rule => String(rule.containsValue || "").trim())
+            && !(agency.rateGroups || []).length) {
+            row.append(levelWarning(
+                "This subgroup has no search term and no rate groups, so it "
+                + "matches nothing."
+            ));
+        }
+        return row;
+    }
+
+    // The search is a "contains" match applied without regard to case, so the
+    // suggestions have to come from the same place the cost algorithm will look
+    // - the agencies this hotel actually has reservations from.
+    function buildAgencyFilter(originGroup, agency, rule, filterIndex) {
+        const line = document.createElement("div");
+        line.className = "tree-filter-row";
+
+        const combo = document.createElement("div");
+        combo.className = "combo";
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "combo-input";
+        input.value = rule.containsValue || "";
+        input.placeholder = "Part of the agency name...";
+        input.setAttribute("aria-label", "Travel agency contains");
+        input.setAttribute("autocomplete", "off");
+
+        const popup = document.createElement("div");
+        popup.className = "combo-popup";
+        popup.setAttribute("role", "listbox");
+        popup.hidden = true;
+
+        const api = {root: combo, close: () => { popup.hidden = true; }};
+
+        async function suggest() {
+            const term = input.value.trim();
+            if (!sourceCapability("travelAgency") || term.length < 2) {
+                popup.hidden = true;
+                return;
+            }
+            const matches = await searchAgencies(term, originGroup.origins);
+            // The field may have moved on while the request was in flight.
+            if (input.value.trim() !== term) return;
+            popup.replaceChildren();
+            if (!matches.length) {
+                const empty = document.createElement("div");
+                empty.className = "combo-empty";
+                empty.textContent =
+                    "No agency in this hotel's reservations contains that. The term "
+                    + "is still saved and matched when the cost is calculated.";
+                popup.append(empty);
+            }
+            for (const match of matches) {
+                const option = document.createElement("div");
+                option.className = "combo-option";
+                option.setAttribute("role", "option");
+                const label = document.createElement("span");
+                label.className = "combo-option-name";
+                label.textContent = match.name;
+                const badge = document.createElement("span");
+                badge.className = "combo-option-group";
+                badge.textContent = `${integerLabel(match.reservationCount)} res.`;
+                option.append(label, badge);
+                option.addEventListener("pointerdown", (event) => {
+                    event.preventDefault();
+                    input.value = match.name;
+                    rule.containsValue = match.name;
+                    popup.hidden = true;
+                    openCombo = null;
+                    setDirty(true);
+                });
+                popup.append(option);
+            }
+            // Close whatever was open BEFORE unhiding this one. The other way
+            // round, the second keystroke finds this combo registered as the
+            // open one and closes it again - so refining the search, which is
+            // the entire point of the control, permanently hid the list.
+            closeOpenCombo();
+            popup.hidden = false;
+            openCombo = api;
+        }
+
+        const debouncedSuggest = debounce(suggest, 250);
+        input.addEventListener("input", () => {
+            rule.containsValue = input.value.trim();
+            setDirty(true);
+            debouncedSuggest();
+        });
+        input.addEventListener("focus", debouncedSuggest);
+        input.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && !popup.hidden) {
+                event.stopPropagation();
+                popup.hidden = true;
+                openCombo = null;
+            }
+            // Enter in a text field inside a form submits it. Here it should
+            // only dismiss the suggestion list.
+            if (event.key === "Enter") { event.preventDefault(); popup.hidden = true; }
+        });
+
+        combo.append(input, popup);
+        const remove = iconButton("×", "Remove search term");
+        remove.onclick = () => {
+            agency.filters.splice(filterIndex, 1);
+            renderDistributionTree();
+            setDirty(true);
+        };
+        line.append(combo, remove);
+        return line;
+    }
+
+    function buildRateGroup(originGroup, agency, rateGroup, path) {
+        const row = document.createElement("div");
+        row.className = "tree-group tree-rate-group";
+
+        const main = document.createElement("div");
+        main.className = "rule-main";
+        const name = labelledInput("Rate group name", {
+            type: "text", value: rateGroup.groupName || "", required: true
+        });
+        name.input.oninput = () => { rateGroup.groupName = name.input.value; setDirty(true); };
+        const percent = labelledInput("Distribution %", {
+            type: "number", min: "0", max: "100", step: "0.01",
+            value: toFixedDecimals(rateGroup.costPercent), required: true
+        });
+        bindNumberNormalisation(percent.input, "costPercent", (value) => {
+            rateGroup.costPercent = value;
+        });
+        percent.input.oninput = () => {
+            rateGroup.costPercent = percent.input.value;
+            setDirty(true);
+        };
+        const remove = iconButton("Remove", "Remove rate group");
+        remove.onclick = () => {
+            agency.rateGroups.splice(path.rateGroupIndex, 1);
+            renderDistributionTree();
+            setDirty(true);
+        };
+        main.append(name.wrap, percent.wrap, remove);
+        row.append(main);
+
+        const chips = document.createElement("div");
+        chips.className = "rate-chips";
+        (rateGroup.rates || []).forEach((rate, rateIndex) => {
+            const chip = document.createElement("span");
+            chip.className = "rate-chip";
+            chip.append(document.createTextNode(rate.rateName));
+            const drop = iconButton("×", `Remove ${rate.rateName}`, "rate-chip-remove");
+            drop.onclick = () => {
+                rateGroup.rates.splice(rateIndex, 1);
+                renderDistributionTree();
+                setDirty(true);
+            };
+            chip.append(drop);
+            chips.append(chip);
+        });
+        if (!(rateGroup.rates || []).length) {
+            const empty = document.createElement("span");
+            empty.className = "tree-field-empty";
+            empty.textContent = "No rates yet - this group is not saved until it has one.";
+            chips.append(empty);
+        }
+        row.append(chips);
+
+        const actions = document.createElement("div");
+        actions.className = "rate-actions";
+        actions.append(
+            buildRatePicker(
+                "matching", "+ Add matching rate", originGroup, agency, rateGroup, path
+            ),
+            buildRatePicker(
+                "all", "+ Add any rate on the property",
+                originGroup, agency, rateGroup, path
+            )
+        );
+        row.append(actions);
+        return row;
+    }
+
+    // Two pickers, one component. "matching" only offers rates that reservations
+    // under this branch's origin and agency filters were actually sold on, which
+    // is what makes the list short enough to be useful; "all" is the escape
+    // hatch for a rate that has not been sold yet, and is deliberately a
+    // separate button so the narrowed list is never quietly replaced by the
+    // full one.
+    function buildRatePicker(mode, label, originGroup, agency, rateGroup, path) {
+        const combo = document.createElement("div");
+        combo.className = "combo rate-picker";
+
+        const trigger = document.createElement("button");
+        trigger.type = "button";
+        trigger.className = "text-button";
+        trigger.textContent = label;
+
+        const popup = document.createElement("div");
+        popup.className = "combo-popup rate-popup";
+        popup.setAttribute("role", "listbox");
+        popup.hidden = true;
+
+        const search = document.createElement("input");
+        search.type = "text";
+        search.className = "combo-input rate-search";
+        search.placeholder = "Search rates...";
+        search.setAttribute("aria-label", `Search ${mode === "all" ? "all" : "matching"} rates`);
+        search.setAttribute("autocomplete", "off");
+
+        const list = document.createElement("div");
+        list.className = "rate-options";
+
+        const note = document.createElement("small");
+        note.className = "match-note";
+
+        const api = {root: combo, close};
+        let options = [];
+
+        function sourceRateId(name) {
+            const match = options.find(
+                option => option.name.toLowerCase() === name.toLowerCase()
+            );
+            return (match && match.id) || null;
+        }
+
+        function close() {
+            popup.hidden = true;
+            search.value = "";
+        }
+
+        function draw() {
+            const assigned = CostMatch.rateAssignmentIndex(
+                model.distributionOriginGroups, path
+            );
+            // Rates already in this very group are not "available" either; they
+            // are simply already picked.
+            const own = new Set(
+                (rateGroup.rates || []).map(rate => rate.rateName.toLowerCase())
+            );
+            const selectable = options.filter(option => !own.has(option.name.toLowerCase()));
+            const {free, taken} = CostMatch.partitionOptions(
+                selectable, assigned, search.value
+            );
+
+            list.replaceChildren();
+            for (const item of free) list.append(rateOption(item, null));
+            if (taken.length) {
+                const heading = document.createElement("div");
+                heading.className = "combo-section";
+                heading.textContent = "Already assigned";
+                list.append(heading);
+                for (const item of taken) list.append(rateOption(item, item.owner));
+            }
+            if (!free.length && !taken.length) {
+                const empty = document.createElement("div");
+                empty.className = "combo-empty";
+                empty.textContent = options.length
+                    ? "No rate matches that search."
+                    : emptyReason();
+                list.append(empty);
+            }
+            note.textContent = options.length
+                ? `${free.length} available, ${taken.length} already assigned`
+                : "";
+        }
+
+        function emptyReason() {
+            if (sources && sources.error) return "This hotel's rate list could not be loaded.";
+            if (mode === "all") return "This hotel has no rates in the source.";
+            if (!sourceCapability("rateFromReservations")) {
+                return "Reservations in this mirror carry no rate, so matching "
+                    + "rates cannot be narrowed. Use \"Add any rate\" instead.";
+            }
+            return "No reservations under these filters were sold on a rate.";
+        }
+
+        function rateOption(item, owner) {
+            const option = document.createElement("div");
+            option.className = "combo-option";
+            option.setAttribute("role", "option");
+            const name = document.createElement("span");
+            name.className = "combo-option-name";
+            name.textContent = item.name;
+            option.append(name);
+            if (owner) {
+                option.classList.add("is-assigned");
+                option.setAttribute("aria-disabled", "true");
+                const badge = document.createElement("span");
+                badge.className = "combo-option-group";
+                badge.textContent = owner;
+                option.append(badge);
+                return option;
+            }
+            option.addEventListener("pointerdown", (event) => {
+                event.preventDefault();
+                rateGroup.rates = rateGroup.rates || [];
+                rateGroup.rates.push({
+                    // partitionOptions rebuilds its results as {name} / {name,
+                    // owner} and drops everything else, so the Mews id has to
+                    // be looked back up from the list it came from. Without
+                    // this every saved rate stored a null id and a rate
+                    // renamed in Mews could never be reconciled again.
+                    rateId: sourceRateId(item.name), rateName: item.name
+                });
+                closeOpenCombo();
+                renderDistributionTree();
+                setDirty(true);
+            });
+            return option;
+        }
+
+        trigger.onclick = async () => {
+            if (!popup.hidden) { close(); openCombo = null; return; }
+            closeOpenCombo();
+            popup.hidden = false;
+            openCombo = api;
+            list.replaceChildren(loadingRow());
+            options = mode === "all"
+                ? ((sources && sources.rates) || [])
+                : await matchingRates(originGroup.origins, agency.filters);
+            if (popup.hidden) return;
+            draw();
+            search.focus();
+        };
+        search.addEventListener("input", draw);
+        search.addEventListener("keydown", (event) => {
+            if (event.key === "Enter") event.preventDefault();
+            if (event.key === "Escape") { event.stopPropagation(); close(); openCombo = null; }
+        });
+
+        popup.append(search, list, note);
+        combo.append(trigger, popup);
+        return combo;
+    }
+
+    function loadingRow() {
+        const row = document.createElement("div");
+        row.className = "combo-empty";
+        row.textContent = "Looking up rates...";
+        return row;
+    }
+
+    // ------------------------------------------------------------------
+    // Source lookups for the tree
+    // ------------------------------------------------------------------
+    const rateCache = new Map();
+    const agencyCache = new Map();
+
+    function debounce(run, delayMs) {
+        let timer = null;
+        return (...parameters) => {
+            clearTimeout(timer);
+            timer = setTimeout(() => run(...parameters), delayMs);
+        };
+    }
+
+    function originParameter(origins) {
+        return (origins || []).join(",");
+    }
+
+    async function searchAgencies(term, origins) {
+        // The property has to be part of the key. Without it, searching "boo"
+        // on one hotel served the next hotel's agency names, with the first
+        // hotel's reservation counts.
+        const key = `${loadedEnterpriseId}|${originParameter(origins)}|${term.toLowerCase()}`;
+        if (agencyCache.has(key)) return agencyCache.get(key);
+        try {
+            const parameters = new URLSearchParams({search: term});
+            if (origins && origins.length) parameters.set("origins", originParameter(origins));
+            const payload = await LosApi.fetchJson(
+                `${AGENCIES_API}/${encodeURIComponent(loadedEnterpriseId)}?${parameters}`
+            );
+            const matches = payload.data || [];
+            agencyCache.set(key, matches);
+            return matches;
+        }
+        catch (error) {
+            console.warn("Travel agency lookup failed", error);
+            return [];
+        }
+    }
+
+    // One request per search term, merged. The API narrows by a single term,
+    // and a subgroup with two terms matches the union of both - so the picker
+    // has to show the union too, or it would hide rates the subgroup covers.
+    async function matchingRates(origins, filters) {
+        const terms = (filters || [])
+            .map(rule => String(rule.containsValue || "").trim())
+            .filter(Boolean);
+        const key = `${originParameter(origins)}|${terms.join("|").toLowerCase()}`;
+        if (rateCache.has(key)) return rateCache.get(key);
+
+        const requests = (terms.length ? terms : [""]).map(async (term) => {
+            const parameters = new URLSearchParams();
+            if (origins && origins.length) parameters.set("origins", originParameter(origins));
+            if (term) parameters.set("agency", term);
+            const query = parameters.toString();
+            const payload = await LosApi.fetchJson(
+                `${RATES_API}/${encodeURIComponent(loadedEnterpriseId)}${query ? `?${query}` : ""}`
+            );
+            return (payload.data && payload.data.rates) || [];
+        });
+
+        try {
+            const merged = new Map();
+            for (const rates of await Promise.all(requests)) {
+                for (const rate of rates) {
+                    if (!merged.has(rate.name.toLowerCase())) merged.set(rate.name.toLowerCase(), rate);
+                }
+            }
+            const result = Array.from(merged.values()).sort(
+                (left, right) => left.name.localeCompare(right.name)
+            );
+            rateCache.set(key, result);
+            return result;
+        }
+        catch (error) {
+            console.warn("Matching rate lookup failed", error);
+            return [];
+        }
+    }
+
     // Only one popup may be open at a time; a single document listener closes it
     // rather than each row registering its own (which would leak on re-render).
     let openCombo = null;
@@ -331,278 +1135,6 @@
     document.addEventListener("pointerdown", (event) => {
         if (openCombo && !openCombo.root.contains(event.target)) closeOpenCombo();
     });
-
-    // A real listbox, because a native <datalist> can neither disable an option
-    // nor group options into sections. Values already used by another group get
-    // their own "Already assigned" section at the bottom, greyed out and
-    // labelled with the owning group, and cannot be selected - the same value in
-    // two groups would make the cost percentage ambiguous.
-    function buildMatchRow(group, groupIndex, rule, ruleIndex) {
-        const match = document.createElement("div");
-        match.className = "match-row";
-
-        const type = document.createElement("select");
-        type.setAttribute("aria-label", "Match type");
-        type.add(new Option("Channel", "channel", false, rule.matchType === "channel"));
-        type.add(new Option("Rate", "rate", false, rule.matchType === "rate"));
-
-        const combo = document.createElement("div");
-        combo.className = "combo";
-
-        const listId = `match-options-${groupIndex}-${ruleIndex}`;
-        const value = document.createElement("input");
-        value.className = "combo-input";
-        value.id = `match-value-${groupIndex}-${ruleIndex}`;
-        value.setAttribute("aria-label", "Match value");
-        value.setAttribute("role", "combobox");
-        value.setAttribute("aria-expanded", "false");
-        value.setAttribute("aria-controls", listId);
-        value.setAttribute("aria-autocomplete", "list");
-        value.setAttribute("autocomplete", "off");
-        // Deliberately NOT required. Clicking "+ Add rate or channel match" and
-        // then leaving the row blank is a normal thing to do, and marking it
-        // required made the whole form invalid - so saving everything else
-        // silently failed. Blank rows are pruned on save instead.
-        value.value = rule.matchValue || "";
-        value.placeholder = "Search rates and channels...";
-
-        const popup = document.createElement("div");
-        popup.className = "combo-popup";
-        popup.id = listId;
-        popup.setAttribute("role", "listbox");
-        popup.hidden = true;
-
-        const note = document.createElement("small");
-        note.className = "match-note";
-
-        let selectable = [];
-        let activeIndex = -1;
-
-        function setActive(index) {
-            activeIndex = index;
-            for (const option of popup.querySelectorAll('[role="option"]')) {
-                option.classList.remove("is-active");
-            }
-            const active = selectable[index];
-            if (active) {
-                active.classList.add("is-active");
-                value.setAttribute("aria-activedescendant", active.id);
-                active.scrollIntoView({block: "nearest"});
-            }
-            else {
-                value.removeAttribute("aria-activedescendant");
-            }
-        }
-
-        function buildOption(item, owner, optionIndex) {
-            const option = document.createElement("div");
-            option.id = `${listId}-opt-${optionIndex}`;
-            option.setAttribute("role", "option");
-            option.className = "combo-option";
-
-            const label = document.createElement("span");
-            label.className = "combo-option-name";
-            label.textContent = item.name;
-            option.append(label);
-
-            if (owner) {
-                // Greyed out and inert: aria-disabled keeps it announced but
-                // unselectable, and it is skipped by keyboard navigation.
-                option.classList.add("is-assigned");
-                option.setAttribute("aria-disabled", "true");
-                option.setAttribute("aria-selected", "false");
-                const badge = document.createElement("span");
-                badge.className = "combo-option-group";
-                badge.textContent = owner;
-                option.append(badge);
-            }
-            else {
-                option.setAttribute("aria-selected", String(
-                    item.name.toLowerCase() === String(value.value).trim().toLowerCase()
-                ));
-                option.addEventListener("pointerdown", (event) => {
-                    event.preventDefault();
-                    commit(item.name);
-                });
-            }
-            return option;
-        }
-
-        function renderPopup() {
-            const available = optionsFor(rule.matchType);
-            const assigned = assignmentIndex(rule.matchType, groupIndex, ruleIndex);
-            const {free, taken} = CostMatch.partitionOptions(available, assigned, value.value);
-            const matching = free.concat(taken);
-
-            popup.replaceChildren();
-            let optionIndex = 0;
-
-            if (free.length) {
-                const section = document.createElement("div");
-                section.setAttribute("role", "group");
-                section.setAttribute("aria-label", "Available");
-                if (taken.length) {
-                    const heading = document.createElement("div");
-                    heading.className = "combo-section";
-                    heading.textContent = "Available";
-                    section.append(heading);
-                }
-                for (const item of free) section.append(buildOption(item, null, optionIndex++));
-                popup.append(section);
-            }
-
-            if (taken.length) {
-                const section = document.createElement("div");
-                section.setAttribute("role", "group");
-                section.setAttribute("aria-label", "Already assigned");
-                const heading = document.createElement("div");
-                heading.className = "combo-section";
-                heading.textContent = "Already assigned";
-                section.append(heading);
-                for (const item of taken) {
-                    section.append(buildOption(item, item.owner, optionIndex++));
-                }
-                popup.append(section);
-            }
-
-            if (!matching.length) {
-                const empty = document.createElement("div");
-                empty.className = "combo-empty";
-                empty.textContent = available.length
-                    ? "No match - press Enter to use what you typed."
-                    : (sources && sources.error
-                        ? "This hotel's list could not be loaded. Type the value manually."
-                        : "No values found for this hotel. Type the value manually.");
-                popup.append(empty);
-            }
-
-            selectable = Array.from(popup.querySelectorAll('[role="option"]:not([aria-disabled="true"])'));
-            setActive(selectable.length ? 0 : -1);
-            note.textContent = available.length
-                ? `${free.length} available, ${taken.length} already assigned`
-                : "";
-        }
-
-        function open() {
-            if (!popup.hidden) return;
-            closeOpenCombo();
-            popup.hidden = false;
-            value.setAttribute("aria-expanded", "true");
-            openCombo = api;
-            renderPopup();
-        }
-        function close() {
-            popup.hidden = true;
-            value.setAttribute("aria-expanded", "false");
-            value.removeAttribute("aria-activedescendant");
-            activeIndex = -1;
-        }
-        const api = {root: combo, close};
-
-        function validate(entered) {
-            const assigned = assignmentIndex(rule.matchType, groupIndex, ruleIndex);
-            const owner = assigned.get(entered.toLowerCase());
-            if (owner) {
-                value.setCustomValidity(`"${entered}" is already assigned to ${owner}.`);
-                note.textContent = `Already assigned to ${owner}. Pick another value.`;
-                match.classList.add("is-duplicate");
-            }
-            else {
-                value.setCustomValidity("");
-                match.classList.remove("is-duplicate");
-            }
-        }
-
-        function commit(name) {
-            value.value = name;
-            rule.matchValue = name;
-            validate(name);
-            close();
-            openCombo = null;
-            setDirty(true);
-            // Another row's list changes the moment this one is assigned.
-            refreshSiblingCombos();
-        }
-
-        value.addEventListener("focus", open);
-        value.addEventListener("input", () => {
-            rule.matchValue = value.value.trim();
-            validate(rule.matchValue);
-            setDirty(true);
-            open();
-            renderPopup();
-            // Clearing this row frees its value for the others.
-            refreshSiblingCombos();
-        });
-        value.addEventListener("keydown", (event) => {
-            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-                event.preventDefault();
-                if (popup.hidden) { open(); return; }
-                if (!selectable.length) return;
-                const step = event.key === "ArrowDown" ? 1 : -1;
-                setActive((activeIndex + step + selectable.length) % selectable.length);
-            }
-            else if (event.key === "Enter") {
-                if (!popup.hidden && selectable[activeIndex]) {
-                    event.preventDefault();
-                    commit(selectable[activeIndex].querySelector(".combo-option-name").textContent);
-                }
-                else if (!popup.hidden) {
-                    event.preventDefault();
-                    close();
-                }
-            }
-            else if (event.key === "Escape") {
-                if (!popup.hidden) { event.stopPropagation(); close(); openCombo = null; }
-            }
-            else if (event.key === "Tab") {
-                close();
-                openCombo = null;
-            }
-        });
-
-        type.onchange = () => {
-            rule.matchType = type.value;
-            rule.matchValue = "";
-            value.value = "";
-            value.setCustomValidity("");
-            match.classList.remove("is-duplicate");
-            if (!popup.hidden) renderPopup();
-            setDirty(true);
-        };
-
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.setAttribute("aria-label", "Remove match");
-        remove.textContent = "×";
-        remove.onclick = () => {
-            group.rules.splice(ruleIndex, 1);
-            renderDistribution();
-            setDirty(true);
-        };
-
-        if (rule.matchValue) validate(rule.matchValue);
-        combo.append(value, popup);
-        match.append(type, combo, remove, note);
-        // Re-validating matters as much as re-rendering: if the value that made
-        // this row a duplicate is removed elsewhere, a stale customValidity
-        // would keep blocking the save with a message about a conflict that no
-        // longer exists.
-        match.refreshCombo = () => {
-            if (rule.matchValue) validate(rule.matchValue);
-            else { value.setCustomValidity(""); match.classList.remove("is-duplicate"); }
-            if (!popup.hidden) renderPopup();
-        };
-        return match;
-    }
-
-    // Assigning a value in one group must immediately update every other row,
-    // without a full re-render (which would close the popup being used).
-    function refreshSiblingCombos() {
-        for (const row of document.querySelectorAll(".match-row")) {
-            if (typeof row.refreshCombo === "function") row.refreshCombo();
-        }
-    }
 
     function renderRows(key) {
         const root = document.getElementById(key);
@@ -645,13 +1177,23 @@
     }
     function bindFields(root,item){root.querySelectorAll("[data-field]").forEach(input=>input.addEventListener("input",()=>{item[input.dataset.field]=input.type==="checkbox"?input.checked:input.value;setDirty(true)}))}
     function emptyMessage(root,text){if(!root.children.length){const p=document.createElement("p");p.className="rules-empty";p.textContent=text;root.append(p)}}
-    function removeRow(key,index){model[key].splice(index,1);key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)}
-    function escapeHtml(value){return String(value??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll('"',"&quot;")}
+    function removeRow(key,index){model[key].splice(index,1);renderRows(key);setDirty(true);syncSectionSwitches()}
     function collect() {
         // Money is rounded once here as well as on blur, so a value typed and
         // submitted with Enter (never blurred) is stored at the same precision
         // it is displayed at. The backend rounds again as the last word.
         for (const input of form.querySelectorAll("[name]")) {
+            if (CHECKBOX_FIELDS.has(input.name)) {
+                model.profile[input.name] = input.checked;
+                continue;
+            }
+            // A switched-off section's inputs are disabled, which exempts them
+            // from constraint validation - so a required field left blank in an
+            // off section reaches the save. Sending its empty string would fail
+            // the whole PUT on a field the page has greyed out, which is the
+            // opposite of what switching a cost off should do. The last known
+            // value stands instead.
+            if (input.disabled && input.value === "") continue;
             model.profile[input.name] = LosFormat.isMoneyField(input.name)
                 ? LosFormat.normalizeSekInputValue(input.value)
                 : input.value;
@@ -660,14 +1202,34 @@
             if (row.linenCost === "" || row.linenCost === null || row.linenCost === undefined) continue;
             row.linenCost = LosFormat.normalizeSekInputValue(row.linenCost);
         }
-        // A half-finished match row carries no meaning and the backend rejects a
-        // blank match value outright, which previously failed the entire save.
-        for (const group of model.distributionGroups) {
-            group.rules = (group.rules || []).filter(
-                rule => String(rule.matchValue || "").trim()
-            );
-        }
-        return model;
+        // A half-finished row carries no meaning and the backend rejects a
+        // blank value outright, which previously failed the entire save. An
+        // empty search term is likewise a row someone started and abandoned,
+        // not a filter that matches everything.
+        //
+        // The pruning builds a copy rather than editing the model in place. It
+        // used to splice the model's own arrays, so a save the backend rejected
+        // left the still-mounted rows holding indices into an array that had
+        // shrunk underneath them - and removing the blank row then deleted its
+        // neighbour's typed value instead.
+        return {
+            ...model,
+            distributionGroups: (model.distributionGroups || []).map(group => ({
+                ...group,
+                rules: (group.rules || []).filter(
+                    rule => String(rule.matchValue || "").trim()
+                )
+            })),
+            distributionOriginGroups: (model.distributionOriginGroups || []).map(group => ({
+                ...group,
+                agencyGroups: (group.agencyGroups || []).map(agency => ({
+                    ...agency,
+                    filters: (agency.filters || []).filter(
+                        rule => String(rule.containsValue || "").trim()
+                    )
+                }))
+            }))
+        };
     }
 
     function sectionOf(element) {
@@ -718,6 +1280,7 @@
                 }
             );
             model = payload.data;
+            model.distributionOriginGroups = model.distributionOriginGroups || [];
             loadedEnterpriseId = model.enterpriseId;
             render();
             setDirty(false);
@@ -818,6 +1381,19 @@
     document.querySelectorAll(".settings-nav button").forEach(button => {
         button.onclick = () => showSection(button.dataset.section);
     });
-    document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));key==="distributionGroups"?renderDistribution():renderRows(key);setDirty(true)});
+    document.querySelectorAll("[data-add]").forEach(button=>button.onclick=()=>{const key=button.dataset.add;model[key].push(structuredClone(defaults[key]));renderRows(key);setDirty(true);syncSectionSwitches()});
+    document.querySelector("[data-add-origin-group]").onclick = () => {
+        model.distributionOriginGroups.push(newOriginGroup());
+        renderDistributionTree();
+        setDirty(true);
+    };
+    // The two switches and the franchise basis all change which controls are
+    // live, so they re-sync before the generic dirty handler runs.
+    form.addEventListener("change", (event) => {
+        if (!event.target.name) return;
+        if (CHECKBOX_FIELDS.has(event.target.name) || event.target.name === "franchiseBasis") {
+            syncSectionSwitches();
+        }
+    });
     hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?")){hotel.value=loadedEnterpriseId;return}loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});loadHotels();
 }());

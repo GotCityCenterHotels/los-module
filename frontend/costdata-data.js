@@ -162,19 +162,45 @@
         return amount * numberOf(percent) / 100;
     }
 
+    // A checkbox that has never been saved arrives as undefined, a saved one as
+    // a real boolean, and a form-encoded one as a string. "false" is a
+    // non-empty string and therefore truthy, which is exactly the bug this
+    // avoids.
+    function isEnabled(value, fallback = true) {
+        if (value === undefined || value === null || value === "") return fallback;
+        if (typeof value === "boolean") return value;
+        return !["false", "0", "no", "off"].includes(String(value).trim().toLowerCase());
+    }
+
     // The tier whose [min, max] band contains count. An empty max is an
-    // open-ended top tier. Returns null when no tier matches, which is a
-    // configuration gap rather than a zero cost.
+    // open-ended top tier.
+    //
+    // A count outside every band falls back to the nearest configured band -
+    // the highest whose minimum it clears, or the lowest when it clears none -
+    // rather than contributing no staffing at all. A property that configures
+    // thresholds up to 200 guests and then serves 240 has not said "no staff
+    // above 200"; it has said "this is the top band", and costing that day at
+    // zero hours understated the cost and produced a warning nobody could act
+    // on. Returns null only when there are no tiers at all, which really is a
+    // configuration gap.
     function matchTier(tiers, count, minKey, maxKey) {
-        for (const tier of tiers || []) {
+        const rows = tiers || [];
+        if (!rows.length) return null;
+        let below = null;
+        let lowest = null;
+        for (const tier of rows) {
             const minimum = numberOf(tier[minKey]);
             const rawMaximum = tier[maxKey];
             const maximum = rawMaximum === null || rawMaximum === undefined || rawMaximum === ""
                 ? Infinity
                 : numberOf(rawMaximum);
             if (count >= minimum && count <= maximum) return tier;
+            if (minimum <= count && (below === null || minimum > numberOf(below[minKey]))) {
+                below = tier;
+            }
+            if (lowest === null || minimum < numberOf(lowest[minKey])) lowest = tier;
         }
-        return null;
+        return below || lowest;
     }
 
     function dailyTotals(rows, field) {
@@ -231,20 +257,50 @@
         return totals;
     }
 
-    function calculateGop(data, { hotelName = "", settingsByHotel = {} } = {}) {
-        const source = data || {};
-        const settingsIndex = settingsByHotel || {};
-        const hotels = hotelsInScope(source, hotelName);
-        const totals = zeroTotals();
-        const flags = [];
-        const seenFlags = new Set();
-        const currencies = new Set();
+    // What the franchise percentage is charged on. Every revenue column in the
+    // cost facts is net of VAT, so these are all net figures; the gross basis
+    // grosses the chosen one up by the property's VAT rate rather than reaching
+    // for gross payments, which are a different quantity entirely (they include
+    // deposits, other services and anything settled in the period).
+    const FRANCHISE_REVENUE_BASES = Object.freeze({
+        roomInclProducts: Object.freeze({
+            label: "Room revenue incl. products",
+            of: (r) => r.roomRevenue
+        }),
+        roomExclProducts: Object.freeze({
+            label: "Room revenue excl. products",
+            of: (r) => r.roomRevenueExclProducts
+        }),
+        roomExclProductsPlusParking: Object.freeze({
+            label: "Room revenue excl. products, plus parking",
+            of: (r) => r.roomRevenueExclProducts + r.parkingRevenue
+        }),
+        totalRevenue: Object.freeze({
+            label: "Total revenue",
+            of: (r) => r.roomRevenue + r.parkingRevenue
+        })
+    });
 
-        function flag(message) {
-            if (seenFlags.has(message)) return;
-            seenFlags.add(message);
-            flags.push(message);
-        }
+    function franchiseBaseAmount(profile, revenue) {
+        const base = FRANCHISE_REVENUE_BASES[profile.franchiseRevenueBase]
+            || FRANCHISE_REVENUE_BASES.roomInclProducts;
+        const net = base.of(revenue);
+        return profile.franchiseBasis === "gross"
+            ? net * (1 + numberOf(profile.franchiseVatPercent) / 100)
+            : net;
+    }
+
+    // Unrounded totals for one set of rows. Separated from calculateGop so the
+    // per-period chart and the scope-wide statement run the same arithmetic:
+    // every threshold is still evaluated per stay date, and a stay date belongs
+    // to exactly one period, so the periods partition the scope exactly.
+    //
+    // Their *rounded* figures can still differ from the statement's by a krona
+    // or two, because each period is rounded to whole kronor on its own and the
+    // statement rounds the scope total once. The statement is the authority;
+    // the chart is a shape, and half a krona per bar is not visible on it.
+    function accumulate(source, hotels, settingsIndex, flag, currencies) {
+        const totals = zeroTotals();
 
         for (const hotel of hotels) {
             const settings = settingsIndex[hotel];
@@ -261,6 +317,12 @@
             const excluded = new Map();
             const roomRevenue = currencyTotal(
                 roomRevenueRows, "roomRevenueInclProducts1Net", currency, excluded
+            );
+            // Needed on its own for the franchise basis "room revenue minus
+            // products", which is the room line with breakfast and every other
+            // sold product taken out of it.
+            const roomRevenueExclProducts = currencyTotal(
+                roomRevenueRows, "roomRevenueExclProducts1Net", currency, new Map()
             );
             const paymentsGross = currencyTotal(
                 paymentRows, "totalPaymentAmountGrossValue", currency, excluded
@@ -294,13 +356,11 @@
             const breakfastTiers = settings.breakfastTiers || [];
             let breakfastGuests = 0;
             let breakfastStaffHours = 0;
-            let unmatchedBreakfastDays = 0;
             for (const guests of guestsPerDay.values()) {
                 breakfastGuests += guests;
                 if (guests <= 0) continue;
                 const tier = matchTier(breakfastTiers, guests, "minGuests", "maxGuests");
                 if (tier) breakfastStaffHours += numberOf(tier.staffHours);
-                else unmatchedBreakfastDays += 1;
             }
             if (profile.breakfastCalculationBasis === "products") {
                 flag(
@@ -315,12 +375,6 @@
                     + "cost covers food only."
                 );
             }
-            else if (unmatchedBreakfastDays) {
-                flag(
-                    `${hotel}: ${unmatchedBreakfastDays} day(s) had a breakfast guest count `
-                    + "outside every configured threshold, so no staff hours were applied to them."
-                );
-            }
             totals.breakfastCost +=
                 breakfastGuests * numberOf(profile.breakfastFoodCostPerGuest)
                 + breakfastStaffHours * numberOf(profile.breakfastStaffCostPerHour);
@@ -329,29 +383,47 @@
             totals.distributionCost += percentOf(
                 roomRevenue, profile.distributionDefaultPercent
             );
-            if ((settings.distributionGroups || []).length) {
+            const hasDistributionTree = (settings.distributionOriginGroups || []).length
+                || (settings.distributionGroups || []).length;
+            if (hasDistributionTree) {
                 flag(
                     `${hotel}: the fallback distribution % was applied to all room revenue. `
-                    + "Per-group percentages need a rate or channel breakdown, which the cost "
-                    + "fact tables do not carry."
+                    + "The per-origin, per-agency and per-rate percentages need a reservation "
+                    + "level breakdown, which the cost fact tables do not carry - they hold one "
+                    + "revenue total per stay date."
                 );
             }
 
             // --- Franchise & card ----------------------------------------------
-            // Cost Input has no field called "franchise". The closest configured
-            // values are the three rent percentages under "Rent & cards", which
-            // are charged on the matching net revenue stream, plus the card cost
-            // percentage on gross payments. Both are flagged, not assumed.
+            // The franchise fee on its configured revenue base, the card cost
+            // percentage on gross payments, and the three rent percentages on
+            // their matching net revenue stream. Franchise is skipped entirely
+            // when the property has it switched off, rather than costed at 0%,
+            // so an unconfigured percentage cannot quietly become a real one.
+            let franchiseCost = 0;
+            if (isEnabled(profile.franchiseEnabled, false)) {
+                franchiseCost = percentOf(
+                    franchiseBaseAmount(profile, {
+                        roomRevenue,
+                        roomRevenueExclProducts,
+                        parkingRevenue
+                    }),
+                    profile.franchisePercent
+                );
+                if (profile.franchiseBasis === "gross") {
+                    flag(
+                        `${hotel}: the franchise fee is charged on a gross basis, so its net `
+                        + `revenue base was grossed up by ${numberOf(profile.franchiseVatPercent)}% `
+                        + "VAT. Every revenue column in the cost facts is net of VAT."
+                    );
+                }
+            }
             totals.franchiseCardCost +=
-                percentOf(roomRevenue, profile.roomRentPercent)
+                franchiseCost
+                + percentOf(roomRevenue, profile.roomRentPercent)
                 + percentOf(breakfastRevenue, profile.breakfastRentPercent)
                 + percentOf(parkingRevenue, profile.parkingRentPercent)
                 + percentOf(paymentsGross, profile.cardCostPercent);
-            flag(
-                "Franchise & card cost is the card cost % on gross payments plus the room, "
-                + "breakfast and parking rent % on their net revenue. Cost Input has no "
-                + "dedicated franchise % field."
-            );
             if (numberOf(profile.breakfastRentPercent) > 0) {
                 flag(
                     `${hotel}: breakfast rent % was applied to the source column `
@@ -383,35 +455,37 @@
             }
 
             // --- Arrivals ---------------------------------------------------------
+            // A property that does not staff reception by arrival volume turns
+            // this off. That is a decision, so it produces neither a cost nor a
+            // warning - unlike an empty threshold list, which is an omission.
+            if (!isEnabled(profile.arrivalCostEnabled)) continue;
+
             const arrivalsPerDay = dailyTotals(movementRows, "totalArrivals");
             const arrivalTiers = settings.arrivalTiers || [];
             let receptionHours = 0;
-            let unmatchedArrivalDays = 0;
             let totalArrivals = 0;
             for (const arrivals of arrivalsPerDay.values()) {
                 totalArrivals += arrivals;
                 if (arrivals <= 0) continue;
                 const tier = matchTier(arrivalTiers, arrivals, "minArrivals", "maxArrivals");
                 if (tier) receptionHours += numberOf(tier.receptionHours);
-                else unmatchedArrivalDays += 1;
             }
             if (!arrivalTiers.length && totalArrivals > 0) {
                 flag(
                     `${hotel}: no reception staffing thresholds are configured, so arrival cost `
-                    + "is zero."
-                );
-            }
-            else if (unmatchedArrivalDays) {
-                flag(
-                    `${hotel}: ${unmatchedArrivalDays} day(s) had an arrival count outside every `
-                    + "configured threshold, so no reception hours were applied to them."
+                    + "is zero. Switch arrival cost off in Cost Input if that is deliberate."
                 );
             }
             totals.arrivalCost += receptionHours * numberOf(profile.receptionCostPerHour);
         }
 
-        // Each line is rounded to whole kronor once, and GOP is derived from the
-        // rounded lines, so the statement always adds up on screen.
+        return totals;
+    }
+
+    // Rounds one set of unrounded totals into the statement rows. Each line is
+    // rounded to whole kronor once and GOP is derived from the rounded lines,
+    // so the statement always adds up on screen.
+    function toAmounts(totals) {
         const amounts = {};
         for (const {key} of GOP_LINES) {
             if (key === "gop") continue;
@@ -419,12 +493,82 @@
         }
         amounts.gop = REVENUE_KEYS.reduce((running, key) => running + amounts[key], 0)
             - COST_KEYS.reduce((running, key) => running + amounts[key], 0);
+        return amounts;
+    }
+
+    // The same rows, split into the buckets the chart draws. Every dataset is
+    // partitioned by the period its stay date falls in, so no row is counted
+    // twice and none is dropped.
+    function splitByPeriod(source, grain) {
+        const buckets = new Map();
+        for (const [dataset, rows] of Object.entries(source || {})) {
+            for (const row of rows || []) {
+                if (!row || !row.stayDate) continue;
+                const key = periodKey(row.stayDate, grain);
+                let bucket = buckets.get(key);
+                if (!bucket) {
+                    bucket = {};
+                    buckets.set(key, bucket);
+                }
+                (bucket[dataset] || (bucket[dataset] = [])).push(row);
+            }
+        }
+        return new Map([...buckets].sort(
+            ([left], [right]) => left.localeCompare(right)
+        ));
+    }
+
+    function calculateGop(
+        data, { hotelName = "", settingsByHotel = {}, grain = "" } = {}
+    ) {
+        const source = data || {};
+        const settingsIndex = settingsByHotel || {};
+        const hotels = hotelsInScope(source, hotelName);
+        const flags = [];
+        const seenFlags = new Set();
+        const currencies = new Set();
+
+        function flag(message) {
+            if (seenFlags.has(message)) return;
+            seenFlags.add(message);
+            flags.push(message);
+        }
+
+        const totals = accumulate(source, hotels, settingsIndex, flag, currencies);
+        const amounts = toAmounts(totals);
+
+        // Periods are only computed when a grain is asked for: the statement
+        // itself needs one set of numbers, and bucketing every dataset is not
+        // free on a year of daily rows.
+        const periods = [];
+        if (grain) {
+            const ignore = () => {};
+            for (const [key, bucket] of splitByPeriod(source, grain)) {
+                const bucketTotals = accumulate(
+                    bucket, hotelsInScope(bucket, hotelName), settingsIndex,
+                    ignore, new Set()
+                );
+                const bucketAmounts = toAmounts(bucketTotals);
+                periods.push({
+                    periodKey: key,
+                    amounts: bucketAmounts,
+                    revenue: REVENUE_KEYS.reduce(
+                        (running, name) => running + bucketAmounts[name], 0
+                    ),
+                    cost: COST_KEYS.reduce(
+                        (running, name) => running + bucketAmounts[name], 0
+                    ),
+                    gop: bucketAmounts.gop
+                });
+            }
+        }
 
         return {
             currency: currencies.size === 1 ? Array.from(currencies)[0] : "SEK",
             hotels,
             lines: GOP_LINES.map((line) => ({...line, amount: amounts[line.key]})),
             gop: amounts.gop,
+            periods,
             flags
         };
     }
@@ -432,10 +576,16 @@
     const api = {
         DATASET_RULES,
         GOP_LINES,
+        FRANCHISE_REVENUE_BASES,
         periodKey,
         aggregate,
         summarize,
-        calculateGop
+        calculateGop,
+        // Exported for the tests: the nearest-band fallback and the checkbox
+        // coercion are both easy to get subtly wrong and neither is reachable
+        // through calculateGop without building a whole fixture.
+        matchTier,
+        isEnabled
     };
     if (typeof module === "object" && module.exports) module.exports = api;
     root.CostData = api;

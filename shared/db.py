@@ -14,9 +14,29 @@ def _setting(*names, default=None):
     raise KeyError(names[0])
 
 
-def get_export_connection():
+# Background jobs (LOS sync, Supplement sync, sql_runner) legitimately run for
+# minutes, so the default ceiling stays where it has always been. A page request
+# is a different animal: the browser aborts at 40s (frontend/los-api.js) and
+# Static Web Apps kills a linked-backend call at ~45s, so a query that outlives
+# that is pure waste - it keeps burning an integration_db backend long after the
+# client gave up, and an impatient reload leaves several of them running at once.
+# HTTP read paths pass their own, tighter ceiling.
+DEFAULT_EXPORT_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("EXPORT_STATEMENT_TIMEOUT_MS", "300000")
+)
+HTTP_EXPORT_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("EXPORT_HTTP_STATEMENT_TIMEOUT_MS", "40000")
+)
+
+
+def get_export_connection(statement_timeout_ms=None):
     # Database B: integration_db. All export, LOS, cost-source, and Supplement
     # access is read-only at both the role and session level.
+    timeout_ms = int(
+        DEFAULT_EXPORT_STATEMENT_TIMEOUT_MS
+        if statement_timeout_ms is None
+        else statement_timeout_ms
+    )
     return psycopg.connect(
         host=_setting(
             "INTEGRATION_DB_HOST",
@@ -54,7 +74,10 @@ def get_export_connection():
             default="require",
         ),
         connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
-        options="-c default_transaction_read_only=on -c statement_timeout=300000",
+        options=(
+            "-c default_transaction_read_only=on "
+            f"-c statement_timeout={timeout_ms}"
+        ),
         row_factory=dict_row,
     )
 

@@ -1,7 +1,11 @@
 import logging
+import os
 
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from threading import Lock
+from time import monotonic
+
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
@@ -32,6 +36,8 @@ PROFILE_FIELDS = (
     "reception_cost_per_hour", "room_rent_percent", "breakfast_calculation_basis",
     "breakfast_food_cost_per_guest", "breakfast_staff_cost_per_hour",
     "breakfast_rent_percent", "parking_rent_percent", "card_cost_percent",
+    "arrival_cost_enabled", "franchise_enabled", "franchise_percent",
+    "franchise_basis", "franchise_revenue_base", "franchise_vat_percent",
 )
 
 DEFAULT_PROFILE = {
@@ -40,6 +46,27 @@ DEFAULT_PROFILE = {
     "roomRentPercent": "0", "breakfastCalculationBasis": "guests", "breakfastFoodCostPerGuest": "0",
     "breakfastStaffCostPerHour": "0", "breakfastRentPercent": "0",
     "parkingRentPercent": "0", "cardCostPercent": "2",
+    # Arrival costing stays on by default: switching it off is a decision the
+    # property makes, and defaulting to off would silently zero a cost line on
+    # every property that has not been re-saved since this field existed.
+    "arrivalCostEnabled": True,
+    # Franchise defaults off. A property that pays no franchise fee must not
+    # acquire one just because the field now exists.
+    "franchiseEnabled": False, "franchisePercent": "0",
+    "franchiseBasis": "net", "franchiseRevenueBase": "roomInclProducts",
+    "franchiseVatPercent": "12",
+}
+
+# Not money and not a plain percentage - these are the fields validate must not
+# push through _number.
+BOOLEAN_PROFILE_FIELDS = frozenset({"arrivalCostEnabled", "franchiseEnabled"})
+CHOICE_PROFILE_FIELDS = {
+    "breakfastCalculationBasis": ("guests", "products"),
+    "franchiseBasis": ("net", "gross"),
+    "franchiseRevenueBase": (
+        "roomInclProducts", "roomExclProducts",
+        "roomExclProductsPlusParking", "totalRevenue",
+    ),
 }
 
 SOURCE_PROPERTIES_SQL = """
@@ -88,6 +115,67 @@ IMPORTED_PROPERTIES_SQL = """
 """
 
 
+# The distribution tree in one round trip. Reading it level by level would be
+# four queries per property and sixteen on the dashboard's all-property read;
+# nesting it in json keeps the shape the editor wants without the fan-out.
+# Every numeric is cast to text so a nested percentage arrives in the same
+# string form as a top-level one, rather than as a JSON float.
+_DISTRIBUTION_TREE_SELECT = """
+    SELECT
+        og.enterprise_id,
+        og.group_name,
+        og.fallback_percent,
+        coalesce((
+            SELECT json_agg(ov.origin_value ORDER BY ov.origin_value)
+            FROM functions.cost_distribution_origin_values ov
+            WHERE ov.origin_group_id = og.origin_group_id
+        ), '[]') AS origins,
+        coalesce((
+            SELECT json_agg(json_build_object(
+                'groupName', ag.group_name,
+                'fallbackPercent', ag.fallback_percent::text,
+                'filters', coalesce((
+                    SELECT json_agg(json_build_object(
+                        'matchField', af.match_field,
+                        'containsValue', af.contains_value
+                    ) ORDER BY af.agency_filter_id)
+                    FROM functions.cost_distribution_agency_filters af
+                    WHERE af.agency_group_id = ag.agency_group_id
+                ), '[]'),
+                'rateGroups', coalesce((
+                    SELECT json_agg(json_build_object(
+                        'groupName', rg.group_name,
+                        'costPercent', rg.cost_percent::text,
+                        'rates', coalesce((
+                            SELECT json_agg(json_build_object(
+                                'rateId', rv.rate_id,
+                                'rateName', rv.rate_name
+                            ) ORDER BY rv.rate_name)
+                            FROM functions.cost_distribution_rate_values rv
+                            WHERE rv.rate_group_id = rg.rate_group_id
+                        ), '[]')
+                    ) ORDER BY rg.sort_order, rg.rate_group_id)
+                    FROM functions.cost_distribution_rate_groups rg
+                    WHERE rg.agency_group_id = ag.agency_group_id
+                ), '[]')
+            ) ORDER BY ag.sort_order, ag.agency_group_id)
+            FROM functions.cost_distribution_agency_groups ag
+            WHERE ag.origin_group_id = og.origin_group_id
+        ), '[]') AS agency_groups
+    FROM functions.cost_distribution_origin_groups og
+"""
+
+DISTRIBUTION_TREE_SQL = (
+    _DISTRIBUTION_TREE_SELECT
+    + " WHERE og.enterprise_id = %s ORDER BY og.sort_order, og.origin_group_id"
+)
+
+ALL_DISTRIBUTION_TREES_SQL = (
+    _DISTRIBUTION_TREE_SELECT
+    + " ORDER BY og.enterprise_id, og.sort_order, og.origin_group_id"
+)
+
+
 def _camel(name):
     parts = name.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
@@ -95,6 +183,20 @@ def _camel(name):
 
 def _json_row(row):
     return {_camel(key): str(value) if isinstance(value, Decimal) else value for key, value in row.items()}
+
+
+def _origin_group_json(row):
+    """One origin group, with its subgroups already nested by the query."""
+    return {
+        "groupName": row["group_name"],
+        "fallbackPercent": (
+            str(row["fallback_percent"])
+            if isinstance(row["fallback_percent"], Decimal)
+            else row["fallback_percent"]
+        ),
+        "origins": list(row["origins"] or []),
+        "agencyGroups": list(row["agency_groups"] or []),
+    }
 
 
 def _property_json(row):
@@ -145,7 +247,47 @@ def _get_mirrored_property(enterprise_id):
     return _property_json(row) if row is not None else None
 
 
+# Both bootstrap writes below are idempotent and, in steady state, write
+# nothing at all - the nightly properties pipeline already owns the mirror. They
+# still cost a write transaction, a commit and (for the mirror) a real heap
+# update per page load, because ON CONFLICT DO UPDATE touches last_seen_at
+# unconditionally. Remembering what this worker has already written keeps the
+# bootstrap behaviour on a cold worker and takes it off the hot path.
+_MIRROR_MEMO_SECONDS = float(os.environ.get("COST_PROPERTY_MEMO_SECONDS", "900"))
+_mirrored_memo = {}
+_preloaded_memo = {}
+_memo_lock = Lock()
+
+
+def _memo_unseen(memo, properties):
+    """The properties this worker has not written recently, and a commit hook."""
+    now = monotonic()
+    with _memo_lock:
+        pending = [
+            record for record in properties
+            if memo.get(record["enterpriseId"], 0) <= now
+        ]
+
+    def remember():
+        deadline = monotonic() + _MIRROR_MEMO_SECONDS
+        with _memo_lock:
+            for record in pending:
+                memo[record["enterpriseId"]] = deadline
+
+    return pending, remember
+
+
+def _reset_property_memo():
+    """Test seam - the memo is keyed by enterprise id only."""
+    with _memo_lock:
+        _mirrored_memo.clear()
+        _preloaded_memo.clear()
+
+
 def _upsert_mirrored_properties(properties):
+    if not properties:
+        return
+    properties, remember = _memo_unseen(_mirrored_memo, properties)
     if not properties:
         return
     with cost_pool.connection() as connection:
@@ -173,6 +315,7 @@ def _upsert_mirrored_properties(properties):
                     for property_row in properties
                 ],
             )
+    remember()
 
 
 def _get_imported_property(enterprise_id):
@@ -211,6 +354,10 @@ def _preload_property_settings(properties):
     if not properties:
         return
 
+    properties, remember = _memo_unseen(_preloaded_memo, properties)
+    if not properties:
+        return
+
     ensure_cost_settings_schema()
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
@@ -225,6 +372,7 @@ def _preload_property_settings(properties):
                     for property_row in properties
                 ],
             )
+    remember()
 
 
 def list_cost_settings_hotels():
@@ -389,11 +537,26 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
                 cursor.execute(query, (enterprise_id,))
                 collections[name] = [_json_row(row) for row in cursor.fetchall()]
 
+            # Appended after the collections above, deliberately: the bulk
+            # settings tests feed result sets positionally, so a query inserted
+            # in the middle would silently hand one table's rows to another.
+            cursor.execute(DISTRIBUTION_TREE_SQL, (enterprise_id,))
+            origin_groups = [
+                _origin_group_json(row) for row in cursor.fetchall()
+            ]
+
     profile.pop("hotelName", None)
     profile.pop("enterpriseId", None)
     profile.pop("updatedAt", None)
     resolved_name = profile_row["hotel_name"] if profile_row else hotel_name
-    return {"enterpriseId": enterprise_id, "hotelName": resolved_name, "profile": profile, "distributionGroups": distribution, **collections}
+    return {
+        "enterpriseId": enterprise_id,
+        "hotelName": resolved_name,
+        "profile": profile,
+        "distributionGroups": distribution,
+        "distributionOriginGroups": origin_groups,
+        **collections,
+    }
 
 
 COLLECTION_QUERIES = {
@@ -452,10 +615,17 @@ def fetch_all_cost_settings():
                 cursor.execute(query)
                 collections[name] = cursor.fetchall()
 
+            cursor.execute(ALL_DISTRIBUTION_TREES_SQL)
+            origin_groups = cursor.fetchall()
+
     by_enterprise = defaultdict(lambda: defaultdict(list))
     for row in groups:
         by_enterprise[row["enterprise_id"]]["distributionGroups"].append(
             _json_row({key: value for key, value in row.items() if key != "enterprise_id"})
+        )
+    for row in origin_groups:
+        by_enterprise[row["enterprise_id"]]["distributionOriginGroups"].append(
+            _origin_group_json(row)
         )
     for name, rows in collections.items():
         for row in rows:
@@ -477,6 +647,7 @@ def fetch_all_cost_settings():
             "hotelName": hotel_name,
             "profile": profile,
             "distributionGroups": owned.get("distributionGroups", []),
+            "distributionOriginGroups": owned.get("distributionOriginGroups", []),
             **{name: owned.get(name, []) for name in COLLECTION_QUERIES},
         }
     return settings_by_hotel
@@ -502,6 +673,18 @@ def _number(value, label, maximum=None, integer=False, money=False):
     # Rounding after the range checks, so 100.4 on a percent field is still
     # rejected rather than quietly becoming 100.
     return _round_sek(result) if money else result
+
+
+def _boolean(value):
+    # An unchecked checkbox is absent from a form post and a checked one arrives
+    # as the string "on" or "true"; JSON sends a real bool. All three mean the
+    # same thing and none of them may become the string "false" - which is
+    # truthy - on the way to a boolean column.
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "on", "yes", "1"}
 
 
 def _required_text(value, label, max_length=200):
@@ -533,6 +716,187 @@ def _validate_ranges(rows, min_key, max_key, label):
     return ranges
 
 
+AGENCY_MATCH_FIELDS = frozenset({"travelAgency", "company", "channel"})
+
+
+def _tree_percent(value, label):
+    """A percentage on one level of the tree, defaulting to zero when absent.
+
+    Every level's column has DEFAULT 0, and a level the operator created but
+    never typed a percentage into means "charge nothing extra here" - not "this
+    payload is malformed". The editor marks these inputs required, so a blank
+    one only reaches this point from a hand-built request.
+    """
+    if value in (None, ""):
+        return Decimal("0")
+    return _number(value, label, 100)
+
+
+def _unique_names(names, label):
+    seen = set()
+    for name in names:
+        folded = name.casefold()
+        if folded in seen:
+            raise ValueError(f"{label} names must be unique")
+        seen.add(folded)
+
+
+def _entries(value, label):
+    """A list of dicts from a JSON payload, or a clear rejection.
+
+    This endpoint is anonymous and the tree is four levels of nested arrays, so
+    every level checks its own shape. Iterating a bare string would otherwise
+    walk it character by character and save each letter as its own row, and a
+    string where an object was expected would surface as an AttributeError -
+    a 500, not the 400 a malformed request deserves.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValueError(f"Each entry in {label} must be an object")
+    return value
+
+
+def _texts(value, label):
+    """A list of plain strings from a JSON payload."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError(f"Each entry in {label} must be text")
+    return value
+
+
+def _validate_distribution_tree(origin_groups):
+    """The three-level distribution rulebook: origin -> agency -> rates.
+
+    Deeper levels override shallower ones, so a level that matches nothing is
+    rejected outright rather than saved: an origin group with no origins, or an
+    agency subgroup with no filter, would either match everything or nothing
+    depending on how the cost algorithm reads it, and neither is what anyone
+    meant when they created it.
+    """
+    clean_groups = []
+    for index, group in enumerate(_entries(origin_groups, "distributionOriginGroups")):
+        group_label = f"Distribution group {index + 1}"
+        name = _required_text(group.get("groupName"), f"{group_label} name")
+
+        origins = []
+        for origin in _texts(group.get("origins"), f"{name} origins"):
+            value = str(origin or "").strip()
+            if not value:
+                continue
+            if len(value) > 250:
+                raise ValueError(f"{name}: an origin value is too long")
+            if value.casefold() not in {existing.casefold() for existing in origins}:
+                origins.append(value)
+
+        agency_groups = []
+        for agency_index, agency in enumerate(
+            _entries(group.get("agencyGroups"), f"{name} subgroups")
+        ):
+            agency_label = f"{name} subgroup {agency_index + 1}"
+            agency_name = _required_text(agency.get("groupName"), f"{agency_label} name")
+
+            filters = []
+            for rule in _entries(agency.get("filters"), f"{agency_name} filters"):
+                contains = str(rule.get("containsValue") or "").strip()
+                if not contains:
+                    continue
+                match_field = rule.get("matchField") or "travelAgency"
+                if match_field not in AGENCY_MATCH_FIELDS:
+                    raise ValueError(
+                        f"{agency_name}: filter field must be one of "
+                        f"{', '.join(sorted(AGENCY_MATCH_FIELDS))}"
+                    )
+                if len(contains) > 250:
+                    raise ValueError(f"{agency_name}: a search term is too long")
+                key = (match_field, contains.casefold())
+                if key in {(f["matchField"], f["containsValue"].casefold()) for f in filters}:
+                    continue
+                filters.append({"matchField": match_field, "containsValue": contains})
+
+            rate_groups = []
+            for rate_index, rate_group in enumerate(
+                _entries(agency.get("rateGroups"), f"{agency_name} rate groups")
+            ):
+                rate_label = f"{agency_name} rate group {rate_index + 1}"
+                rate_group_name = _required_text(
+                    rate_group.get("groupName"), f"{rate_label} name"
+                )
+                rates = []
+                seen_rates = set()
+                for rate in _entries(rate_group.get("rates"), f"{rate_group_name} rates"):
+                    rate_name = str(rate.get("rateName") or "").strip()
+                    if not rate_name:
+                        continue
+                    if len(rate_name) > 250:
+                        raise ValueError(f"{rate_group_name}: a rate name is too long")
+                    if rate_name.casefold() in seen_rates:
+                        continue
+                    seen_rates.add(rate_name.casefold())
+                    rate_id = rate.get("rateId")
+                    rates.append({
+                        "rateId": (
+                            None if rate_id in (None, "")
+                            else _required_text(rate_id, "Rate ID", 250)
+                        ),
+                        "rateName": rate_name,
+                    })
+                if not rates:
+                    raise ValueError(
+                        f"{rate_group_name} has no rates. Add at least one rate "
+                        "or remove the group."
+                    )
+                rate_groups.append({
+                    "groupName": rate_group_name,
+                    "costPercent": _tree_percent(
+                        rate_group.get("costPercent"), f"{rate_group_name} percent"
+                    ),
+                    "rates": rates,
+                })
+            _unique_names([entry["groupName"] for entry in rate_groups], agency_name)
+
+            if not filters and not rate_groups:
+                raise ValueError(
+                    f"{agency_name} has no travel agency filter and no rate "
+                    "groups, so it would never match anything. Add a filter or "
+                    "remove the subgroup."
+                )
+            agency_groups.append({
+                "groupName": agency_name,
+                "fallbackPercent": _tree_percent(
+                    agency.get("fallbackPercent"), f"{agency_name} percent"
+                ),
+                "filters": filters,
+                "rateGroups": rate_groups,
+            })
+        _unique_names([entry["groupName"] for entry in agency_groups], name)
+
+        if not origins and not agency_groups:
+            raise ValueError(
+                f"{name} has no origins and no subgroups, so it would never "
+                "match anything. Pick at least one origin or remove the group."
+            )
+        clean_groups.append({
+            "groupName": name,
+            "fallbackPercent": _tree_percent(
+                group.get("fallbackPercent"), f"{name} percent"
+            ),
+            "origins": origins,
+            "agencyGroups": agency_groups,
+        })
+    _unique_names(
+        [group["groupName"] for group in clean_groups], "Distribution group"
+    )
+    return clean_groups
+
+
 def validate_cost_settings(enterprise_id, hotel_name, payload):
     enterprise_id = _required_text(enterprise_id, "Enterprise ID", 50)
     hotel_name = _required_text(hotel_name, "Hotel", 250)
@@ -540,15 +904,23 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
     currency = _required_text(profile.get("currency", "SEK"), "Currency", 3).upper()
     if len(currency) != 3 or not currency.isalpha():
         raise ValueError("Currency must be a three-letter code")
-    percent_fields = {"distributionDefaultPercent", "roomRentPercent", "breakfastRentPercent", "parkingRentPercent", "cardCostPercent"}
+    percent_fields = {
+        "distributionDefaultPercent", "roomRentPercent", "breakfastRentPercent",
+        "parkingRentPercent", "cardCostPercent", "franchisePercent",
+        "franchiseVatPercent",
+    }
     clean_profile = {"currency": currency}
     for database_field in PROFILE_FIELDS[1:]:
         key = _camel(database_field)
-        if key == "breakfastCalculationBasis":
-            basis = profile.get(key, "guests")
-            if basis not in {"guests", "products"}:
-                raise ValueError("Breakfast calculation basis must be guests or products")
-            clean_profile[key] = basis
+        if key in CHOICE_PROFILE_FIELDS:
+            allowed = CHOICE_PROFILE_FIELDS[key]
+            value = profile.get(key, DEFAULT_PROFILE[key])
+            if value not in allowed:
+                raise ValueError(f"{key} must be one of {', '.join(allowed)}")
+            clean_profile[key] = value
+            continue
+        if key in BOOLEAN_PROFILE_FIELDS:
+            clean_profile[key] = _boolean(profile.get(key, DEFAULT_PROFILE[key]))
             continue
         clean_profile[key] = _number(
             profile.get(key, DEFAULT_PROFILE[key]),
@@ -571,6 +943,10 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
             if match_type not in {"rate", "channel"}: raise ValueError("Distribution match type must be rate or channel")
             rules.append({"matchType": match_type, "matchValue": _required_text(rule.get("matchValue"), "Distribution match value")})
         result["distributionGroups"].append({"groupName": name, "costPercent": _number(group.get("costPercent"), f"{name} percent", 100), "rules": rules})
+
+    result["distributionOriginGroups"] = _validate_distribution_tree(
+        payload.get("distributionOriginGroups") or []
+    )
 
     # Cleaning is keyed by (room category, occupancy): a category serving 2 + 1
     # extra beds has three rows, because linen and minutes differ per occupancy.
@@ -608,6 +984,112 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
     return result
 
 
+_PROFILE_UPSERT_SQL = """
+    INSERT INTO functions.cost_property_settings (
+        enterprise_id, currency, distribution_default_percent,
+        cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent,
+        breakfast_calculation_basis, breakfast_food_cost_per_guest,
+        breakfast_staff_cost_per_hour, breakfast_rent_percent,
+        parking_rent_percent, card_cost_percent, arrival_cost_enabled,
+        franchise_enabled, franchise_percent, franchise_basis,
+        franchise_revenue_base, franchise_vat_percent
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (enterprise_id) DO UPDATE SET
+        currency = EXCLUDED.currency,
+        distribution_default_percent = EXCLUDED.distribution_default_percent,
+        cleaning_cost_per_minute = EXCLUDED.cleaning_cost_per_minute,
+        reception_cost_per_hour = EXCLUDED.reception_cost_per_hour,
+        room_rent_percent = EXCLUDED.room_rent_percent,
+        breakfast_calculation_basis = EXCLUDED.breakfast_calculation_basis,
+        breakfast_food_cost_per_guest = EXCLUDED.breakfast_food_cost_per_guest,
+        breakfast_staff_cost_per_hour = EXCLUDED.breakfast_staff_cost_per_hour,
+        breakfast_rent_percent = EXCLUDED.breakfast_rent_percent,
+        parking_rent_percent = EXCLUDED.parking_rent_percent,
+        card_cost_percent = EXCLUDED.card_cost_percent,
+        arrival_cost_enabled = EXCLUDED.arrival_cost_enabled,
+        franchise_enabled = EXCLUDED.franchise_enabled,
+        franchise_percent = EXCLUDED.franchise_percent,
+        franchise_basis = EXCLUDED.franchise_basis,
+        franchise_revenue_base = EXCLUDED.franchise_revenue_base,
+        franchise_vat_percent = EXCLUDED.franchise_vat_percent,
+        updated_at = now()
+"""
+
+
+def _insert_distribution_tree(cursor, enterprise_id, origin_groups):
+    """Rewrite the whole tree for one property.
+
+    Written top-down with RETURNING rather than in three executemany passes: the
+    child rows key off identity columns that only exist once the parent row is
+    in, and generating them per level would need a second read to find out what
+    the parents were called.
+    """
+    for order, group in enumerate(origin_groups):
+        cursor.execute(
+            """
+            INSERT INTO functions.cost_distribution_origin_groups (
+                enterprise_id, group_name, fallback_percent, sort_order
+            )
+            VALUES (%s,%s,%s,%s)
+            RETURNING origin_group_id
+            """,
+            (enterprise_id, group["groupName"], group["fallbackPercent"], order),
+        )
+        origin_group_id = cursor.fetchone()[0]
+        cursor.executemany(
+            "INSERT INTO functions.cost_distribution_origin_values "
+            "(origin_group_id, origin_value) VALUES (%s,%s)",
+            [(origin_group_id, origin) for origin in group["origins"]],
+        )
+        for agency_order, agency in enumerate(group["agencyGroups"]):
+            cursor.execute(
+                """
+                INSERT INTO functions.cost_distribution_agency_groups (
+                    origin_group_id, group_name, fallback_percent, sort_order
+                )
+                VALUES (%s,%s,%s,%s)
+                RETURNING agency_group_id
+                """,
+                (
+                    origin_group_id, agency["groupName"],
+                    agency["fallbackPercent"], agency_order,
+                ),
+            )
+            agency_group_id = cursor.fetchone()[0]
+            cursor.executemany(
+                "INSERT INTO functions.cost_distribution_agency_filters "
+                "(agency_group_id, match_field, contains_value) VALUES (%s,%s,%s)",
+                [
+                    (agency_group_id, rule["matchField"], rule["containsValue"])
+                    for rule in agency["filters"]
+                ],
+            )
+            for rate_order, rate_group in enumerate(agency["rateGroups"]):
+                cursor.execute(
+                    """
+                    INSERT INTO functions.cost_distribution_rate_groups (
+                        agency_group_id, group_name, cost_percent, sort_order
+                    )
+                    VALUES (%s,%s,%s,%s)
+                    RETURNING rate_group_id
+                    """,
+                    (
+                        agency_group_id, rate_group["groupName"],
+                        rate_group["costPercent"], rate_order,
+                    ),
+                )
+                rate_group_id = cursor.fetchone()[0]
+                cursor.executemany(
+                    "INSERT INTO functions.cost_distribution_rate_values "
+                    "(rate_group_id, rate_id, rate_name) VALUES (%s,%s,%s)",
+                    [
+                        (rate_group_id, rate["rateId"], rate["rateName"])
+                        for rate in rate_group["rates"]
+                    ],
+                )
+
+
 def save_cost_settings(enterprise_id, payload):
     ensure_cost_settings_schema()
     # The property picker already obtained this ID/name pair from the property
@@ -625,9 +1107,21 @@ def save_cost_settings(enterprise_id, payload):
     p = data["profile"]
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute("""INSERT INTO functions.cost_property_settings (enterprise_id, currency, distribution_default_percent, cleaning_cost_per_minute, reception_cost_per_hour, room_rent_percent, breakfast_calculation_basis, breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour, breakfast_rent_percent, parking_rent_percent, card_cost_percent) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (enterprise_id) DO UPDATE SET currency=EXCLUDED.currency, distribution_default_percent=EXCLUDED.distribution_default_percent, cleaning_cost_per_minute=EXCLUDED.cleaning_cost_per_minute, reception_cost_per_hour=EXCLUDED.reception_cost_per_hour, room_rent_percent=EXCLUDED.room_rent_percent, breakfast_calculation_basis=EXCLUDED.breakfast_calculation_basis, breakfast_food_cost_per_guest=EXCLUDED.breakfast_food_cost_per_guest, breakfast_staff_cost_per_hour=EXCLUDED.breakfast_staff_cost_per_hour, breakfast_rent_percent=EXCLUDED.breakfast_rent_percent, parking_rent_percent=EXCLUDED.parking_rent_percent, card_cost_percent=EXCLUDED.card_cost_percent, updated_at=now()""", (data["enterpriseId"], p["currency"], p["distributionDefaultPercent"], p["cleaningCostPerMinute"], p["receptionCostPerHour"], p["roomRentPercent"], p["breakfastCalculationBasis"], p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"], p["breakfastRentPercent"], p["parkingRentPercent"], p["cardCostPercent"]))
-            for table in ("cost_distribution_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers"):
+            cursor.execute(_PROFILE_UPSERT_SQL, (
+                data["enterpriseId"], p["currency"], p["distributionDefaultPercent"],
+                p["cleaningCostPerMinute"], p["receptionCostPerHour"],
+                p["roomRentPercent"], p["breakfastCalculationBasis"],
+                p["breakfastFoodCostPerGuest"], p["breakfastStaffCostPerHour"],
+                p["breakfastRentPercent"], p["parkingRentPercent"],
+                p["cardCostPercent"], p["arrivalCostEnabled"],
+                p["franchiseEnabled"], p["franchisePercent"], p["franchiseBasis"],
+                p["franchiseRevenueBase"], p["franchiseVatPercent"],
+            ))
+            for table in ("cost_distribution_groups", "cost_distribution_origin_groups", "cost_cleaning_categories", "cost_arrival_staffing_tiers", "cost_breakfast_staffing_tiers"):
                 cursor.execute(f"DELETE FROM functions.{table} WHERE enterprise_id = %s", (data["enterpriseId"],))
+            _insert_distribution_tree(
+                cursor, data["enterpriseId"], data["distributionOriginGroups"]
+            )
             for order, group in enumerate(data["distributionGroups"]):
                 cursor.execute("INSERT INTO functions.cost_distribution_groups (enterprise_id, group_name, cost_percent, sort_order) VALUES (%s,%s,%s,%s) RETURNING distribution_group_id", (data["enterpriseId"], group["groupName"], group["costPercent"], order)); group_id = cursor.fetchone()[0]
                 cursor.executemany("INSERT INTO functions.cost_distribution_rules (distribution_group_id, match_type, match_value) VALUES (%s,%s,%s)", [(group_id, r["matchType"], r["matchValue"]) for r in group["rules"]])

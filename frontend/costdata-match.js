@@ -50,7 +50,47 @@
         return {free, taken};
     }
 
-    const api = {assignmentIndex, partitionOptions};
+    /**
+     * Which rate group in the distribution tree already claims each rate.
+     *
+     * The same problem as assignmentIndex, one level deeper: a rate sitting in
+     * two rate groups has two distribution percentages and no way to choose
+     * between them. The owner label is the full path, because "Corporate" alone
+     * does not say which origin group's Corporate it is.
+     *
+     * `except` is the rate group being edited, as {originIndex, agencyIndex,
+     * rateGroupIndex}; it never reports itself as a conflict.
+     */
+    function rateAssignmentIndex(originGroups, except) {
+        const assigned = new Map();
+        const skip = except || {};
+        (originGroups || []).forEach((origin, originIndex) => {
+            const originName = String(origin.groupName || "").trim()
+                || `Group ${originIndex + 1}`;
+            (origin.agencyGroups || []).forEach((agency, agencyIndex) => {
+                const agencyName = String(agency.groupName || "").trim()
+                    || `Subgroup ${agencyIndex + 1}`;
+                (agency.rateGroups || []).forEach((rateGroup, rateGroupIndex) => {
+                    if (originIndex === skip.originIndex
+                        && agencyIndex === skip.agencyIndex
+                        && rateGroupIndex === skip.rateGroupIndex) return;
+                    const rateGroupName = String(rateGroup.groupName || "").trim()
+                        || `Rates ${rateGroupIndex + 1}`;
+                    for (const rate of rateGroup.rates || []) {
+                        const name = String(rate.rateName || "").trim();
+                        if (!name) continue;
+                        assigned.set(
+                            name.toLowerCase(),
+                            `${originName} / ${agencyName} / ${rateGroupName}`
+                        );
+                    }
+                });
+            });
+        });
+        return assigned;
+    }
+
+    const api = {assignmentIndex, partitionOptions, rateAssignmentIndex};
 
     if (typeof module === "object" && module.exports) {
         module.exports = api;

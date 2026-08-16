@@ -164,15 +164,176 @@ test("derivations the fact data cannot support exactly are flagged", () => {
     const statement = CostData.calculateGop(data, { settingsByHotel: settings });
 
     assert.equal(
-        statement.flags.some((message) => /no dedicated franchise/.test(message)),
-        true,
-        "the missing franchise % field must be flagged"
-    );
-    assert.equal(
         statement.flags.some((message) => /no per-category or per-occupancy/.test(message)),
         true,
         "the blended cleaning rate must be flagged"
     );
+});
+
+// Cost Input now has a real franchise % field, so the caveat that used to
+// apologise for its absence must not survive - it would keep telling operators
+// to configure something they already have.
+test("the missing-franchise-field caveat is gone now that the field exists", () => {
+    const statement = CostData.calculateGop(data, { settingsByHotel: settings });
+
+    assert.equal(
+        statement.flags.some((message) => /no dedicated franchise/.test(message)),
+        false
+    );
+});
+
+function withProfile(overrides) {
+    return { A: { ...settings.A, profile: { ...settings.A.profile, ...overrides } } };
+}
+
+test("a disabled franchise costs nothing even with a percentage saved", () => {
+    const off = CostData.calculateGop(data, {
+        settingsByHotel: withProfile({ franchiseEnabled: false, franchisePercent: "8" })
+    });
+
+    // Card 2% of 20000 plus 5% room rent on 16000, exactly as before.
+    assert.equal(lineFor(off, "franchiseCardCost"), 400 + 800);
+});
+
+test("an enabled franchise is charged on the configured revenue base", () => {
+    const inclProducts = CostData.calculateGop(data, {
+        settingsByHotel: withProfile({
+            franchiseEnabled: true,
+            franchisePercent: "10",
+            franchiseBasis: "net",
+            franchiseRevenueBase: "roomInclProducts"
+        })
+    });
+    assert.equal(lineFor(inclProducts, "franchiseCardCost"), 400 + 800 + 1600);
+
+    // The same 10% on room revenue with the products taken out: the fixture
+    // has no roomRevenueExclProducts1Net at all, so the base is zero and the
+    // franchise adds nothing. That is the point - the two bases are different
+    // columns, not the same number under two names.
+    const exclProducts = CostData.calculateGop(data, {
+        settingsByHotel: withProfile({
+            franchiseEnabled: true,
+            franchisePercent: "10",
+            franchiseRevenueBase: "roomExclProducts"
+        })
+    });
+    assert.equal(lineFor(exclProducts, "franchiseCardCost"), 400 + 800);
+});
+
+test("a gross franchise basis grosses the net revenue up by the VAT rate", () => {
+    const statement = CostData.calculateGop(data, {
+        settingsByHotel: withProfile({
+            franchiseEnabled: true,
+            franchisePercent: "10",
+            franchiseBasis: "gross",
+            franchiseVatPercent: "12",
+            franchiseRevenueBase: "roomInclProducts"
+        })
+    });
+
+    // 16000 net grossed to 17920, then 10% of that.
+    assert.equal(lineFor(statement, "franchiseCardCost"), 400 + 800 + 1792);
+    assert.equal(statement.flags.some((message) => /grossed up by 12%/.test(message)), true);
+});
+
+test("switching arrival cost off zeroes the line and drops its warnings", () => {
+    const statement = CostData.calculateGop(data, {
+        settingsByHotel: {
+            A: { ...settings.A, arrivalTiers: [], profile: {
+                ...settings.A.profile, arrivalCostEnabled: false
+            } }
+        }
+    });
+
+    assert.equal(lineFor(statement, "arrivalCost"), 0);
+    assert.equal(
+        statement.flags.some((message) => /reception staffing thresholds/.test(message)),
+        false,
+        "an intentional off switch is not a configuration gap"
+    );
+});
+
+// A count above the top band used to contribute no staff hours at all and
+// raise a warning nobody could act on. The top band is what the property meant.
+test("a count above every threshold falls back to the highest band", () => {
+    const busy = {
+        ...data,
+        arrivalsDepartures: [
+            { stayDate: "2026-01-02", hotelName: "A", totalArrivals: 40, totalDepartures: 30 },
+            { stayDate: "2026-01-03", hotelName: "A", totalArrivals: 10, totalDepartures: 20 }
+        ]
+    };
+    const capped = {
+        A: {
+            ...settings.A,
+            arrivalTiers: [
+                { minArrivals: 0, maxArrivals: 20, receptionHours: "8" },
+                { minArrivals: 21, maxArrivals: 30, receptionHours: "16" }
+            ]
+        }
+    };
+    const statement = CostData.calculateGop(busy, { settingsByHotel: capped });
+
+    // 40 arrivals clears the closed 21-30 band, so that band's 16h applies;
+    // 10 arrivals still lands in 0-20 for 8h. 24h x 300.
+    assert.equal(lineFor(statement, "arrivalCost"), 7200);
+    assert.equal(
+        statement.flags.some((message) => /outside every configured threshold/.test(message)),
+        false
+    );
+});
+
+test("a count below every threshold falls back to the lowest band", () => {
+    const tiers = [
+        { minGuests: 50, maxGuests: 100, staffHours: "4" },
+        { minGuests: 101, maxGuests: null, staffHours: "9" }
+    ];
+
+    assert.equal(CostData.matchTier(tiers, 10, "minGuests", "maxGuests").staffHours, "4");
+    assert.equal(CostData.matchTier(tiers, 75, "minGuests", "maxGuests").staffHours, "4");
+    assert.equal(CostData.matchTier(tiers, 400, "minGuests", "maxGuests").staffHours, "9");
+    assert.equal(CostData.matchTier([], 10, "minGuests", "maxGuests"), null);
+});
+
+// A checkbox that has never been saved, a real boolean and a form-encoded
+// string all reach this code. "false" is a truthy string, which is the whole
+// reason this helper exists.
+test("an unsaved arrival toggle defaults to on, and the string false does not", () => {
+    assert.equal(CostData.isEnabled(undefined), true);
+    assert.equal(CostData.isEnabled(""), true);
+    assert.equal(CostData.isEnabled(false), false);
+    assert.equal(CostData.isEnabled("false"), false);
+    assert.equal(CostData.isEnabled("off"), false);
+    assert.equal(CostData.isEnabled("true"), true);
+    assert.equal(CostData.isEnabled(undefined, false), false);
+});
+
+test("periods are only computed when a grain is asked for, and sum to the total", () => {
+    const withoutGrain = CostData.calculateGop(data, { settingsByHotel: settings });
+    assert.deepEqual(withoutGrain.periods, []);
+
+    const byDay = CostData.calculateGop(data, { settingsByHotel: settings, grain: "day" });
+    assert.deepEqual(byDay.periods.map(({ periodKey }) => periodKey), [
+        "2026-01-02", "2026-01-03"
+    ]);
+
+    // Every stay date belongs to exactly one bucket, so no revenue is counted
+    // twice and none is dropped.
+    const revenue = byDay.periods.reduce((total, period) => total + period.revenue, 0);
+    assert.equal(revenue, lineFor(byDay, "roomRevenue") + lineFor(byDay, "parkingRevenue"));
+
+    const byMonth = CostData.calculateGop(data, { settingsByHotel: settings, grain: "month" });
+    assert.equal(byMonth.periods.length, 1);
+    assert.equal(byMonth.periods[0].periodKey, "2026-01-01");
+    assert.equal(byMonth.periods[0].gop, byMonth.gop);
+});
+
+test("a period's own thresholds are still evaluated per stay date", () => {
+    const byMonth = CostData.calculateGop(data, { settingsByHotel: settings, grain: "month" });
+
+    // The whole period is one bucket, but 60 and 20 guests must still band
+    // separately: banding the 80-guest total would give 10h, not 14h.
+    assert.equal(byMonth.periods[0].amounts.breakfastCost, 80 * 40 + 14 * 250);
 });
 
 test("missing thresholds are reported rather than silently costing zero", () => {
