@@ -32,6 +32,7 @@ from shared.mews_source import (
     CATEGORY_ORDERING_COLUMNS,
     UNORDERED_CATEGORY_RANK,
     agency_contains_text,
+    rate_name_lateral,
 )
 
 
@@ -361,42 +362,65 @@ def list_rates(enterprise_id, cursor=None):
     Mews Rate has no EnterpriseId - it hangs off ServiceId - so the join runs
     through service_current unless the mirror denormalised enterprise_id onto
     the rate itself.
+
+    rate_current still says which rates the property has, and whether they are
+    active; it is only the name that comes from rate_history, because that is
+    the field that moves. See shared/mews_source.rate_name_lateral.
     """
     with _Session(cursor) as source:
-        name_column = _resolve_column(source, "rate_current", RATE_NAME_COLUMNS)
         active_column = _resolve_column(
             source, "rate_current", RATE_ACTIVE_COLUMNS, required=False
         )
         direct_enterprise = _resolve_column(
             source, "rate_current", RATE_ENTERPRISE_COLUMNS, required=False
         )
-
         active_predicate = SQL("AND rate.{} ").format(Identifier(active_column)) \
             if active_column else SQL("")
 
         if direct_enterprise:
-            query = SQL("""
-                SELECT DISTINCT
-                    rate.id::text AS rate_id,
-                    trim(rate.{name})::text AS rate_name
-                FROM rate_current rate
-                WHERE rate.enterprise_id::text = %(enterprise_id)s
-                  AND nullif(trim(rate.{name}), '') IS NOT NULL
-                  {active}
-                ORDER BY rate_name
-            """).format(name=Identifier(name_column), active=active_predicate)
+            scope_join = SQL("")
+            scope_predicate = SQL("rate.enterprise_id::text = %(enterprise_id)s")
         else:
-            query = SQL("""
-                SELECT DISTINCT
-                    rate.id::text AS rate_id,
-                    trim(rate.{name})::text AS rate_name
-                FROM rate_current rate
-                JOIN service_current service ON service.id = rate.service_id
-                WHERE service.enterprise_id::text = %(enterprise_id)s
-                  AND nullif(trim(rate.{name}), '') IS NOT NULL
-                  {active}
-                ORDER BY rate_name
-            """).format(name=Identifier(name_column), active=active_predicate)
+            scope_join = SQL(
+                "JOIN service_current service ON service.id = rate.service_id"
+            )
+            scope_predicate = SQL("service.enterprise_id::text = %(enterprise_id)s")
+
+        history = rate_name_lateral(
+            lambda table: _table_columns(source, table), SQL("rate.id"), alias="named"
+        )
+        if history:
+            name_join, name_value = history
+            name_filter = SQL("")
+        else:
+            # No usable rate history in this mirror: fall back to the current
+            # row, which is what this read did before.
+            name_column = _resolve_column(source, "rate_current", RATE_NAME_COLUMNS)
+            name_join = SQL("")
+            name_value = SQL("trim(rate.{})").format(Identifier(name_column))
+            name_filter = SQL("AND nullif(trim(rate.{}), '') IS NOT NULL").format(
+                Identifier(name_column)
+            )
+
+        query = SQL("""
+            SELECT DISTINCT
+                rate.id::text AS rate_id,
+                {name}::text AS rate_name
+            FROM rate_current rate
+            {scope_join}
+            {name_join}
+            WHERE {scope_predicate}
+              {name_filter}
+              {active}
+            ORDER BY rate_name
+        """).format(
+            name=name_value,
+            scope_join=scope_join,
+            name_join=name_join,
+            scope_predicate=scope_predicate,
+            name_filter=name_filter,
+            active=active_predicate,
+        )
 
         source.execute(query, {"enterprise_id": str(enterprise_id)})
         return [
@@ -792,11 +816,16 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
         rate_name_column = _resolve_column(
             source, "rate_current", RATE_NAME_COLUMNS, required=False
         )
-        if rate_fk is None or rate_name_column is None:
+        history = rate_name_lateral(
+            lambda table: _table_columns(source, table),
+            SQL("scoped.rate_id"),
+            alias="named",
+        )
+        if rate_fk is None or (rate_name_column is None and history is None):
             logging.info(
-                "Reservations carry no usable rate link (rate_fk=%s rate_name=%s); "
-                "falling back to every rate on the property",
-                rate_fk, rate_name_column,
+                "Reservations carry no usable rate link (rate_fk=%s rate_name=%s "
+                "rate_history=%s); falling back to every rate on the property",
+                rate_fk, rate_name_column, bool(history),
             )
             return {"rates": list_rates(enterprise_id, cursor=source), "filtered": False}
 
@@ -822,9 +851,25 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
             scope = _STAY_SCOPE
             agency_predicate = SQL("")
 
+        if history:
+            name_join, name_value = history
+            name_filter = SQL("")
+        else:
+            name_join = SQL(
+                "JOIN rate_current rate ON rate.id::text = scoped.rate_id::text"
+            )
+            name_value = SQL("trim(rate.{})").format(Identifier(rate_name_column))
+            name_filter = SQL("WHERE nullif(trim(rate.{}), '') IS NOT NULL").format(
+                Identifier(rate_name_column)
+            )
+
+        # The identifier stays in its own type through the CTE and the join, and
+        # is cast to text only on the way out. Casting it up front put a function
+        # on the column the rate lookup keys off, which is the one thing that
+        # stops it using an index.
         query = SQL("""
             WITH scoped_rates AS MATERIALIZED (
-                SELECT reservation.{rate_fk}::text AS rate_id,
+                SELECT reservation.{rate_fk} AS rate_id,
                        count(*)::bigint AS reservation_count
                 {scope}
                   AND reservation.{rate_fk} IS NOT NULL
@@ -832,17 +877,19 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
                   {agency_predicate}
                 GROUP BY 1
             )
-            SELECT rate.id::text AS rate_id,
-                   trim(rate.{rate_name})::text AS rate_name,
+            SELECT scoped.rate_id::text AS rate_id,
+                   {rate_name}::text AS rate_name,
                    scoped.reservation_count
             FROM scoped_rates scoped
-            JOIN rate_current rate ON rate.id::text = scoped.rate_id
-            WHERE nullif(trim(rate.{rate_name}), '') IS NOT NULL
+            {name_join}
+            {name_filter}
             ORDER BY rate_name
             LIMIT {limit}
         """).format(
             rate_fk=Identifier(rate_fk),
-            rate_name=Identifier(rate_name_column),
+            rate_name=name_value,
+            name_join=name_join,
+            name_filter=name_filter,
             scope=scope,
             origin_predicate=_origin_predicate(origin_column),
             agency_predicate=agency_predicate,

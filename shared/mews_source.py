@@ -93,6 +93,84 @@ def reset_column_cache():
         _column_cache.clear()
 
 
+# ---------------------------------------------------------------------------
+# Rate names
+#
+# A rate's name is read from rate_history, not from rate_current.
+#
+# rate_current holds whatever the rate looks like at this moment, and that
+# moves: a rate is renamed, or carries no name for a while, and the mirror's
+# current row moves with it. rate_history keeps every version, so the most
+# recent version that actually has a name stays put. Everything downstream is
+# keyed on that name - the Cost Input pickers store it, and the distribution
+# mix matches on it - so reading the fluctuating copy meant a rate could quietly
+# stop matching the rule that was written for it, or drop out of a picker
+# between one page load and the next.
+#
+# Three places ask this question, and this is the one answer, for the same
+# reason the agency fold below has one: three copies of a rule that must agree
+# is three chances for them not to.
+# ---------------------------------------------------------------------------
+RATE_HISTORY_TABLE = "rate_history"
+RATE_HISTORY_NAME_COLUMNS = (
+    "name", "rate_name", "names", "short_name", "display_name",
+)
+# Newest first. Mews entity history stamps CreatedUtc; the snapshot-shaped
+# mirrors stamp their own validity instead, so both spellings are accepted and
+# the first one present wins.
+RATE_HISTORY_ORDER_COLUMNS = (
+    "created_utc", "snapshot_valid_from", "updated_utc", "valid_from",
+)
+
+
+def rate_name_lateral(columns_of, rate_id, alias="rate", outer=False):
+    """A LATERAL yielding one rate's stable display name from rate_history.
+
+    rate_id is composable SQL for the rate identifier in the surrounding query.
+    It is compared against rate_history.id untouched, with no cast on either
+    side, so an index on that column can still be used - this runs once per
+    candidate rate, and a cast on the indexed side would turn each one into a
+    scan of the whole history.
+
+    columns_of(table) returns the column names present on a source table, so the
+    caller's own schema cache is reused rather than a second one being built.
+
+    Returns (join, value) as composable SQL, or None when the mirror has no
+    usable rate history - which lets the caller fall back to rate_current rather
+    than fail on a mirror that never had the table.
+    """
+    columns = columns_of(RATE_HISTORY_TABLE)
+    if not columns:
+        return None
+    name_column = next(
+        (column for column in RATE_HISTORY_NAME_COLUMNS if column in columns), None
+    )
+    order_column = next(
+        (column for column in RATE_HISTORY_ORDER_COLUMNS if column in columns), None
+    )
+    if not name_column or not order_column:
+        return None
+
+    join = SQL(
+        "{outer}JOIN LATERAL ("
+        "SELECT nullif(trim(history.{name}), '') AS rate_name "
+        "FROM {table} history "
+        "WHERE history.id = {rate_id} "
+        "AND nullif(trim(history.{name}), '') IS NOT NULL "
+        "ORDER BY history.{order} DESC "
+        "LIMIT 1"
+        ") {alias} ON true"
+    ).format(
+        outer=SQL("LEFT ") if outer else SQL(""),
+        name=Identifier(name_column),
+        table=Identifier(RATE_HISTORY_TABLE),
+        rate_id=rate_id,
+        order=Identifier(order_column),
+        alias=Identifier(alias),
+    )
+    return join, SQL("{}.rate_name").format(Identifier(alias))
+
+
 # "Does this travel agency name contain this term?", as one rule.
 #
 # A travel agency's name is written differently everywhere it is written:

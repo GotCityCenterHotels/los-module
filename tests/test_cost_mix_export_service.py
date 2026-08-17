@@ -180,6 +180,32 @@ class DistributionMixExportTests(unittest.TestCase):
         self.assertIn('reservation."origin"', query)
         self.assertNotIn("JOIN rate_current", query)
 
+    def test_the_mix_reads_the_rate_name_from_history(self):
+        # This is the one that matters most: the mix is matched against rate
+        # names an operator saved in Cost Input, so it has to see the same
+        # stable name the picker offered them. Reading the current row meant a
+        # renamed rate silently stopped matching its own rule, and the cost it
+        # carried quietly moved to the fallback percentage.
+        columns = dict(FULL_MIRROR)
+        columns["rate_history"] = {"id", "name", "created_utc"}
+        query = sql_of(self.build(columns))
+
+        self.assertIn("rate_history", query)
+        self.assertIn("JOIN LATERAL", query)
+        self.assertIn('history."created_utc" DESC', query)
+        self.assertIn("LIMIT 1", query)
+        self.assertNotIn("JOIN rate_current", query)
+        # Left, so a reservation whose rate has no name keeps its origin and
+        # agency in the weighting instead of dropping out of the mix.
+        self.assertIn("LEFT JOIN LATERAL", query)
+        self.assertIn("history.id = reservation.\"rate_id\"", query)
+
+    def test_a_mirror_without_rate_history_still_reads_the_current_row(self):
+        query = sql_of(self.build(FULL_MIRROR))
+        self.assertNotIn("rate_history", query)
+        self.assertIn("LEFT JOIN rate_current", query)
+        self.assertIn('trim(rate."rate_name")', query)
+
     def test_without_an_origin_column_there_is_nothing_to_apportion_by(self):
         columns = dict(FULL_MIRROR)
         columns["reservation_current"] = (

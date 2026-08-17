@@ -385,17 +385,28 @@ def _require_integration_settings():
 
 
 def _assert_source_boundary(connection, expected_database):
-    """The connection really is integration_db, and really is read-only."""
-    with connection.cursor(row_factory=dict_row) as cursor:
-        cursor.execute(
-            "SELECT current_database() AS database_name, "
-            "current_setting('transaction_read_only') AS read_only"
-        )
-        boundary = cursor.fetchone()
-    if boundary["database_name"].lower() != expected_database.lower():
-        raise RuntimeError("Supplement source connection opened the wrong database")
-    if boundary["read_only"].lower() != "on":
-        raise RuntimeError("Supplement source connection is not read-only")
+    """The connection really is integration_db, and really is read-only.
+
+    Ends by rolling back, and that is not tidiness. These connections are not in
+    autocommit, so the SELECT below opens a transaction, and this runs as a
+    pool's configure callback - psycopg_pool discards any connection a configure
+    callback hands back still inside one. Leaving it open meant every connection
+    the pool created was thrown away on creation, and every caller waited out the
+    checkout timeout for a connection that could never arrive.
+    """
+    try:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT current_database() AS database_name, "
+                "current_setting('transaction_read_only') AS read_only"
+            )
+            boundary = cursor.fetchone()
+        if boundary["database_name"].lower() != expected_database.lower():
+            raise RuntimeError("Supplement source connection opened the wrong database")
+        if boundary["read_only"].lower() != "on":
+            raise RuntimeError("Supplement source connection is not read-only")
+    finally:
+        connection.rollback()
 
 
 @contextmanager

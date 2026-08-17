@@ -129,6 +129,57 @@ class SupplementSourceSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "must be integration_db"):
                 supplement_source._require_integration_settings()
 
+    def test_the_boundary_check_leaves_the_connection_idle(self):
+        """psycopg_pool discards a connection its configure callback leaves in a
+        transaction, and the interactive pickup path uses this as that callback.
+
+        These connections are not in autocommit, so the boundary SELECT opens a
+        transaction. Leaving it open does not fail loudly - the pool throws the
+        connection away on creation, tries again, throws that one away too, and
+        every caller waits out the checkout timeout for a connection that can
+        never arrive. The Supplement detail dialog went down exactly that way.
+        """
+        connection = MagicMock()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.return_value = {
+            "database_name": "integration_db",
+            "read_only": "on",
+        }
+        connection.cursor.return_value = cursor
+
+        supplement_source._assert_source_boundary(connection, "integration_db")
+
+        connection.rollback.assert_called_once()
+
+    def test_the_connection_is_left_idle_even_when_the_boundary_is_wrong(self):
+        # Otherwise a misconfigured connection is both rejected and leaked in a
+        # transaction, and the pool's own error is buried under a second one.
+        for boundary, message in (
+            ({"database_name": "somewhere_else", "read_only": "on"}, "wrong database"),
+            ({"database_name": "integration_db", "read_only": "off"}, "not read-only"),
+        ):
+            with self.subTest(boundary=boundary):
+                connection = MagicMock()
+                cursor = MagicMock()
+                cursor.__enter__.return_value = cursor
+                cursor.fetchone.return_value = boundary
+                connection.cursor.return_value = cursor
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    supplement_source._assert_source_boundary(
+                        connection, "integration_db"
+                    )
+                connection.rollback.assert_called_once()
+
+    def test_the_pickup_pool_configures_with_that_check(self):
+        # The pool is the only place a configure callback exists in this app, so
+        # the rule above has exactly one enforcement point and it is this one.
+        source = Path(supplement_source.__file__).read_text(encoding="utf-8")
+        pool = source[source.index("def _pickup_connection_pool"):]
+        self.assertIn("configure=", pool)
+        self.assertIn("_assert_source_boundary", pool)
+
     def test_profile_gate_requires_stay_date_pruning_or_index_access(self):
         sequential = [{"Plan": {"Node Type": "Seq Scan", "Filter": "start_utc = $1"}}]
         indexed = [{"Plan": {

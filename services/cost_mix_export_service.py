@@ -41,8 +41,10 @@ from services.cost_source_service import (
     CostSourceUnavailableError,
     _agency_join,
     _resolve_column,
+    _table_columns,
     table_identifier,
 )
+from shared.mews_source import rate_name_lateral
 
 
 # Reservation-level exports are the two most expensive statements in the cost
@@ -266,7 +268,21 @@ def build_distribution_mix_export(source):
     rate_name = _resolve_column(
         source, "rate_current", RATE_NAME_COLUMNS, required=False
     )
-    if rate_fk and rate_name:
+    # The mix is matched against rate names an operator saved in Cost Input, so
+    # it has to read the same stable name those pickers offered - the current
+    # row moves, and a renamed rate would silently stop matching its own rule.
+    rate_history = rate_name_lateral(
+        lambda table: _table_columns(source, table),
+        SQL("reservation.{}").format(Identifier(rate_fk)) if rate_fk else SQL("NULL"),
+        alias="named",
+        # Left, so a reservation whose rate has no name still carries its origin
+        # and agency into the mix instead of dropping out of the weighting.
+        outer=True,
+    ) if rate_fk else None
+
+    if rate_history:
+        rate_join, rate_value = rate_history
+    elif rate_fk and rate_name:
         rate_join = SQL(
             "LEFT JOIN rate_current rate ON rate.id::text = reservation.{}::text"
         ).format(Identifier(rate_fk))

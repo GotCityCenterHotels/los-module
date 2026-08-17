@@ -264,6 +264,112 @@ class RateLookupTests(unittest.TestCase):
         self.assertNotIn("service_current", query)
 
 
+class RateHistoryNameTests(unittest.TestCase):
+    """A rate's name is read from rate_history, not rate_current.
+
+    rate_current holds whatever the rate is called at this moment, and that
+    moves - a rename, or a spell with no name at all, and the current row moves
+    with it. Everything downstream is keyed on the name: the Cost Input pickers
+    store it and the distribution mix matches on it, so a rate that was renamed
+    quietly stopped matching the rule written for it. rate_history keeps every
+    version, so the newest one that actually has a name stays put.
+    """
+
+    MIRROR = {
+        "rate_current": {"id", "service_id", "rate_name", "is_active"},
+        "rate_history": {"id", "name", "created_utc"},
+        "reservation_current": {
+            "id", "service_id", "rate_id", "origin", "start_utc",
+        },
+        "service_current": {"id", "enterprise_id"},
+    }
+
+    def setUp(self):
+        cost_source_service._reset_column_cache()
+
+    def _run(self, call, columns, rows):
+        cursor = FakeCursor(columns, rows)
+        with patch.object(
+            cost_source_service, "export_pool",
+            SimpleNamespace(connection=lambda: FakeConnection(cursor))
+        ):
+            result = call()
+        return result, cursor
+
+    def test_the_rate_picker_takes_its_name_from_history(self):
+        rates, cursor = self._run(
+            lambda: cost_source_service.list_rates("hotel-1"),
+            self.MIRROR,
+            [{"rate_id": "r1", "rate_name": "BAR"}],
+        )
+        self.assertEqual(rates, [{"id": "r1", "name": "BAR"}])
+
+        query = [sql for sql in cursor.executed if "rate_current" in sql][-1]
+        self.assertIn("rate_history", query)
+        self.assertIn("JOIN LATERAL", query)
+        # Newest first, and never a version that has no name.
+        self.assertIn('"created_utc" DESC', query)
+        self.assertIn("LIMIT 1", query)
+        # rate_current still says which rates exist and whether they are active;
+        # it just no longer supplies the name.
+        self.assertIn("rate_current", query)
+        self.assertIn('rate."is_active"', query)
+        self.assertNotIn('trim(rate."rate_name")', query)
+
+    def test_the_matching_rate_picker_takes_its_name_from_history(self):
+        result, cursor = self._run(
+            lambda: cost_source_service._list_matching_rates_uncached(
+                "hotel-1", [], "", None
+            ),
+            self.MIRROR,
+            [{"rate_id": "r1", "rate_name": "BAR", "reservation_count": 4}],
+        )
+        self.assertTrue(result["filtered"])
+
+        query = [sql for sql in cursor.executed if "scoped_rates" in sql][-1]
+        self.assertIn("rate_history", query)
+        self.assertIn("JOIN LATERAL", query)
+        self.assertNotIn("JOIN rate_current", query)
+        # The identifier keeps its own type through the CTE and the lookup, and
+        # is cast only on the way out - a cast on the joined column is what would
+        # stop the history lookup using an index, once per candidate rate.
+        self.assertIn("history.id = scoped.rate_id", query)
+        self.assertNotIn("history.id::text", query)
+        self.assertIn("SELECT reservation.\"rate_id\" AS rate_id", query)
+        self.assertIn("scoped.rate_id::text AS rate_id", query)
+
+    def test_a_mirror_without_rate_history_still_reads_the_current_row(self):
+        # The table is not guaranteed to exist on every mirror, and losing the
+        # picker entirely would be far worse than an occasionally stale name.
+        without_history = {
+            table: columns for table, columns in self.MIRROR.items()
+            if table != "rate_history"
+        }
+        rates, cursor = self._run(
+            lambda: cost_source_service.list_rates("hotel-1"),
+            without_history,
+            [{"rate_id": "r1", "rate_name": "BAR"}],
+        )
+        self.assertEqual(rates, [{"id": "r1", "name": "BAR"}])
+        query = [sql for sql in cursor.executed if "rate_current" in sql][-1]
+        self.assertNotIn("rate_history", query)
+        self.assertIn('trim(rate."rate_name")', query)
+
+    def test_a_history_table_without_a_usable_column_falls_back_too(self):
+        for history_columns in ({"id", "created_utc"}, {"id", "name"}):
+            with self.subTest(history_columns=history_columns):
+                cost_source_service._reset_column_cache()
+                columns = dict(self.MIRROR, rate_history=history_columns)
+                _, cursor = self._run(
+                    lambda: cost_source_service.list_rates("hotel-1"),
+                    columns,
+                    [{"rate_id": "r1", "rate_name": "BAR"}],
+                )
+                query = [sql for sql in cursor.executed if "rate_current" in sql][-1]
+                self.assertNotIn("JOIN LATERAL", query)
+                self.assertIn('trim(rate."rate_name")', query)
+
+
 class SourceWindowTests(unittest.TestCase):
     """Every reservation-derived lookup is bounded.
 
