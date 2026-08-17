@@ -983,9 +983,33 @@ def fetch_supplement_detail(
             comparison_stored = stored_inventory[comparison_date]
             comparison_fallback = latest_inventory[comparison_date]
 
+            # The curves are rebuilt from the source database, over the network,
+            # under a statement ceiling deliberately tighter than the proxy's.
+            # They are also the only part of this response that can fail that
+            # way - the figures beside them are already in hand, from the
+            # published read model. Failing the whole request over the curves
+            # threw those away too and left the dialog with nothing but "Unable
+            # to retrieve Supplement detail". They degrade instead: the figures
+            # go out, and the curve says why it is missing.
+            pickup_error = None
+            try:
+                current_rebuild = current_history.result()
+                comparison_rebuild = comparison_history.result()
+            except Exception as error:
+                pickup_error = error
+                current_rebuild = []
+                comparison_rebuild = []
+                logging.exception(
+                    "Supplement pickup rebuild failed hotel_code=%s stay_date=%s "
+                    "sqlstate=%s",
+                    hotel_code,
+                    stay_date,
+                    getattr(error, "sqlstate", None) or "none",
+                )
+
             pickup = []
             for row in _pickup_rows(
-                current_history.result(), current_stored, current_fallback
+                current_rebuild, current_stored, current_fallback
             ):
                 rooms = float(row["assigned_rooms"] or 0)
                 pickup.append({
@@ -1001,7 +1025,7 @@ def fetch_supplement_detail(
                 })
             comparison_pickup = []
             for row in _pickup_rows(
-                comparison_history.result(), comparison_stored, comparison_fallback
+                comparison_rebuild, comparison_stored, comparison_fallback
             ):
                 rooms = float(row["assigned_rooms"] or 0)
                 comparison_pickup.append({
@@ -1035,7 +1059,21 @@ def fetch_supplement_detail(
                     max(point["daysBeforeStay"] for point in pickup)
                     if pickup else 0
                 ),
+                # An empty curve because there is no history reads the same as an
+                # empty curve because the rebuild failed, and they are not the
+                # same thing. The reader is told which.
+                "pickupAvailable": pickup_error is None,
             }
+            if pickup_error is not None:
+                payload["pickupUnavailableReason"] = (
+                    "The pickup history could not be rebuilt from the source "
+                    "database. The figures above are published data and are "
+                    "unaffected."
+                )
+                # Deliberately not cached. A transient source failure held for
+                # the cache's lifetime would turn one bad minute into a curve
+                # that stays missing until the next publication.
+                return _windowed_payload(payload, days_before_stay)
             with _detail_cache_lock:
                 if len(_detail_cache) >= 256:
                     _detail_cache.clear()

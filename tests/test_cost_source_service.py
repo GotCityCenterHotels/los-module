@@ -31,6 +31,9 @@ class FakeCursor:
         self.rows = rows
         self._result = []
         self.executed = []
+        # Recorded alongside the SQL, because what the term is folded against now
+        # travels as a parameter rather than being baked into a LIKE pattern.
+        self.parameters = []
 
     def __enter__(self):
         return self
@@ -41,6 +44,7 @@ class FakeCursor:
     def execute(self, query, parameters=None):
         text = query.as_string(None) if hasattr(query, "as_string") else str(query)
         self.executed.append(text)
+        self.parameters.append(parameters)
         if "information_schema.columns" in text:
             # A qualified lookup passes (table, schema) and must only see that
             # schema's table; an unqualified one passes (table,).
@@ -383,11 +387,146 @@ class MatchingRateTests(unittest.TestCase):
 class ContainsPatternTests(unittest.TestCase):
     def test_like_metacharacters_in_the_search_term_are_escaped(self):
         # A search for "50%" must look for a literal per cent sign, not for
-        # "anything".
+        # "anything". No longer used for agency names, which fold both sides and
+        # test with strpos, but this escaping is not obvious the second time
+        # either.
         self.assertEqual(cost_source_service.contains_pattern("50%"), "%50\\%%")
         self.assertEqual(cost_source_service.contains_pattern("a_b"), "%a\\_b%")
         self.assertEqual(cost_source_service.contains_pattern("back\\slash"), "%back\\\\slash%")
         self.assertEqual(cost_source_service.contains_pattern("expedia"), "%expedia%")
+
+
+class AgencyFoldTests(unittest.TestCase):
+    """One rule for "does this agency name contain this term"."""
+
+    def test_the_fold_removes_spacing_and_punctuation_and_nothing_else(self):
+        from shared.mews_source import (
+            AGENCY_FOLD_PATTERN, agency_contains_text, agency_fold_text,
+        )
+
+        folded = agency_fold_text("agency.name")
+        # lower() is what handles case, including accented letters, because it is
+        # collation-aware. The regexp handles everything else.
+        self.assertIn("lower(", folded)
+        self.assertIn(AGENCY_FOLD_PATTERN, folded)
+        self.assertIn("coalesce(agency.name, '')", folded)
+
+        # The tempting shorter pattern - drop everything that is not [:alnum:] -
+        # is ctype-dependent, and under the C locale would fold "Hôtel Diva" to
+        # "hteldiva" and stop it matching "hôtel diva" as well.
+        self.assertEqual(AGENCY_FOLD_PATTERN, "[[:space:][:punct:]]+")
+        self.assertNotIn("alnum", folded)
+
+        contains = agency_contains_text("agency.name", "%(agency_term)s")
+        self.assertTrue(contains.startswith("strpos("))
+        self.assertTrue(contains.endswith(") > 0"))
+        # Both sides, or a term the operator typed with a dot would still miss a
+        # name stored without one.
+        self.assertEqual(contains.count(AGENCY_FOLD_PATTERN), 2)
+
+    # The fold is one rule over whatever term is in the rulebook and whatever name
+    # is in the source: there is no per-agency branch anywhere, and no agency name
+    # appears in shipped code outside a comment. These cases are the specification
+    # for that, across the shapes real agency names actually take - a trading
+    # name, a legal form, a country subsidiary, an all-caps mirror.
+    #
+    # PostgreSQL evaluates the real fold, so this asserts an equivalent of it:
+    # [[:space:][:punct:]] is exactly string.whitespace plus string.punctuation
+    # over ASCII. If the two ever disagree, this is where the expectation is
+    # recorded.
+    AGENCIES = {
+        "booking.com": (
+            "Booking.com", "BOOKING.COM", "Booking com", "Booking . Com",
+            "Booking.com B.V.", "booking.com bv", "Bookingcom",
+        ),
+        "expedia": (
+            "Expedia", "EXPEDIA", "Expedia, Inc.", "Expedia Group",
+            "Expedia Lodging Partner Services Srl", "expedia  travel",
+        ),
+        "hotelbeds": (
+            "Hotelbeds", "HOTELBEDS GROUP", "Hotelbeds Spain, S.L.U.",
+            "Hotel-beds", "hotel beds",
+        ),
+        "nordic choice": (
+            "Nordic Choice", "NORDIC CHOICE HOTELS", "Nordic-Choice",
+            "nordicchoice", "Nordic  Choice  AB",
+        ),
+    }
+
+    @staticmethod
+    def _fold(value):
+        import string
+
+        stripped = set(string.punctuation) | set(string.whitespace)
+        return "".join(
+            character for character in value if character not in stripped
+        ).lower()
+
+    def _contains(self, name, term):
+        return self._fold(term) in self._fold(name)
+
+    def test_one_term_catches_every_spelling_of_its_own_agency(self):
+        for term, names in self.AGENCIES.items():
+            for name in names:
+                self.assertTrue(
+                    self._contains(name, term),
+                    f"{term!r} should catch {name!r}",
+                )
+                # However the operator types the term, too - the fold is applied
+                # to both sides, so neither has to match the other's punctuation.
+                for typed in (term.upper(), term.replace(".", " "), term.title()):
+                    self.assertTrue(
+                        self._contains(name, typed),
+                        f"{typed!r} should catch {name!r}",
+                    )
+
+    def test_it_is_still_a_contains_test_and_not_a_match_anything(self):
+        # Folding makes the rule forgiving, not indiscriminate: every agency's
+        # term must miss every other agency's names.
+        for term, names in self.AGENCIES.items():
+            for other, other_names in self.AGENCIES.items():
+                if other == term:
+                    continue
+                for name in other_names:
+                    self.assertFalse(
+                        self._contains(name, term),
+                        f"{term!r} must not catch {name!r}",
+                    )
+
+    def test_accented_letters_survive_the_fold(self):
+        # Which is why the pattern names the two classes to remove rather than
+        # keeping only [:alnum:] - that is ASCII-only under the C locale.
+        self.assertEqual(self._fold("Hôtel Diva"), "hôteldiva")
+        self.assertTrue(self._contains("Hôtel Diva AB", "hôtel diva"))
+        # And the limit of that: an unaccented term does not reach an accented
+        # name. The suggestion list shows the real spelling, and a second term
+        # covers it.
+        self.assertFalse(self._contains("Hôtel Diva AB", "hotel diva"))
+
+    def test_an_ampersand_and_the_word_and_are_not_the_same_term(self):
+        # The fold removes "&" and keeps "and", so these are two spellings it
+        # cannot unify. The remedy is the one the editor's hint gives for an
+        # abbreviation: the subgroup's terms are a union, so add both.
+        self.assertTrue(self._contains("Smith & Jones Travel", "smith jones"))
+        self.assertFalse(self._contains("Smith & Jones Travel", "smith and jones"))
+
+    def test_all_three_callers_apply_the_same_rule(self):
+        # The editor's two pickers and the cost query have to agree, or the editor
+        # offers an agency the cost never charges.
+        from pathlib import Path
+
+        from queries.cost_data import COST_DATA_QUERIES
+        from shared.mews_source import AGENCY_FOLD_PATTERN
+
+        self.assertIn(
+            AGENCY_FOLD_PATTERN, COST_DATA_QUERIES["distributionRates"]
+        )
+        service = Path(cost_source_service.__file__).read_text(encoding="utf-8")
+        # By import, not by a second copy of the pattern. The queries themselves
+        # are checked for ILIKE where they are generated, in the two tests below -
+        # the word survives here only in contains_pattern's docstring.
+        self.assertIn("agency_contains_text", service)
+        self.assertNotIn(AGENCY_FOLD_PATTERN, service)
 
 
 class SourceCacheTests(unittest.TestCase):
@@ -468,7 +607,12 @@ class TravelAgencyTests(unittest.TestCase):
         self.assertIn(
             'ON agency."id"::text = reservation."travel_agency_id"::text', query
         )
-        self.assertIn("ILIKE %(agency_pattern)s", query)
+        # Folded on both sides rather than ILIKE on the raw text: "booking.com"
+        # has to find the agency however the mirror punctuates it.
+        self.assertNotIn("ILIKE", query)
+        self.assertIn("%(agency_term)s", query)
+        self.assertIn("[[:space:][:punct:]]+", query)
+        self.assertEqual(cursor.parameters[-1]["agency_term"], "exp")
 
     def test_an_unqualified_probe_never_sees_the_staging_table(self):
         # The guard that keeps a same-named table in another schema from
@@ -499,6 +643,12 @@ class TravelAgencyTests(unittest.TestCase):
         self.assertTrue(payload["originFilterApplied"])
         query = " ".join(cursor.executed[-1].split())
         self.assertIn('JOIN "staging"."travel_agency" agency', query)
+        # The same fold as the agency picker, so a term that found the agency
+        # there narrows the rates here. They were two different predicates on the
+        # same text before, and nothing said which of them had emptied the list.
+        self.assertNotIn("ILIKE", query)
+        self.assertIn("[[:space:][:punct:]]+", query)
+        self.assertEqual(cursor.parameters[-1]["agency_term"], "expedia")
 
     def test_the_capability_flag_reports_the_agency_search_as_available(self):
         columns = dict(self.COLUMNS)

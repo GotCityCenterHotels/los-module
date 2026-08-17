@@ -2473,9 +2473,18 @@ tbody tr.total-row:hover {
 .tree-warning { margin:10px 0 0; color:#b54708; font-size:11.5px;
     font-weight:600; }
 .tree-filter-row { display:grid; flex:1 1 100%;
-    grid-template-columns:minmax(180px,1fr) 34px; gap:8px; align-items:center; }
+    grid-template-columns:minmax(180px,1fr) 34px; gap:8px 8px; align-items:center; }
 .tree-filter-row .remove-rule { width:34px; height:34px; padding:0; }
 .settings-editor .tree-filter-row input { height:34px; }
+/* What this term matches, under the field rather than only inside a popup that
+   has to be open to be read. A term that catches nothing is the commonest way
+   this rulebook quietly falls back to the default percentage. */
+.tree-filter-match { grid-column:1 / -1; margin-top:-2px; color:#667085;
+    font-size:11px; line-height:1.45; }
+.tree-filter-match.is-empty { color:#b54708; font-weight:600; }
+.tree-filter-match.is-error { color:#b42318; font-weight:600; }
+.tree-field-hint { flex:1 1 100%; max-width:70ch; margin:2px 0 0; color:#98a2b3;
+    font-size:11px; line-height:1.5; }
 .origin-choices { flex:1 1 100%; }
 .origin-choices small { margin-left:5px; color:#98a2b3; font-weight:400; }
 .origin-choices .is-orphaned-choice { color:#b54708; }

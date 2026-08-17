@@ -90,29 +90,69 @@
         return (rows || []).filter((row) => !hotelName || row.hotelName === hotelName);
     }
 
+    const UNSPECIFIED = "Unspecified";
+
+    // localeCompare rebuilds its collator from the arguments on every call, and
+    // a comparator runs tens of thousands of times on a full year. No locale
+    // argument, so the ordering matches the localeCompare() calls it replaces.
+    const collator = new Intl.Collator();
+
+    function childMap(parent, key) {
+        let child = parent.get(key);
+        if (child === undefined) {
+            child = new Map();
+            parent.set(key, child);
+        }
+        return child;
+    }
+
     function aggregate(dataset, rows, { grain = "day", hotelName = "" } = {}) {
         const rule = DATASET_RULES[dataset];
         if (!rule) throw new Error(`Unknown cost dataset: ${dataset}`);
 
-        const grouped = new Map();
-        for (const row of filterRows(rows, hotelName)) {
-            const stayDate = periodKey(row.stayDate, grain);
-            const keyParts = [stayDate, row.hotelName || "Unspecified"];
-            for (const dimension of rule.dimensions) keyParts.push(row[dimension] || "Unspecified");
-            const key = JSON.stringify(keyParts);
-            let result = grouped.get(key);
+        // One Map level per grouping field, keyed on the strings the rows
+        // already carry, rather than one composite key string built and hashed
+        // end to end for every row. Same reasoning - and the same measured
+        // difference - as the LOS fact grouping in los-data.js.
+        const index = new Map();
+        const grouped = [];
+        // A dataset repeats each stay date across hotels and dimensions, and at
+        // a week grain resolving one costs a Date round trip.
+        const periodKeys = new Map();
 
-            if (!result) {
+        for (const row of filterRows(rows, hotelName)) {
+            let stayDate = periodKeys.get(row.stayDate);
+            if (stayDate === undefined) {
+                stayDate = periodKey(row.stayDate, grain);
+                periodKeys.set(row.stayDate, stayDate);
+            }
+
+            // The grouping path: period, hotel, then whatever this dataset is
+            // dimensioned by. Every element but the last addresses a nested
+            // Map; the last addresses the group itself.
+            const path = [stayDate, row.hotelName || UNSPECIFIED];
+            for (const dimension of rule.dimensions) {
+                path.push(row[dimension] || UNSPECIFIED);
+            }
+            let bucket = index;
+            for (let depth = 0; depth < path.length - 1; depth += 1) {
+                bucket = childMap(bucket, path[depth]);
+            }
+            const leaf = path[path.length - 1];
+            let result = bucket.get(leaf);
+
+            if (result === undefined) {
                 result = {
                     stayDate,
-                    hotelName: row.hotelName || "Unspecified",
+                    hotelName: row.hotelName || UNSPECIFIED,
                     lastUpdatedAt: row.lastUpdatedAt || null
                 };
                 for (const dimension of rule.dimensions) {
-                    result[dimension] = row[dimension] || "Unspecified";
+                    result[dimension] = row[dimension] || UNSPECIFIED;
                 }
                 for (const value of rule.values) result[value] = 0;
-                grouped.set(key, result);
+                bucket.set(leaf, result);
+                grouped.push(result);
             }
 
             for (const value of rule.values) result[value] += Number(row[value]) || 0;
@@ -121,11 +161,25 @@
             }
         }
 
-        return Array.from(grouped.values()).sort((left, right) =>
-            left.stayDate.localeCompare(right.stayDate)
-            || left.hotelName.localeCompare(right.hotelName)
-            || JSON.stringify(left).localeCompare(JSON.stringify(right))
-        );
+        // Stay date first, then hotel, then the dimensions that actually
+        // distinguish two rows sharing both. The tiebreak used to serialise
+        // whole row objects and compare the JSON text, which ordered ties by
+        // lastUpdatedAt - an accident of key order, not a decision - and cost
+        // two full stringifies per comparison.
+        return grouped.sort((left, right) => {
+            if (left.stayDate !== right.stayDate) {
+                return left.stayDate < right.stayDate ? -1 : 1;
+            }
+            const byHotel = collator.compare(left.hotelName, right.hotelName);
+            if (byHotel !== 0) return byHotel;
+            for (const dimension of rule.dimensions) {
+                const byDimension = collator.compare(
+                    String(left[dimension]), String(right[dimension])
+                );
+                if (byDimension !== 0) return byDimension;
+            }
+            return 0;
+        });
     }
 
     function sum(rows, field) {

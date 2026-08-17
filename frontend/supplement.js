@@ -615,6 +615,16 @@
     function renderPickup() {
         const payload = state.detailPayload;
         if (!payload) return;
+        // "No history" and "the rebuild failed" both arrive as an empty curve
+        // and mean completely different things, so they do not look the same.
+        if (payload.pickupAvailable === false) {
+            elements.pickupCurve.innerHTML = `<div class="supplement-empty pickup-empty"><strong>Pickup pace unavailable</strong><span>${escapeHtml(payload.pickupUnavailableReason || "The pickup history could not be rebuilt.")}</span></div>`;
+            elements.pickupCurrentLabel.textContent = "Current · unavailable";
+            elements.pickupComparisonLabel.textContent = `${payload.comparison} · unavailable`;
+            elements.pickupCoverage.textContent = "The figures above are published data and are unaffected.";
+            elements.pickupWindowHint.textContent = "";
+            return;
+        }
         const pickup = windowedPickup(payload.pickup);
         const comparisonPickup = windowedPickup(payload.comparisonPickup);
         elements.pickupCurve.innerHTML = curveSvg(pickup, comparisonPickup);

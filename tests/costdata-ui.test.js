@@ -398,6 +398,49 @@ test("a failed source lookup is reported as a failure, not as an empty result", 
     assert.match(service, /JOIN rate_current rate ON rate\.id::text = scoped\.rate_id/);
 });
 
+test("an agency term matches whatever the source calls the agency", () => {
+    const script = read("costdata-input.js");
+    const shared = fs.readFileSync(
+        path.join(__dirname, "..", "shared", "mews_source.py"), "utf8"
+    );
+
+    // "booking.com" typed into the filter matched nothing at a property whose
+    // mirror spells it "Booking com": the predicate was a substring test on the
+    // raw text, so it caught only the spelling the operator happened to type.
+    assert.match(shared, /def agency_fold_text\(expression\)/);
+    assert.match(shared, /\[\[:space:\]\[:punct:\]\]\+/);
+    // Keeping only [:alnum:] is ctype-dependent and would have cost every
+    // accented name its vowels under the C locale.
+    assert.doesNotMatch(shared, /\[\^\[:alnum:\]\]/);
+
+    // And the operator is told, where they type, that it works this way - plus
+    // that several terms are a union, which is the answer for an abbreviation the
+    // folding cannot reach.
+    // Said as a rule about every agency, with two examples: the single-example
+    // wording read as a Booking.com special case.
+    assert.match(script, /Capitals, spaces and punctuation are ignored for every agency/);
+    assert.match(script, /expedia/);
+    assert.match(script, /one per name the agency goes by/);
+});
+
+test("a term says what it matches, without the popup having to be open", () => {
+    const script = read("costdata-input.js");
+    const css = read("styles.css");
+
+    // A term that catches nothing is the commonest way this rulebook quietly
+    // charges the fallback percentage, and nothing on screen said so once the
+    // suggestion list had closed.
+    assert.match(script, /function describeMatches\(result\)/);
+    assert.match(script, /function refreshSummary\(\)/);
+    assert.match(script, /Matches no travel agency in this hotel's reservations/);
+    assert.match(css, /\.tree-filter-match\.is-empty/);
+    // Read from the cache first: every tree edit rebuilds every filter row, so a
+    // request per saved term per render would be a burst on each keystroke
+    // elsewhere in the tree.
+    assert.match(script, /function cachedAgencies\(term, origins\)/);
+    assert.match(script, /const cached = cachedAgencies\(term, originGroup\.origins\)/);
+});
+
 test("an empty matching-rate list names the filters that produced it", () => {
     const script = read("costdata-input.js");
 
@@ -723,13 +766,36 @@ test("a comparison that fails to load leaves this year's statement standing", ()
     // This year's figures are complete and correct; blanking the page over an
     // extra reading would be the larger loss.
     assert.match(script, /elements\.comparisonNote\.hidden = false;/);
-    assert.doesNotMatch(
-        /catch \(error\) \{[\s\S]*?\n {8}\}/.exec(
-            /async function ensureComparison\(\)[\s\S]*?\n {4}\}/.exec(script)[0]
-        )[0],
-        /elements\.gop\.hidden = true/
-    );
+    // Anchored on the function that performs the fetch, which is where the
+    // handler lives now that the request is also started early, in parallel
+    // with this year's.
+    const comparisonFetch = /async function loadComparison\([\s\S]*?\n {4}\}/.exec(script);
+    assert.ok(comparisonFetch, "loadComparison should own the comparison request");
+    const handler = /catch \(error\) \{[\s\S]*?\n {8}\}/.exec(comparisonFetch[0]);
+    assert.ok(handler, "a comparison failure should be caught, not propagated");
+    assert.doesNotMatch(handler[0], /elements\.gop\.hidden = true/);
+    assert.doesNotMatch(handler[0], /elements\.results\.hidden = true/);
     assert.match(read("styles.css"), /\.gop-chart-warning \{/);
+});
+
+test("the comparison request does not wait for this year's response", () => {
+    const script = read("costdata.js");
+
+    // Both are the same endpoint over ranges the date inputs already hold, so
+    // fetching them one after the other put two full round trips in front of
+    // one view. The comparison is started before this year's is awaited, and
+    // awaited only just before the first render - so the chart is still never
+    // drawn once without it and again with it.
+    const load = /async function loadData\(\)[\s\S]*?\n {4}\}/.exec(script)[0];
+    const started = load.indexOf("startComparison(range)");
+    const awaitedMain = load.indexOf("await LosApi.fetchJson");
+    const awaitedComparison = load.indexOf("await comparisonRequest");
+    const rendered = load.indexOf("render();");
+
+    assert.ok(started !== -1, "the comparison should be started inside loadData");
+    assert.ok(started < awaitedMain, "it should be started before this year's is awaited");
+    assert.ok(awaitedMain < awaitedComparison, "and awaited afterwards");
+    assert.ok(awaitedComparison < rendered, "but before the first render");
 });
 
 test("a missing control warns instead of killing the page bootstrap", () => {

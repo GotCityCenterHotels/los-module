@@ -1,4 +1,14 @@
+from shared.mews_source import agency_contains_text
+
+
 DATE_PREDICATE = "stay_date BETWEEN %(start_date)s AND %(end_date)s"
+
+# The one rule for "does this agency name contain this term". The two interactive
+# pickers in services/cost_source_service.py apply the same one, so a term that
+# found an agency in the editor is the term that charges it here.
+AGENCY_MATCHES_TERM = agency_contains_text(
+    "combination.travel_agency", "term.contains_value"
+)
 
 
 COST_DATA_QUERIES = {
@@ -165,18 +175,19 @@ COST_DATA_QUERIES = {
                          WHERE term.agency_group_id = agency_group.agency_group_id
                            AND nullif(btrim(term.contains_value), '') IS NOT NULL
                      )
+                     -- Any one term is enough: a subgroup's terms are a union, so
+                     -- an agency that spells itself two ways gets a row each.
                      OR EXISTS (
                          SELECT 1
                          FROM functions.cost_distribution_agency_filters term
                          WHERE term.agency_group_id = agency_group.agency_group_id
                            AND nullif(btrim(term.contains_value), '') IS NOT NULL
-                           -- strpos, not ILIKE: the term is typed by an operator
-                           -- and a per cent sign or underscore in an agency name
-                           -- must be a per cent sign, not a wildcard.
-                           AND strpos(
-                                 lower(combination.travel_agency),
-                                 lower(btrim(term.contains_value))
-                               ) > 0
+                           -- Folded on both sides, so "booking.com" charges
+                           -- "Booking.com B.V." and "BOOKING COM" alike. strpos
+                           -- rather than ILIKE also means a per cent sign or an
+                           -- underscore in an agency name stays a character
+                           -- rather than becoming a wildcard.
+                           AND {AGENCY_MATCHES_TERM}
                      )
                  )
                 LEFT JOIN functions.cost_distribution_rate_groups rate_group

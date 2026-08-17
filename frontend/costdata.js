@@ -199,19 +199,15 @@
         for (const entry of elements.lyLegend) entry.hidden = !drawn;
     }
 
-    async function ensureComparison() {
-        if (!elements.showLy || !elements.showLy.checked || !loadedRange) {
-            comparison = null;
-            elements.comparisonNote.hidden = true;
-            return;
-        }
-        const key = comparisonKey();
-        if (comparison && comparison.key === key) return;
-
-        // Busy state belongs to the caller: loadData already holds the controls
-        // through setLoading, and doing it here as well released them halfway
-        // through a load that was still running.
-        const range = LosFormat.lastYearRange(loadedRange, elements.lyBasis.value);
+    /**
+     * Fetch the comparison for an explicit range.
+     *
+     * Takes the range rather than reading loadedRange, so a load can start this
+     * before it has one - the comparison is a fixed offset from what the date
+     * inputs already say, and never needed this year's response to begin.
+     */
+    async function loadComparison(forRange, key) {
+        const range = LosFormat.lastYearRange(forRange, elements.lyBasis.value);
         elements.comparisonNote.hidden = true;
         try {
             const payload = await LosApi.fetchJson(
@@ -233,30 +229,61 @@
         }
     }
 
+    // Busy state belongs to the caller: loadData already holds the controls
+    // through setLoading, and doing it here as well released them halfway
+    // through a load that was still running.
+    async function ensureComparison() {
+        if (!elements.showLy || !elements.showLy.checked || !loadedRange) {
+            comparison = null;
+            elements.comparisonNote.hidden = true;
+            return;
+        }
+        const key = comparisonKey();
+        if (comparison && comparison.key === key) return;
+        await loadComparison(loadedRange, key);
+    }
+
+    // The same request, started for a range the inputs hold but loadedRange does
+    // not yet. Returns a promise that always settles, so awaiting it later never
+    // turns a comparison failure into a failed load.
+    function startComparison(forRange) {
+        if (!elements.showLy || !elements.showLy.checked) {
+            comparison = null;
+            elements.comparisonNote.hidden = true;
+            return Promise.resolve();
+        }
+        const key = `${forRange.startDate}|${forRange.endDate}|${elements.lyBasis.value}`;
+        if (comparison && comparison.key === key) return Promise.resolve();
+        return loadComparison(forRange, key);
+    }
+
     async function loadData() {
         elements.error.hidden = true;
         try {
             validateDates();
             setLoading(true);
             elements.status.textContent = "Loading cost data…";
-            const parameters = new URLSearchParams({
+            const range = {
                 startDate: elements.startDate.value,
                 endDate: elements.endDate.value
-            });
+            };
+            const parameters = new URLSearchParams(range);
+            // The comparison is the same endpoint over a fixed offset from this
+            // range, and it used to be fetched only once this year's response had
+            // already arrived - two full requests, one after the other, for one
+            // view. It depends on nothing in that response, so it goes out now.
+            const comparisonRequest = startComparison(range);
             const payload = await LosApi.fetchJson(`${API_URL}?${parameters}`);
             loadedData = payload.data || {};
             // The cost rulebook travels with the facts, so every figure below is
             // computed from what is currently saved in Cost Input.
             loadedSettings = payload.costSettings || {};
-            loadedRange = {
-                startDate: elements.startDate.value,
-                endDate: elements.endDate.value
-            };
+            loadedRange = range;
             populateHotels(payload.hotels || []);
             updateFreshness();
-            // Before the first render, so the chart is not drawn once without the
-            // comparison and again with it.
-            await ensureComparison();
+            // Still before the first render, so the chart is not drawn once
+            // without the comparison and again with it.
+            await comparisonRequest;
             render();
             const totalRows = Object.values(payload.rowCounts || {})
                 .reduce((total, count) => total + Number(count || 0), 0);

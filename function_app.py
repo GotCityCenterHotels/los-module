@@ -67,6 +67,12 @@ IMPORT_MAX_DEQUEUE_COUNT = int(os.environ.get("IMPORT_MAX_DEQUEUE_COUNT", "3"))
 # the equivalent MAX_GRID_DAYS; this applies the same guard to LOS and cost.
 MAX_RANGE_DAYS = int(os.environ.get("MAX_QUERY_RANGE_DAYS", "400"))
 
+# Short on purpose. Cost facts change when an import runs, and the operator
+# reloading the page may be the person who just triggered one, so this buys the
+# repeats within a single sitting without holding a stale answer past the point
+# anyone would notice. The sibling cost routes already sit at 120-300.
+COST_DATA_MAX_AGE_SECONDS = int(os.environ.get("COST_DATA_MAX_AGE_SECONDS", "60"))
+
 
 def validate_range_span(start_date: date, end_date: date):
     span_days = (end_date - start_date).days + 1
@@ -236,6 +242,42 @@ def cached_json_response(req, payload, etag):
 
 def supplement_cached_response(req, payload, request_key):
     return cached_json_response(req, payload, supplement_etag(payload, request_key))
+
+
+def content_hash_response(req, payload, prefix, max_age):
+    """A revalidatable JSON response for a route with no publication to name.
+
+    The Supplement and LOS reads validate against the publication that produced
+    them, which lets them answer a repeat without rebuilding anything. Cost data
+    has no such marker: the seven fact tables carry a last_updated_at but no
+    index on it, so a watermark query would sequentially scan all seven - more
+    work than the request it was meant to save - and the settings tables it also
+    depends on carry no timestamp at all.
+
+    So the validator is the body itself. It cannot skip building the response,
+    but it is exactly correct - identical bytes mean an identical ETag - and it
+    turns a repeat into a 304 with nothing on the wire. max-age is what actually
+    removes the request, and is deliberately short because this data changes
+    when an import runs, which an operator may have just triggered themselves.
+    """
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    etag = content_etag(prefix, sha256(body).hexdigest())
+    headers = {
+        "ETag": etag,
+        "Cache-Control": f"private, max-age={max_age}",
+        "Vary": "Accept-Encoding",
+    }
+    if req.headers.get("If-None-Match") == etag:
+        return func.HttpResponse(status_code=304, headers=headers)
+    if len(body) > 1400 and "gzip" in (req.headers.get("Accept-Encoding") or "").lower():
+        body = gzip.compress(body, compresslevel=5)
+        headers["Content-Encoding"] = "gzip"
+    return func.HttpResponse(
+        body=body,
+        status_code=200,
+        mimetype="application/json",
+        headers=headers,
+    )
 
 
 def validate_facts_parameters(req):
@@ -481,7 +523,11 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         }
     )
 
-    return compressed_json_response(
+    # The Cost Data page asks this endpoint twice for one view - the selected
+    # range and the same range a year back - and re-asks whenever the comparison
+    # is toggled or its basis changed. Those repeats were full rebuilds of a
+    # payload that had not moved.
+    return content_hash_response(
         req,
         {
             "parameters": {
@@ -493,6 +539,8 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             "data": datasets,
             "costSettings": cost_settings,
         },
+        "costdata",
+        COST_DATA_MAX_AGE_SECONDS,
     )
 
 
@@ -913,9 +961,22 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
         return json_response({"error": str(error)}, 400)
     except (SupplementUnavailableError, SupplementSchemaError) as error:
         return json_response({"error": str(error)}, 503)
-    except Exception:
+    except Exception as error:
         logging.exception("Supplement detail endpoint failed")
-        return json_response({"error": "Unable to retrieve Supplement detail"}, 500)
+        # A bare "Unable to retrieve Supplement detail" tells whoever reports it
+        # nothing, and tells whoever has to fix it nothing either - the only
+        # record is a stack trace nobody has in front of them. The class and the
+        # SQLSTATE are enough to place the failure and carry no query text, no
+        # parameters, and no data, which is the same line the schema services
+        # already draw.
+        return json_response(
+            {
+                "error": "Unable to retrieve Supplement detail",
+                "failure": type(error).__name__,
+                "sqlstate": getattr(error, "sqlstate", None),
+            },
+            500,
+        )
 
 
 @app.function_name(name="SupplementDataImport")

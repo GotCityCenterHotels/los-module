@@ -91,3 +91,53 @@ def reset_column_cache():
     """Test seam - the cache is keyed by table name only."""
     with _column_lock:
         _column_cache.clear()
+
+
+# "Does this travel agency name contain this term?", as one rule.
+#
+# A travel agency's name is written differently everywhere it is written:
+# Booking.com, BOOKING.COM, "Booking com", "Booking.com B.V.". An operator typing
+# one of those into a Cost Input filter means all of them, and a plain substring
+# test on the raw text means only the one they happened to type - so "booking.com"
+# silently matched nothing at a property whose mirror spells it "Booking com".
+#
+# Both sides are folded to letters and digits only, in lower case, before the
+# substring test. That absorbs case, spacing, punctuation and a trailing company
+# form in one step: booking.com, Booking Com and BOOKING.COM all fold to
+# "bookingcom", and "Booking.com B.V." folds to "bookingcombv", which contains it.
+#
+# What is removed is spacing and punctuation, and nothing else. The tempting
+# shorter pattern - drop everything that is not [:alnum:] - is ctype-dependent:
+# under the C locale it is ASCII-only, so "Hôtel Diva" would fold to "hteldiva"
+# and stop matching "hotel diva" as well as "hôtel diva". Naming only the two
+# classes to remove keeps every accented letter whatever the server's locale,
+# which matters for most of the Nordic and French names in this source. Case is
+# handled by lower(), which is collation-aware and does fold accented letters.
+#
+# Three callers have to agree on this or the editor shows matches the cost never
+# applies: the agency picker and the matching-rate picker in
+# services/cost_source_service.py, and the distribution cost query in
+# queries/cost_data.py. There is deliberately no second implementation of it in
+# Python - a rule that must be identical in three places does not get a fourth
+# copy that could drift.
+AGENCY_FOLD_PATTERN = "[[:space:][:punct:]]+"
+
+
+def agency_fold_text(expression):
+    """SQL folding one agency name or search term to its comparable form.
+
+    Takes and returns plain SQL text, so the caller can compose it either into a
+    psycopg SQL() template or into a query string.
+    """
+    return (
+        "lower(regexp_replace(coalesce(" + expression + ", ''), "
+        f"'{AGENCY_FOLD_PATTERN}', '', 'g'))"
+    )
+
+
+def agency_contains_text(name_expression, term_expression):
+    """SQL testing whether a folded agency name contains a folded term."""
+    return (
+        f"strpos({agency_fold_text(name_expression)}, "
+        f"{agency_fold_text(term_expression)}) > 0"
+    )

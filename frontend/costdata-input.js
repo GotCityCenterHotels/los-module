@@ -1190,6 +1190,21 @@
             empty.textContent = "No search terms yet.";
             filters.append(empty);
         }
+        else {
+            // Both halves of what an operator has to know before typing, said
+            // where they are typing. "booking.com" matching nothing at a property
+            // whose source spells it "Booking com" is what the folding fixes; an
+            // agency that genuinely goes by two names - an abbreviation, a
+            // rebrand - needs a term each, and that is what the union buys.
+            const hint = document.createElement("small");
+            hint.className = "tree-field-hint";
+            hint.textContent =
+                "Capitals, spaces and punctuation are ignored for every agency: "
+                + "“booking.com” also matches “Booking.com B.V.”, and “expedia” "
+                + "matches “Expedia, Inc.”. Several terms match any of them — add "
+                + "one per name the agency goes by.";
+            filters.append(hint);
+        }
         filters.append(textButton("+ Add search term", () => {
             agency.filters = agency.filters || [];
             agency.filters.push({matchField: "travelAgency", containsValue: ""});
@@ -1232,12 +1247,74 @@
         return row;
     }
 
-    // The search is a "contains" match applied without regard to case, so the
-    // suggestions have to come from the same place the cost algorithm will look
-    // - the agencies this hotel actually has reservations from.
+    // The search is a "contains" match with case, spacing and punctuation folded
+    // out of both sides, so the suggestions have to come from the same place the
+    // cost algorithm will look - the agencies this hotel actually has
+    // reservations from - and be found by the same rule.
     function buildAgencyFilter(originGroup, agency, rule, filterIndex) {
         const line = document.createElement("div");
         line.className = "tree-filter-row";
+
+        // What this term matches right now, under the field rather than only
+        // inside a popup that has to be open to be read. A term that catches
+        // nothing is the single most common way this rulebook silently charges
+        // the fallback percentage, and until now nothing on screen said so once
+        // the popup had closed.
+        const summary = document.createElement("small");
+        summary.className = "tree-filter-match";
+
+        function describeMatches(result) {
+            summary.classList.remove("is-empty", "is-error");
+            summary.hidden = !result;
+            // Hidden rather than emptied: an empty <small> still takes a grid row
+            // and its gap, so a term-less row grew by 8px for nothing.
+            if (!result) { summary.textContent = ""; return; }
+            if (result.error) {
+                summary.classList.add("is-error");
+                summary.textContent = `Could not check this term: ${result.error}`;
+                return;
+            }
+            const matches = result.agencies || [];
+            if (!matches.length) {
+                summary.classList.add("is-empty");
+                summary.textContent =
+                    "Matches no travel agency in this hotel's reservations. It is "
+                    + "still saved, and charged if one ever matches.";
+                return;
+            }
+            const reservations = matches.reduce(
+                (total, match) => total + (Number(match.reservationCount) || 0), 0
+            );
+            const shown = matches.slice(0, 3).map(match => match.name);
+            const rest = matches.length - shown.length;
+            summary.textContent =
+                `Matches ${matches.length} `
+                + `${matches.length === 1 ? "agency" : "agencies"}`
+                + ` · ${integerLabel(reservations)} res. — `
+                + shown.join(", ")
+                + (rest > 0 ? `, and ${rest} more` : "");
+        }
+
+        // Rendered from the cache when it is there, so the tree rebuilding on
+        // every edit does not fire a request per saved term each time.
+        function refreshSummary() {
+            const term = String(rule.containsValue || "").trim();
+            if (!term || !sourceCapability("travelAgency")) {
+                describeMatches(null);
+                return;
+            }
+            const cached = cachedAgencies(term, originGroup.origins);
+            if (cached) { describeMatches(cached); return; }
+            summary.classList.remove("is-empty", "is-error");
+            summary.hidden = false;
+            summary.textContent = "Checking…";
+            searchAgencies(term, originGroup.origins).then((result) => {
+                // The field may have been retyped, or the row removed, while the
+                // request was in flight.
+                if (String(rule.containsValue || "").trim() !== term) return;
+                describeMatches(result);
+            });
+        }
 
         const combo = document.createElement("div");
         combo.className = "combo";
@@ -1304,9 +1381,11 @@
                     popup.hidden = true;
                     openCombo = null;
                     setDirty(true);
+                    refreshSummary();
                 });
                 popup.append(option);
             }
+            describeMatches(result);
             // Close whatever was open BEFORE unhiding this one. The other way
             // round, the second keystroke finds this combo registered as the
             // open one and closes it again - so refining the search, which is
@@ -1317,10 +1396,14 @@
         }
 
         const debouncedSuggest = debounce(suggest, 250);
+        const debouncedSummary = debounce(refreshSummary, 400);
         input.addEventListener("input", () => {
             rule.containsValue = input.value.trim();
             setDirty(true);
             debouncedSuggest();
+            // Behind the suggestions on purpose: suggest() fills the same cache
+            // this reads, so by the time it runs the answer is usually local.
+            debouncedSummary();
         });
         input.addEventListener("focus", debouncedSuggest);
         input.addEventListener("keydown", (event) => {
@@ -1341,7 +1424,8 @@
             renderDistributionTree();
             setDirty(true);
         };
-        line.append(combo, remove);
+        line.append(combo, remove, summary);
+        refreshSummary();
         return line;
     }
 
@@ -1692,15 +1776,26 @@
         return (origins || []).join(",");
     }
 
+    // The property has to be part of the key. Without it, searching "boo" on one
+    // hotel served the next hotel's agency names, with the first hotel's
+    // reservation counts.
+    function agencyCacheKey(term, origins) {
+        return `${loadedEnterpriseId}|${originParameter(origins)}|${term.toLowerCase()}`;
+    }
+
+    // The answer if it is already here, without a request. Every tree edit
+    // rebuilds every filter row, so the match summary under each term reads this
+    // first: otherwise ticking one checkbox fired a lookup per saved term.
+    function cachedAgencies(term, origins) {
+        return agencyCache.get(agencyCacheKey(term, origins)) || null;
+    }
+
     // Returns {agencies, error}. A failure is reported rather than returned as
     // an empty list: the two look identical to the caller, and the caller's
     // message for an empty list ("no agency contains that") is a lie about a
     // request that never completed. A failure is deliberately not cached.
     async function searchAgencies(term, origins) {
-        // The property has to be part of the key. Without it, searching "boo"
-        // on one hotel served the next hotel's agency names, with the first
-        // hotel's reservation counts.
-        const key = `${loadedEnterpriseId}|${originParameter(origins)}|${term.toLowerCase()}`;
+        const key = agencyCacheKey(term, origins);
         if (agencyCache.has(key)) return agencyCache.get(key);
         try {
             const parameters = new URLSearchParams({search: term});

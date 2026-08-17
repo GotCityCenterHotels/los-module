@@ -31,6 +31,7 @@ from shared.db import HTTP_EXPORT_STATEMENT_TIMEOUT_MS
 from shared.mews_source import (
     CATEGORY_ORDERING_COLUMNS,
     UNORDERED_CATEGORY_RANK,
+    agency_contains_text,
 )
 
 
@@ -317,6 +318,11 @@ def contains_pattern(term):
     """ILIKE '%term%' with the LIKE metacharacters in the user's term escaped.
 
     A search for "50%" must look for a literal per cent sign, not "anything".
+
+    No longer used for travel agency names - those fold both sides and test with
+    strpos, which has no metacharacters to escape at all. Kept for any caller
+    that needs a genuine LIKE pattern from operator-supplied text, and because
+    getting this escaping right is not obvious the second time either.
     """
     escaped = (
         str(term or "")
@@ -678,8 +684,8 @@ def _list_travel_agencies_uncached(enterprise_id, search, origins, cursor):
               {origin_predicate}
               AND nullif(trim(agency.{agency_name}), '') IS NOT NULL
               AND (
-                  %(agency_pattern)s::text IS NULL
-                  OR agency.{agency_name} ILIKE %(agency_pattern)s ESCAPE '\\'
+                  %(agency_term)s::text IS NULL
+                  OR {agency_contains}
               )
             GROUP BY 1
             ORDER BY reservation_count DESC, agency_name
@@ -691,12 +697,18 @@ def _list_travel_agencies_uncached(enterprise_id, search, origins, cursor):
             ),
             scope=_scope_with_agency(join),
             origin_predicate=_origin_predicate(origin_column),
+            # Folded on both sides rather than ILIKE '%term%' on the raw text:
+            # what the operator types has to find the agency however this mirror
+            # happens to punctuate it. See shared/mews_source.agency_fold_text.
+            agency_contains=SQL(
+                agency_contains_text("agency.{agency_name}", "%(agency_term)s")
+            ).format(agency_name=Identifier(join.name)),
             limit=Literal(PICKER_LIMIT),
         )
         source.execute(query, {
             "enterprise_id": str(enterprise_id),
             "window_start": _window_start(),
-            "agency_pattern": contains_pattern(search) if str(search or "").strip() else None,
+            "agency_term": str(search).strip() if str(search or "").strip() else None,
             "origins": list(origins) if origins else None,
         })
         return [
@@ -797,8 +809,14 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
 
         if wants_agency and agency_available:
             scope = _scope_with_agency(join)
+            # The same fold the agency picker uses, so a term that found the
+            # agency there narrows the rates here too. They diverged before this:
+            # the picker offered "Booking.com B.V." for "booking.com" and then
+            # this query, on the raw text, matched the same reservations - but any
+            # spelling difference broke both silently and identically, and neither
+            # said which of the two filters had emptied the list.
             agency_predicate = SQL(
-                "AND agency.{} ILIKE %(agency_pattern)s ESCAPE '\\'"
+                "AND " + agency_contains_text("agency.{}", "%(agency_term)s")
             ).format(Identifier(join.name))
         else:
             scope = _STAY_SCOPE
@@ -834,7 +852,7 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
             "enterprise_id": str(enterprise_id),
             "window_start": _window_start(),
             "origins": list(origins) if origins else None,
-            "agency_pattern": contains_pattern(agencySearch) if wants_agency else None,
+            "agency_term": str(agencySearch).strip() if wants_agency else None,
         })
         rates = [
             {

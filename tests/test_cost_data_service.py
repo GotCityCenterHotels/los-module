@@ -1,4 +1,5 @@
 import os
+import threading
 import unittest
 
 from datetime import date, datetime, timezone
@@ -21,10 +22,18 @@ cost_data_service.cost_pool.close()
 
 
 class FakeCursor:
-    def __init__(self, result_sets):
-        self.result_sets = iter(result_sets)
+    """Answers by query, not by call order.
+
+    The datasets are fetched concurrently, so nothing guarantees which query
+    runs first - and a fake that hands back the next result set in sequence
+    would quietly pair each dataset with somebody else's rows.
+    """
+
+    def __init__(self, results_by_query, executions, lock):
+        self.results_by_query = results_by_query
+        self.executions = executions
+        self.lock = lock
         self.current = []
-        self.executions = []
 
     def __enter__(self):
         return self
@@ -33,8 +42,9 @@ class FakeCursor:
         return False
 
     def execute(self, query, parameters):
-        self.executions.append((query, parameters))
-        self.current = next(self.result_sets)
+        with self.lock:
+            self.executions.append((query, parameters))
+        self.current = self.results_by_query[query]
 
     def fetchall(self):
         return self.current
@@ -55,11 +65,22 @@ class FakeConnection:
 
 
 class FakePool:
-    def __init__(self, result_sets):
-        self.cursor = FakeCursor(result_sets)
+    """One cursor per checkout, because the real pool hands out one per caller.
+
+    A single shared cursor would serialise what the service now runs in
+    parallel, and would let one worker's fetchall see another's rows.
+    """
+
+    def __init__(self, results_by_query):
+        self.results_by_query = results_by_query
+        self.executions = []
+        self.lock = threading.Lock()
+        self.max_size = 4
 
     def connection(self):
-        return FakeConnection(self.cursor)
+        return FakeConnection(
+            FakeCursor(self.results_by_query, self.executions, self.lock)
+        )
 
 
 class CostDataServiceTests(unittest.TestCase):
@@ -102,12 +123,12 @@ class CostDataServiceTests(unittest.TestCase):
                 "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
             }],
         }
-        ordered = [
-            result_sets.get(dataset, [])
-            for dataset in cost_data_service.COST_DATA_QUERIES
-        ]
+        results_by_query = {
+            query: result_sets.get(dataset, [])
+            for dataset, query in cost_data_service.COST_DATA_QUERIES.items()
+        }
         original_pool = cost_data_service.cost_pool
-        fake_pool = FakePool(ordered)
+        fake_pool = FakePool(results_by_query)
         cost_data_service.cost_pool = fake_pool
 
         try:
@@ -137,9 +158,9 @@ class CostDataServiceTests(unittest.TestCase):
         self.assertEqual(datasets["distributionRates"][0]["mixRevenue"], "500.00")
 
         self.assertEqual(
-            len(fake_pool.cursor.executions), len(cost_data_service.COST_DATA_QUERIES)
+            len(fake_pool.executions), len(cost_data_service.COST_DATA_QUERIES)
         )
-        for query, parameters in fake_pool.cursor.executions:
+        for query, parameters in fake_pool.executions:
             self.assertIn("stay_date BETWEEN", query)
             self.assertEqual(parameters["start_date"], date(2026, 1, 1))
             self.assertEqual(parameters["end_date"], date(2026, 1, 31))
