@@ -232,7 +232,7 @@ function render() {
     const hotels = getSelectedHotels();
     const view = LosData.calculateAverageView(loadedFacts, {
         grain: grainInput.value,
-        hotelCodes: hotels,
+        hotelNames: hotels,
         selectedMonths: loadedMonths
     });
     const rows = pivotAverageRows(view.rows);
@@ -243,7 +243,7 @@ function render() {
     totalLosSpitElement.textContent = formatDecimal(summaryByScenario.spit?.averageLos ?? null);
     totalLosSpitCard.hidden = false;
     renderTable(rows);
-    renderChart(rows.filter(({ hotelCode }) => hotelCode === "Total"));
+    renderChart(rows.filter(({ hotelName }) => hotelName === "Total"));
 }
 
 const collator = new Intl.Collator();
@@ -261,10 +261,10 @@ function pivotAverageRows(rows) {
             byHotel = new Map();
             byPeriod.set(row.periodKey, byHotel);
         }
-        let group = byHotel.get(row.hotelCode);
+        let group = byHotel.get(row.hotelName);
         if (group === undefined) {
-            group = { periodKey: row.periodKey, hotelCode: row.hotelCode, scenarios: {} };
-            byHotel.set(row.hotelCode, group);
+            group = { periodKey: row.periodKey, hotelName: row.hotelName, scenarios: {} };
+            byHotel.set(row.hotelName, group);
             pivoted.push(group);
         }
         group.scenarios[row.scenario] = row;
@@ -272,8 +272,8 @@ function pivotAverageRows(rows) {
 
     return pivoted.sort((a, b) =>
         (a.periodKey < b.periodKey ? -1 : a.periodKey > b.periodKey ? 1 : 0)
-        || (a.hotelCode === "Total" ? 1 : 0) - (b.hotelCode === "Total" ? 1 : 0)
-        || collator.compare(a.hotelCode, b.hotelCode)
+        || (a.hotelName === "Total" ? 1 : 0) - (b.hotelName === "Total" ? 1 : 0)
+        || collator.compare(a.hotelName, b.hotelName)
     );
 }
 
@@ -304,9 +304,9 @@ function renderTable(rows) {
             periodLabels.set(item.periodKey, periodLabel);
         }
 
-        markup[index] = `<tr${item.hotelCode === "Total" ? ' class="total-row"' : ""}>`
+        markup[index] = `<tr${item.hotelName === "Total" ? ' class="total-row"' : ""}>`
             + `<td>${periodLabel}</td>`
-            + `<td>${escapeHtml(item.hotelCode)}</td>`
+            + `<td>${escapeHtml(item.hotelName)}</td>`
             + `<td>${formatDecimal(current?.averageLos ?? null)}</td>`
             + `<td>${formatDecimal(ly?.averageLos ?? null)}</td>`
             + `<td class="los-spit-column">${formatDecimal(spit?.averageLos ?? null)}</td>`

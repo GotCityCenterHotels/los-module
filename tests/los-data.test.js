@@ -4,17 +4,17 @@ const assert = require("node:assert/strict");
 const LosData = require("../frontend/los-data.js");
 
 const facts = [
-    { arrivalDate: "2026-01-01", hotelCode: "A", scenario: "current", los: 1, bookingCount: 2, nightCount: 2 },
-    { arrivalDate: "2026-01-02", hotelCode: "A", scenario: "current", los: 5, bookingCount: 1, nightCount: 5 },
-    { arrivalDate: "2026-01-02", hotelCode: "B", scenario: "current", los: 3, bookingCount: 4, nightCount: 12 },
-    { arrivalDate: "2026-02-01", hotelCode: "A", scenario: "ly", los: 2, bookingCount: 2, nightCount: 4 },
-    { arrivalDate: "2026-02-01", hotelCode: "A", scenario: "spit", los: 8, bookingCount: 1, nightCount: 8 }
+    { arrivalDate: "2026-01-01", hotelName: "A", scenario: "current", los: 1, bookingCount: 2, nightCount: 2 },
+    { arrivalDate: "2026-01-02", hotelName: "A", scenario: "current", los: 5, bookingCount: 1, nightCount: 5 },
+    { arrivalDate: "2026-01-02", hotelName: "B", scenario: "current", los: 3, bookingCount: 4, nightCount: 12 },
+    { arrivalDate: "2026-02-01", hotelName: "A", scenario: "ly", los: 2, bookingCount: 2, nightCount: 4 },
+    { arrivalDate: "2026-02-01", hotelName: "A", scenario: "spit", los: 8, bookingCount: 1, nightCount: 8 }
 ];
 
 test("weighted Average LOS uses additive nights and bookings", () => {
     const [row] = LosData.calculateAverageLos(facts, {
         grain: "month",
-        hotelCodes: ["A", "B"],
+        hotelNames: ["A", "B"],
         scenario: "current",
         portfolio: true
     });
@@ -35,7 +35,7 @@ test("one-pass Average view returns hotel, portfolio, and summary results", () =
     };
     const view = LosData.calculateAverageView(iterableFacts, {
         grain: "month",
-        hotelCodes: ["A", "B"]
+        hotelNames: ["A", "B"]
     });
 
     assert.equal(iterations, 1);
@@ -56,7 +56,7 @@ test("portfolio aggregation sums hotels", () => {
     });
 
     assert.equal(rows.reduce((sum, row) => sum + row.bookingCount, 0), 7);
-    assert.ok(rows.every((row) => row.hotelCode === "Total"));
+    assert.ok(rows.every((row) => row.hotelName === "Total"));
 });
 
 test("daily facts aggregate into month and year keys", () => {
@@ -156,7 +156,7 @@ test("empty datasets return empty analytical views", () => {
 
 test("zero booking counts yield a null average and zero percentages", () => {
     const zeroFacts = [
-        { arrivalDate: "2026-01-01", hotelCode: "A", scenario: "current", los: 1, bookingCount: 0, nightCount: 0 }
+        { arrivalDate: "2026-01-01", hotelName: "A", scenario: "current", los: 1, bookingCount: 0, nightCount: 0 }
     ];
     const [average] = LosData.calculateAverageLos(zeroFacts);
     const [distribution] = LosData.calculateDistribution(zeroFacts);

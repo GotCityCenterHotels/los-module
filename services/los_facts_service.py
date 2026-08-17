@@ -34,14 +34,16 @@ def los_read_model_enabled():
     }
 
 
+# Two hotel identities, both load-bearing: hotelName is what the hotel-list
+# route returns and what the filters send back, and enterpriseId is the stable
+# key that survives a rename. The third field this used to carry, hotelCode, was
+# a byte-for-byte copy of hotelName - on a year of facts, ~170k rows each
+# repeating the same string twice.
 def _fact_json(row):
     return {
         "arrivalDate": row["arrival_date"].isoformat(),
-        # Keep hotelCode backward-compatible for existing filters while
-        # exposing the stable unified identity for new consumers.
-        "hotelCode": row["hotel_name"],
-        "enterpriseId": row["hotel_code"],
         "hotelName": row["hotel_name"],
+        "enterpriseId": row["hotel_code"],
         "scenario": row["scenario"],
         "los": int(row["los"]),
         "bookingCount": int(row["booking_count"]),
@@ -152,12 +154,10 @@ def _fetch_published_los_facts(start_date, end_date, ly_comparison_basis):
         # is impossible; naming the row by its enterprise ID rather than by null
         # keeps a broken invariant visible instead of silently regrouping every
         # unnamed hotel together, which is what the inner join used to risk.
-        hotel_name = hotel_names.get(enterprise_id, enterprise_id)
         facts.append({
             "arrivalDate": row["arrival_date"].isoformat(),
-            "hotelCode": hotel_name,
+            "hotelName": hotel_names.get(enterprise_id, enterprise_id),
             "enterpriseId": enterprise_id,
-            "hotelName": hotel_name,
             "scenario": row["scenario"],
             "los": int(row["los"]),
             "bookingCount": int(row["booking_count"]),

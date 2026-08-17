@@ -114,15 +114,15 @@
         return child;
     }
 
-    function filterFacts(facts, { hotelCodes = null, scenario = null } = {}) {
-        const includeFact = createFactPredicate({ hotelCodes, scenario });
+    function filterFacts(facts, { hotelNames = null, scenario = null } = {}) {
+        const includeFact = createFactPredicate({ hotelNames, scenario });
         return (Array.isArray(facts) ? facts : Array.from(facts)).filter(includeFact);
     }
 
-    function createFactPredicate({ hotelCodes = null, scenario = null, selectedMonths = [] } = {}) {
-        const hotels = hotelCodes === null
+    function createFactPredicate({ hotelNames = null, scenario = null, selectedMonths = [] } = {}) {
+        const hotels = hotelNames === null
             ? null
-            : new Set(Array.isArray(hotelCodes) ? hotelCodes : [hotelCodes]);
+            : new Set(Array.isArray(hotelNames) ? hotelNames : [hotelNames]);
         const scenarios = scenario === null || scenario === "all"
             ? null
             : new Set(Array.isArray(scenario) ? scenario : [scenario]);
@@ -136,7 +136,7 @@
         }
 
         return (fact) =>
-            (hotels === null || hotels.has(fact.hotelCode))
+            (hotels === null || hotels.has(fact.hotelName))
             && (scenarios === null || scenarios.has(fact.scenario))
             && (months === null || months.has(String(fact.arrivalDate).slice(0, 7)));
     }
@@ -152,9 +152,9 @@
 
     function aggregateFacts(
         facts,
-        { grain = "day", hotelCodes = null, scenario = null, portfolio = false } = {}
+        { grain = "day", hotelNames = null, scenario = null, portfolio = false } = {}
     ) {
-        const includeFact = createFactPredicate({ hotelCodes, scenario });
+        const includeFact = createFactPredicate({ hotelNames, scenario });
         const periodKeyFor = createPeriodKeyResolver(grain);
         const index = new Map();
         const rows = [];
@@ -162,10 +162,10 @@
         for (const fact of facts) {
             if (!includeFact(fact)) continue;
             const periodKey = periodKeyFor(fact.arrivalDate);
-            const hotelCode = portfolio ? "Total" : fact.hotelCode;
+            const hotelName = portfolio ? "Total" : fact.hotelName;
             const los = Number(fact.los);
             const byLos = childMap(
-                childMap(childMap(index, periodKey), hotelCode),
+                childMap(childMap(index, periodKey), hotelName),
                 fact.scenario
             );
             let group = byLos.get(los);
@@ -173,7 +173,7 @@
             if (group === undefined) {
                 group = {
                     periodKey,
-                    hotelCode,
+                    hotelName,
                     scenario: fact.scenario,
                     los,
                     bookingCount: 0,
@@ -196,13 +196,13 @@
         const rows = [];
 
         for (const fact of exactLosFacts) {
-            const byScenario = childMap(childMap(index, fact.periodKey), fact.hotelCode);
+            const byScenario = childMap(childMap(index, fact.periodKey), fact.hotelName);
             let group = byScenario.get(fact.scenario);
 
             if (group === undefined) {
                 group = {
                     periodKey: fact.periodKey,
-                    hotelCode: fact.hotelCode,
+                    hotelName: fact.hotelName,
                     scenario: fact.scenario,
                     bookingCount: 0,
                     nightCount: 0,
@@ -230,9 +230,9 @@
 
     function calculateAverageView(
         facts,
-        { grain = "day", hotelCodes = null, scenario = null, selectedMonths = [] } = {}
+        { grain = "day", hotelNames = null, scenario = null, selectedMonths = [] } = {}
     ) {
-        const includeFact = createFactPredicate({ hotelCodes, scenario, selectedMonths });
+        const includeFact = createFactPredicate({ hotelNames, scenario, selectedMonths });
         const periodKeyFor = createPeriodKeyResolver(grain);
         const hotelIndex = new Map();
         const portfolioIndex = new Map();
@@ -253,13 +253,13 @@
             const nightCount = Number(fact.nightCount) || 0;
 
             const hotelScenarios = childMap(
-                childMap(hotelIndex, periodKey), fact.hotelCode
+                childMap(hotelIndex, periodKey), fact.hotelName
             );
             let hotelGroup = hotelScenarios.get(scenarioName);
             if (hotelGroup === undefined) {
                 hotelGroup = {
                     periodKey,
-                    hotelCode: fact.hotelCode,
+                    hotelName: fact.hotelName,
                     scenario: scenarioName,
                     bookingCount: 0,
                     nightCount: 0,
@@ -276,7 +276,7 @@
             if (portfolioGroup === undefined) {
                 portfolioGroup = {
                     periodKey,
-                    hotelCode: "Total",
+                    hotelName: "Total",
                     scenario: scenarioName,
                     bookingCount: 0,
                     nightCount: 0,
@@ -292,7 +292,7 @@
             if (summaryGroup === undefined) {
                 summaryGroup = {
                     periodKey: "All",
-                    hotelCode: "Total",
+                    hotelName: "Total",
                     scenario: scenarioName,
                     bookingCount: 0,
                     nightCount: 0,
@@ -325,7 +325,7 @@
         facts,
         {
             grain = "day",
-            hotelCodes = null,
+            hotelNames = null,
             scenario = null,
             portfolio = false,
             metric = "bookings",
@@ -338,7 +338,7 @@
         }
 
         const includeFact = createFactPredicate({
-            hotelCodes,
+            hotelNames,
             scenario,
             selectedMonths
         });
@@ -351,14 +351,14 @@
         for (const fact of facts) {
             if (!includeFact(fact)) continue;
             const periodKey = periodKeyFor(fact.arrivalDate);
-            const hotelCode = portfolio ? "Total" : fact.hotelCode;
-            const byScenario = childMap(childMap(index, periodKey), hotelCode);
+            const hotelName = portfolio ? "Total" : fact.hotelName;
+            const byScenario = childMap(childMap(index, periodKey), hotelName);
             let group = byScenario.get(fact.scenario);
 
             if (group === undefined) {
                 group = {
                     periodKey,
-                    hotelCode,
+                    hotelName,
                     scenario: fact.scenario,
                     metric,
                     // One slot per bucket, positional. The previous shape built
@@ -388,7 +388,7 @@
 
             return {
                 periodKey: group.periodKey,
-                hotelCode: group.hotelCode,
+                hotelName: group.hotelName,
                 scenario: group.scenario,
                 metric: group.metric,
                 total: rawValues.reduce((sum, value) => sum + value, 0),
@@ -405,10 +405,10 @@
         if (rows.length < 2) return rows;
 
         const hotelRank = new Map();
-        for (const row of rows) hotelRank.set(row.hotelCode, 0);
+        for (const row of rows) hotelRank.set(row.hotelName, 0);
         Array.from(hotelRank.keys())
             .sort((left, right) => collator.compare(String(left), String(right)))
-            .forEach((hotelCode, index) => hotelRank.set(hotelCode, index));
+            .forEach((hotelName, index) => hotelRank.set(hotelName, index));
 
         return rows.sort((left, right) => {
             // Period keys are fixed-shape ISO strings, or the literal "All" on
@@ -417,7 +417,7 @@
             if (left.periodKey !== right.periodKey) {
                 return left.periodKey < right.periodKey ? -1 : 1;
             }
-            const rankDifference = hotelRank.get(left.hotelCode) - hotelRank.get(right.hotelCode);
+            const rankDifference = hotelRank.get(left.hotelName) - hotelRank.get(right.hotelName);
             if (rankDifference !== 0) return rankDifference;
             return ((SCENARIO_ORDER[left.scenario] || 99) - (SCENARIO_ORDER[right.scenario] || 99))
                 || (Number(left.los || 0) - Number(right.los || 0));

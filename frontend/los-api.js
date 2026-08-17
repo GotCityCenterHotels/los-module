@@ -141,7 +141,7 @@
             for (const fact of facts || []) {
                 const key = JSON.stringify([
                     fact.arrivalDate,
-                    fact.hotelCode,
+                    fact.hotelName,
                     fact.scenario,
                     Number(fact.los)
                 ]);
@@ -153,7 +153,8 @@
                 else {
                     merged.set(key, {
                         arrivalDate: fact.arrivalDate,
-                        hotelCode: fact.hotelCode,
+                        hotelName: fact.hotelName,
+                        enterpriseId: fact.enterpriseId,
                         scenario: fact.scenario,
                         los: Number(fact.los),
                         bookingCount: Number(fact.bookingCount) || 0,

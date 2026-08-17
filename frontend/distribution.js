@@ -3,7 +3,10 @@ const API_BASE_URL = "/api";
 const startDate = document.getElementById("startDate");
 const endDate = document.getElementById("endDate");
 const grain = document.getElementById("grain");
-const hotelName = document.getElementById("hotelName");
+// The element keeps its id: distribution.html labels it and the <label for>
+// points at it. The variable is named for what it is, so it does not read as
+// the hotelName field on a fact row.
+const hotelSelect = document.getElementById("hotelName");
 const lyComparisonBasis = document.getElementById("lyComparisonBasis");
 const metric = document.getElementById("metric");
 const scenario = document.getElementById("scenario");
@@ -79,10 +82,10 @@ function getHotelRequestKey(requestState) {
 
 async function loadHotels(requestState = loadedRequestState || getRequestState(), { forceRefresh = false } = {}) {
     const requestId = ++hotelRequestId;
-    const selectedHotel = hotelName.value;
+    const selectedHotel = hotelSelect.value;
     const requestKey = getHotelRequestKey(requestState);
     if (!forceRefresh && hotelListLoaded && loadedHotelRequestKey === requestKey) return;
-    if (!hotelListLoaded) hotelName.options[0].textContent = "Loading hotels…";
+    if (!hotelListLoaded) hotelSelect.options[0].textContent = "Loading hotels…";
     const payload = await LosApi.fetchHotelList({
         apiBaseUrl: API_BASE_URL,
         startDate: requestState.startDate,
@@ -92,15 +95,15 @@ async function loadHotels(requestState = loadedRequestState || getRequestState()
     });
     if (requestId !== hotelRequestId) return;
 
-    hotelName.innerHTML = '<option value="">All hotels</option>';
+    hotelSelect.innerHTML = '<option value="">All hotels</option>';
     for (const hotel of payload.data || []) {
         const option = document.createElement("option");
         option.value = hotel;
         option.textContent = hotel;
-        hotelName.appendChild(option);
+        hotelSelect.appendChild(option);
     }
-    if (Array.from(hotelName.options).some(({ value }) => value === selectedHotel)) {
-        hotelName.value = selectedHotel;
+    if (Array.from(hotelSelect.options).some(({ value }) => value === selectedHotel)) {
+        hotelSelect.value = selectedHotel;
     }
     hotelListLoaded = true;
     loadedHotelRequestKey = requestKey;
@@ -154,10 +157,10 @@ async function loadData() {
 function render() {
     if (lastLoadedRequestKey === null) return;
 
-    const selectedHotel = hotelName.value;
+    const selectedHotel = hotelSelect.value;
     const rows = LosData.calculateDistribution(loadedFacts, {
         grain: grain.value,
-        hotelCodes: selectedHotel ? [selectedHotel] : null,
+        hotelNames: selectedHotel ? [selectedHotel] : null,
         scenario: scenario.value,
         portfolio: level.value === "total",
         metric: metric.value,
@@ -192,7 +195,7 @@ function render() {
 function renderRow(row, periodLabel, unit) {
     return `<div class="distribution-card">
         <div class="distribution-heading">
-            <div><h3>${periodLabel}</h3><span>${escapeHtml(row.hotelCode)}</span></div>
+            <div><h3>${periodLabel}</h3><span>${escapeHtml(row.hotelName)}</span></div>
             <div>${scenarioLabel(row.scenario)} &middot; ${formatNumber(row.total)}
                 ${unit}</div>
         </div>
@@ -235,8 +238,8 @@ function escapeHtml(value) {
 
 function handleHotelError(error) {
     console.error(error);
-    if (hotelName.options.length === 1) {
-        hotelName.options[0].textContent = "Hotels unavailable";
+    if (hotelSelect.options.length === 1) {
+        hotelSelect.options[0].textContent = "Hotels unavailable";
     }
 }
 
@@ -246,7 +249,7 @@ document.getElementById("monthPicker").addEventListener("periodchange", markBack
 lyComparisonBasis.addEventListener("change", markBackendSettingChanged);
 loadButton.addEventListener("click", loadData);
 grain.addEventListener("change", render);
-hotelName.addEventListener("change", render);
+hotelSelect.addEventListener("change", render);
 metric.addEventListener("change", render);
 scenario.addEventListener("change", render);
 level.addEventListener("change", render);
@@ -258,5 +261,5 @@ document.addEventListener("DOMContentLoaded", () => {
     // of the Update data click.
     if (isValidPeriod()) loadHotels().catch(handleHotelError);
 });
-hotelName.addEventListener("pointerdown", () => loadHotels().catch(handleHotelError));
-hotelName.addEventListener("focus", () => loadHotels().catch(handleHotelError));
+hotelSelect.addEventListener("pointerdown", () => loadHotels().catch(handleHotelError));
+hotelSelect.addEventListener("focus", () => loadHotels().catch(handleHotelError));

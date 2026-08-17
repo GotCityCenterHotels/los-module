@@ -70,7 +70,7 @@ test("selected months become sorted contiguous request ranges", () => {
 test("fact collections merge duplicate additive keys", () => {
     const fact = {
         arrivalDate: "2026-01-01",
-        hotelCode: "A",
+        hotelName: "A",
         scenario: "current",
         los: 2,
         bookingCount: 3,
@@ -139,7 +139,7 @@ test("disjoint ranges concatenate every row without re-keying", async () => {
     const fetcher = async (url) => ({
         data: [{
             arrivalDate: url.includes("2026-01") ? "2026-01-04" : "2026-03-04",
-            hotelCode: "A",
+            hotelName: "A",
             scenario: "current",
             los: 2,
             bookingCount: 3,
