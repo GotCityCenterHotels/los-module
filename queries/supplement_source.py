@@ -6,7 +6,14 @@ from datetime import date, datetime, timedelta
 from threading import Lock
 from zoneinfo import ZoneInfo
 
-from shared.db import HTTP_EXPORT_STATEMENT_TIMEOUT_MS, get_export_connection
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from shared.db import (
+    HTTP_EXPORT_STATEMENT_TIMEOUT_MS,
+    export_conninfo,
+    get_export_connection,
+)
 from shared.mews_source import (
     CATEGORY_ORDERING_COLUMNS,
     UNORDERED_CATEGORY_RANK,
@@ -377,21 +384,63 @@ def _require_integration_settings():
     return database_name
 
 
+def _assert_source_boundary(connection, expected_database):
+    """The connection really is integration_db, and really is read-only."""
+    with connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            "SELECT current_database() AS database_name, "
+            "current_setting('transaction_read_only') AS read_only"
+        )
+        boundary = cursor.fetchone()
+    if boundary["database_name"].lower() != expected_database.lower():
+        raise RuntimeError("Supplement source connection opened the wrong database")
+    if boundary["read_only"].lower() != "on":
+        raise RuntimeError("Supplement source connection is not read-only")
+
+
 @contextmanager
 def _read_only_source_connection(statement_timeout_ms=None):
     expected_database = _require_integration_settings()
     with get_export_connection(statement_timeout_ms) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT current_database() AS database_name, "
-                "current_setting('transaction_read_only') AS read_only"
-            )
-            boundary = cursor.fetchone()
-        if boundary["database_name"].lower() != expected_database.lower():
-            raise RuntimeError("Supplement source connection opened the wrong database")
-        if boundary["read_only"].lower() != "on":
-            raise RuntimeError("Supplement source connection is not read-only")
+        _assert_source_boundary(connection, expected_database)
         yield connection
+
+
+# The interactive read path keeps a small pool of its own. The sync jobs open a
+# connection per run and hold it for minutes, which is right for them and wrong
+# here: a dialog that opens a fresh connection pays a TLS handshake and a SCRAM
+# exchange before it can ask anything, every single time. Bounded at two because
+# that is how many pickup curves a detail request rebuilds at once.
+#
+# The boundary assertion moves to the pool's configure hook, so it still runs
+# against every physical connection - once, when the connection is created,
+# rather than once per query.
+_pickup_pool = None
+_pickup_pool_lock = Lock()
+
+
+def _pickup_connection_pool():
+    global _pickup_pool
+    if _pickup_pool is not None:
+        return _pickup_pool
+    with _pickup_pool_lock:
+        if _pickup_pool is None:
+            expected_database = _require_integration_settings()
+            _pickup_pool = ConnectionPool(
+                conninfo=export_conninfo(HTTP_EXPORT_STATEMENT_TIMEOUT_MS),
+                kwargs={"row_factory": dict_row},
+                configure=lambda connection: _assert_source_boundary(
+                    connection, expected_database
+                ),
+                min_size=int(os.environ.get("SUPPLEMENT_SOURCE_POOL_MIN_SIZE", "0")),
+                max_size=int(os.environ.get("SUPPLEMENT_SOURCE_POOL_MAX_SIZE", "2")),
+                timeout=float(os.environ.get("DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "10")),
+                max_idle=float(os.environ.get("DB_POOL_MAX_IDLE_SECONDS", "300")),
+                max_lifetime=float(os.environ.get("DB_POOL_MAX_LIFETIME_SECONDS", "1800")),
+                check=ConnectionPool.check_connection,
+                open=True,
+            )
+    return _pickup_pool
 
 
 def stockholm_today():
@@ -445,11 +494,10 @@ def fetch_pickup_history(hotel_code, stay_date, category, as_of_date):
     the response, and anything still running is holding a source backend for a
     request nobody is waiting on any more. It also uses an ordinary cursor
     rather than a named one - the result is a row per day, so the DECLARE and
-    FETCH round trips a server-side cursor adds buy nothing.
+    FETCH round trips a server-side cursor adds buy nothing - and a pooled
+    connection, so a warm instance does not re-handshake per dialog.
     """
-    with _read_only_source_connection(
-        HTTP_EXPORT_STATEMENT_TIMEOUT_MS
-    ) as connection:
+    with _pickup_connection_pool().connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(PICKUP_HISTORY_SQL, {
                 "hotel_code": str(hotel_code),

@@ -863,6 +863,13 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
     category = (req.params.get("roomCategory") or "").strip() or None
     ly_basis = req.params.get("lyComparisonBasis") or "sameDate"
     inventory_basis = req.params.get("inventoryBasis") or "sellable"
+    # Which half of the detail to build. The figures come from the published
+    # read model and are ready in milliseconds; the pickup curves are rebuilt
+    # from reservation lifecycle in the source database and are the slow half.
+    # Asking for them separately lets the dialog fill in as the figures land
+    # rather than holding an empty panel until the curves finish. Omitted means
+    # both, which is what the endpoint has always returned.
+    include = (req.params.get("include") or "all").strip().lower()
     # Lookback window for the pickup curve, in days before the stay date.
     # Omitted or "all" means the complete history back to the first booking -
     # deliberately not a large sentinel number, so nothing clips it.
@@ -890,16 +897,16 @@ def supplement_detail(req: func.HttpRequest) -> func.HttpResponse:
         started_at = perf_counter()
         payload = fetch_supplement_detail(
             hotel_code, stay_date, category, ly_basis, inventory_basis,
-            days_before_stay,
+            days_before_stay, include,
         )
         request_key = "|".join([
             hotel_code, stay_date.isoformat(), category or "", ly_basis,
-            inventory_basis, days_before_raw or "all",
+            inventory_basis, days_before_raw or "all", include,
         ])
         response = supplement_cached_response(req, payload, request_key)
         logging.info(
-            "Supplement detail served run_id=%s elapsed_ms=%.1f",
-            payload.get("runId"), (perf_counter() - started_at) * 1000,
+            "Supplement detail served run_id=%s include=%s elapsed_ms=%.1f",
+            payload.get("runId"), include, (perf_counter() - started_at) * 1000,
         )
         return response
     except ValueError as error:

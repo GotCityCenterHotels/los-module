@@ -72,6 +72,45 @@ class SharedDatabaseConfigurationTests(unittest.TestCase):
         self.assertEqual(connection_options["dbname"], "database-b")
         self.assertEqual(connection_options["user"], "shared-user")
 
+    def test_pooled_export_conninfo_carries_the_same_enforcement(self):
+        # The interactive pickup path builds its pool from a conninfo rather than
+        # calling psycopg.connect directly. Read-only enforcement is a property
+        # of the connection, not of the caller, so it has to survive that route
+        # exactly as it does the one-off one.
+        settings = {
+            "INTEGRATION_DB_HOST": "integration-host",
+            "INTEGRATION_DB_NAME": "integration_db",
+            "INTEGRATION_DB_USER": "readonly-user",
+            "INTEGRATION_DB_PASSWORD": "readonly-password",
+        }
+        with patch.dict(os.environ, settings, clear=True):
+            conninfo = db.export_conninfo(db.HTTP_EXPORT_STATEMENT_TIMEOUT_MS)
+
+        self.assertIn("default_transaction_read_only=on", conninfo)
+        self.assertIn("integration-host", conninfo)
+        self.assertIn("integration_db", conninfo)
+        self.assertIn("readonly-user", conninfo)
+        self.assertIn(
+            f"statement_timeout={db.HTTP_EXPORT_STATEMENT_TIMEOUT_MS}", conninfo
+        )
+
+    def test_pooled_and_one_off_export_settings_do_not_drift(self):
+        settings = {
+            "INTEGRATION_DB_HOST": "integration-host",
+            "INTEGRATION_DB_NAME": "integration_db",
+            "INTEGRATION_DB_USER": "readonly-user",
+            "INTEGRATION_DB_PASSWORD": "readonly-password",
+        }
+        with patch.dict(os.environ, settings, clear=True), patch.object(
+            db.psycopg, "connect"
+        ) as connect:
+            db.get_export_connection(1234)
+            conninfo = db.export_conninfo(1234)
+
+        direct = connect.call_args.kwargs
+        for key in ("host", "dbname", "user", "options"):
+            self.assertIn(str(direct[key]), conninfo, f"{key} differs between the two")
+
     def test_import_connection_uses_database_a_cost_settings(self):
         settings = {
             "POSTGRES_HOST": "shared-host",

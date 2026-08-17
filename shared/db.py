@@ -1,6 +1,7 @@
 import os
 
 import psycopg
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 
 
@@ -29,15 +30,18 @@ HTTP_EXPORT_STATEMENT_TIMEOUT_MS = int(
 )
 
 
-def get_export_connection(statement_timeout_ms=None):
-    # Database B: integration_db. All export, LOS, cost-source, and Supplement
-    # access is read-only at both the role and session level.
+def export_connection_settings(statement_timeout_ms=None):
+    """Connection arguments for Database B: integration_db.
+
+    One definition, so a pooled connection and a one-off connection cannot drift
+    apart on the settings that matter - read-only enforcement above all.
+    """
     timeout_ms = int(
         DEFAULT_EXPORT_STATEMENT_TIMEOUT_MS
         if statement_timeout_ms is None
         else statement_timeout_ms
     )
-    return psycopg.connect(
+    return dict(
         host=_setting(
             "INTEGRATION_DB_HOST",
             "EXPORT_POSTGRES_HOST",
@@ -80,6 +84,21 @@ def get_export_connection(statement_timeout_ms=None):
         ),
         row_factory=dict_row,
     )
+
+
+def get_export_connection(statement_timeout_ms=None):
+    # Database B: integration_db. All export, LOS, cost-source, and Supplement
+    # access is read-only at both the role and session level.
+    return psycopg.connect(**export_connection_settings(statement_timeout_ms))
+
+
+def export_conninfo(statement_timeout_ms=None):
+    """The same settings as a conninfo string, for a pool to build from."""
+    settings = export_connection_settings(statement_timeout_ms)
+    # row_factory is a connection-object argument, not a libpq parameter; a pool
+    # takes it separately.
+    settings.pop("row_factory", None)
+    return make_conninfo(**settings)
 
 
 def get_import_connection():

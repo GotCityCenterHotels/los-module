@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
@@ -19,11 +20,18 @@ MAX_GRID_DAYS = 366
 STALE_AFTER_HOURS = 36
 VALID_LY_COMPARISONS = {"sameDate", "sameWeekday"}
 VALID_INVENTORY_BASES = {"sellable", "physical"}
+# "summary" skips the source database entirely and answers from the published
+# read model, which is the fast half of a detail request.
+VALID_DETAIL_INCLUDES = {"all", "summary"}
 INVENTORY_EXACT_FROM = date(2026, 2, 27)
 
 _grid_cache = {}
 _grid_cache_lock = Lock()
 _detail_cache = {}
+# The figures-only half, for a dialog that has been opened before the slow half
+# of a previous open finished. Once the full payload lands it supersedes this,
+# and a summary request is answered by projecting it.
+_summary_cache = {}
 _detail_cache_lock = Lock()
 # The hotel and room-category dimensions change only when a sync publishes, so
 # they are held per publication rather than re-read on every grid request that
@@ -603,10 +611,14 @@ def _detail_rows(cursor, table, hotel_code, stay_date, category, as_of=None):
     return cursor.fetchall()
 
 
-def _stored_inventory_by_snapshot(
-    cursor, hotel_code, stay_date, category, maximum_snapshot_date
-):
+def _stored_inventory_for_dates(cursor, hotel_code, windows, category):
     """Per-snapshot inventory for the days a sync actually materialised.
+
+    windows is {stay_date: maximum_snapshot_date}. The current and comparison
+    curves want the same shape of answer for two dates with two different
+    cutoffs, and asking twice meant two round trips for one index's worth of
+    work - the lookup index leads on (hotel_code, stay_date, snapshot_date), so
+    the two branches are a bitmap OR over it.
 
     Deliberately has no lower bound: the old "snapshot_date BETWEEN stay_date -
     366 AND stay_date + 7" clipped the curve at a year regardless of what was
@@ -615,39 +627,68 @@ def _stored_inventory_by_snapshot(
     category_clause = (
         "AND i.space_room_category_id = %(category)s::uuid" if category else ""
     )
+    branches = " OR ".join(
+        f"(i.stay_date = %(stay_date_{index})s"
+        f" AND i.snapshot_date <= %(cutoff_{index})s)"
+        for index in range(len(windows))
+    )
+    parameters = {"hotel_code": hotel_code, "category": category}
+    for index, (stay_date, cutoff) in enumerate(windows.items()):
+        parameters[f"stay_date_{index}"] = stay_date
+        parameters[f"cutoff_{index}"] = cutoff
+
     cursor.execute(f"""
-        SELECT i.snapshot_date,
+        SELECT i.stay_date, i.snapshot_date,
                sum(i.total_space) AS total_space,
                sum(i.space_to_sell) AS space_to_sell,
                CASE WHEN bool_or(i.inventory_quality = 'approximated-current')
                     THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
         FROM functions.supplement_snapshot_inventory i
-        WHERE i.hotel_code = %(hotel_code)s AND i.stay_date = %(stay_date)s
-          AND i.snapshot_date <= %(maximum_snapshot_date)s
+        WHERE i.hotel_code = %(hotel_code)s
+          AND ({branches})
           {category_clause}
-        GROUP BY i.snapshot_date
+        GROUP BY i.stay_date, i.snapshot_date
+    """, parameters)
+
+    by_stay_date = {stay_date: {} for stay_date in windows}
+    for row in cursor.fetchall():
+        by_stay_date.setdefault(row["stay_date"], {})[row["snapshot_date"]] = row
+    return by_stay_date
+
+
+def _latest_inventory_for_dates(cursor, hotel_code, stay_dates, category):
+    """Latest known inventory for several stay dates, in one round trip.
+
+    This answers three former queries at once: the summary figure for the stay
+    date, and the fallback each of the two pickup curves uses for days no sync
+    materialised. They were three separate reads of the same table, two of them
+    for identical arguments.
+    """
+    # Built conditionally rather than binding a NULL the planner cannot type.
+    inventory_category_clause = (
+        "AND space_room_category_id = %(category)s::uuid" if category else ""
+    )
+    cursor.execute(f"""
+        SELECT stay_date,
+               sum(total_space) AS total_space,
+               sum(space_to_sell) AS space_to_sell,
+               CASE WHEN bool_or(inventory_quality = 'approximated-current')
+                    THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
+        FROM functions.supplement_latest_inventory
+        WHERE hotel_code = %(hotel_code)s
+          AND stay_date = ANY(%(stay_dates)s)
+          {inventory_category_clause}
+        GROUP BY stay_date
     """, {
         "hotel_code": hotel_code,
-        "stay_date": stay_date,
+        "stay_dates": list(stay_dates),
         "category": category,
-        "maximum_snapshot_date": maximum_snapshot_date,
     })
-    return {row["snapshot_date"]: row for row in cursor.fetchall()}
-
-
-def _pickup_inventory(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
-    """The Database A half of a pickup curve: stored inventory and its fallback.
-
-    Split out from the lifecycle rebuild so the two can run at the same time -
-    this part reads the published read model over the connection the request
-    already holds, while the rebuild reads the source over its own.
-    """
-    return (
-        _stored_inventory_by_snapshot(
-            cursor, hotel_code, stay_date, category, maximum_snapshot_date
-        ),
-        _latest_inventory(cursor, hotel_code, stay_date, category),
-    )
+    found = {row["stay_date"]: row for row in cursor.fetchall()}
+    # A stay date with no inventory rows drops out of a GROUP BY, where the old
+    # ungrouped aggregate returned one all-null row. An empty mapping reads the
+    # same downstream, because every consumer goes through .get(...) or 0.
+    return {stay_date: found.get(stay_date, {}) for stay_date in stay_dates}
 
 
 def _pickup_rows(history, stored, fallback):
@@ -684,24 +725,6 @@ def _pickup_rows(history, stored, fallback):
     return rows
 
 
-def _latest_inventory(cursor, hotel_code, stay_date, category):
-    category_clause = (
-        "AND space_room_category_id = %(category)s::uuid" if category else ""
-    )
-    cursor.execute(f"""
-        SELECT sum(total_space) AS total_space,
-               sum(space_to_sell) AS space_to_sell
-        FROM functions.supplement_latest_inventory
-        WHERE hotel_code = %(hotel_code)s AND stay_date = %(stay_date)s
-          {category_clause}
-    """, {
-        "hotel_code": hotel_code,
-        "stay_date": stay_date,
-        "category": category,
-    })
-    return cursor.fetchone() or {}
-
-
 def _slice_pickup(points, days_before_stay):
     """Keep the requested lookback window. None means the whole history.
 
@@ -733,6 +756,22 @@ def _windowed_payload(payload, days_before_stay):
     }
 
 
+PICKUP_FIELDS = ("pickup", "comparisonPickup", "pickupHistoryDays", "daysBeforeStay")
+
+
+def _summary_view(payload):
+    """The figures alone, with the curves stripped out.
+
+    Everything the dialog puts above the chart - rooms, rate, inventory,
+    occupancy, booking mix - comes from the published read model in Database A
+    and is ready in milliseconds. The curves are rebuilt from reservation
+    lifecycle in the source database and are the slow half. Serving the figures
+    on their own lets the dialog fill in as soon as they land instead of holding
+    an empty panel until the slow half finishes.
+    """
+    return {key: value for key, value in payload.items() if key not in PICKUP_FIELDS}
+
+
 def fetch_supplement_detail(
     hotel_code,
     stay_date,
@@ -740,13 +779,25 @@ def fetch_supplement_detail(
     ly_comparison_basis,
     inventory_basis="sellable",
     days_before_stay=None,
+    include="all",
 ):
     if ly_comparison_basis not in VALID_LY_COMPARISONS:
         raise ValueError("lyComparisonBasis must be sameDate or sameWeekday")
     if inventory_basis not in VALID_INVENTORY_BASES:
         raise ValueError("inventoryBasis must be sellable or physical")
+    if include not in VALID_DETAIL_INCLUDES:
+        raise ValueError("include must be all or summary")
     if days_before_stay is not None and days_before_stay < 1:
         raise ValueError("daysBeforeStay must be at least 1")
+    if category:
+        # The category used to be checked by a query that cast it to uuid, which
+        # accepted any spelling Postgres recognises. Normalising to the canonical
+        # form up front keeps that tolerance now the check is made in memory, and
+        # keeps two spellings of one category off two cache keys.
+        try:
+            category = str(UUID(str(category)))
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("Unknown Supplement room category") from None
     today = stockholm_today()
     minimum_allowed = add_months(today, -36)
     maximum_allowed = add_months(today, 18)
@@ -765,11 +816,21 @@ def fetch_supplement_detail(
             )
             with _detail_cache_lock:
                 cached = _detail_cache.get(cache_key)
+                cached_summary = _summary_cache.get(cache_key)
             if cached is not None:
                 logging.info("Supplement detail cache hit run_id=%s", publication["run_id"])
                 # The cache holds the complete curve, so changing the lookback
-                # window is a slice of memory rather than another source query.
+                # window is a slice of memory rather than another source query -
+                # and a request for the figures alone is a projection of it.
+                if include == "summary":
+                    return _summary_view(cached)
                 return _windowed_payload(cached, days_before_stay)
+            if include == "summary" and cached_summary is not None:
+                logging.info(
+                    "Supplement detail summary cache hit run_id=%s",
+                    publication["run_id"],
+                )
+                return cached_summary
             logging.info("Supplement detail cache miss run_id=%s", publication["run_id"])
             comparison_date = shift_last_year(stay_date, ly_comparison_basis)
             coverage = status.get("coverage")
@@ -780,19 +841,17 @@ def fetch_supplement_detail(
                 raise SupplementUnavailableError(
                     "The selected detail date has not been backfilled into PostgreSQL"
                 )
-            cursor.execute(
-                "SELECT 1 FROM functions.hotels WHERE active AND enterprise_id = %s",
-                (hotel_code,),
-            )
-            if cursor.fetchone() is None:
+            # Answered from the dimensions already held for this publication
+            # rather than from two more round trips. Same rules: an active hotel,
+            # and a category that belongs to it.
+            dimensions = _dimensions(cursor, publication)
+            if hotel_code not in dimensions["hotelNames"]:
                 raise ValueError("Unknown Supplement hotel")
-            if category:
-                cursor.execute("""
-                    SELECT 1 FROM functions.supplement_room_categories
-                    WHERE hotel_code = %s AND room_category_id = %s::uuid
-                """, (hotel_code, category))
-                if cursor.fetchone() is None:
-                    raise ValueError("Unknown Supplement room category")
+            if category and not any(
+                item["code"] == category
+                for item in dimensions["categoriesByHotel"].get(hotel_code, ())
+            ):
+                raise ValueError("Unknown Supplement room category")
             future = stay_date >= today
             comparison_as_of = shift_last_year(publication["data_as_of"], ly_comparison_basis)
             comparison_pickup_cutoff = (
@@ -805,15 +864,19 @@ def fetch_supplement_detail(
             # dialog waits for the slower of the two rather than for both in
             # turn, with all the read-model work overlapped behind them. Started
             # only after the hotel and category have been validated, so an
-            # unknown identifier still costs nothing at the source.
-            current_history = _pickup_workers.submit(
-                fetch_pickup_history,
-                hotel_code, stay_date, category, publication["data_as_of"],
-            )
-            comparison_history = _pickup_workers.submit(
-                fetch_pickup_history,
-                hotel_code, comparison_date, category, comparison_pickup_cutoff,
-            )
+            # unknown identifier still costs nothing at the source - and not at
+            # all when only the figures were asked for.
+            current_history = None
+            comparison_history = None
+            if include != "summary":
+                current_history = _pickup_workers.submit(
+                    fetch_pickup_history,
+                    hotel_code, stay_date, category, publication["data_as_of"],
+                )
+                comparison_history = _pickup_workers.submit(
+                    fetch_pickup_history,
+                    hotel_code, comparison_date, category, comparison_pickup_cutoff,
+                )
 
             current_rows = _detail_rows(cursor, "latest", hotel_code, stay_date, category)
             comparison_rows = _detail_rows(
@@ -852,35 +915,73 @@ def fetch_supplement_detail(
                     "comparisonAveragePrice": float(comparison.get("room_revenue") or 0) / comparison_rooms if comparison_rooms else None,
                 })
 
-            inventory_category_clause = (
-                "AND space_room_category_id = %(category)s::uuid"
-                if category else ""
-            )
-            cursor.execute(f"""
-                SELECT sum(total_space) AS total_space,
-                       sum(space_to_sell) AS space_to_sell,
-                       CASE WHEN bool_or(inventory_quality = 'approximated-current')
-                            THEN 'approximated-current' ELSE 'exact' END AS inventory_quality
-                FROM functions.supplement_latest_inventory
-                WHERE hotel_code = %(hotel_code)s
-                  AND stay_date = %(stay_date)s
-                  {inventory_category_clause}
-            """, {
-                "hotel_code": hotel_code,
-                "stay_date": stay_date,
-                "category": category,
-            })
-            inventory = cursor.fetchone()
-
             # Both curves' inventory comes from the read model over the
             # connection already in hand, so it is gathered while the source
-            # rebuilds are still running.
-            current_stored, current_fallback = _pickup_inventory(
-                cursor, hotel_code, stay_date, category, publication["data_as_of"]
+            # rebuilds are still running. Two reads cover what used to be five:
+            # the summary figure and the two curves' fallbacks all came from the
+            # same table, twice with identical arguments.
+            latest_inventory = _latest_inventory_for_dates(
+                cursor, hotel_code, (stay_date, comparison_date), category
             )
-            comparison_stored, comparison_fallback = _pickup_inventory(
-                cursor, hotel_code, comparison_date, category, comparison_pickup_cutoff
+            inventory = latest_inventory[stay_date]
+            total_assigned = sum(float(row.get("assigned_rooms") or 0) for row in current_rows)
+            total_revenue = sum(float(row.get("room_revenue") or 0) for row in current_rows)
+            summary = {
+                **status,
+                "hotelCode": hotel_code,
+                "stayDate": stay_date.isoformat(),
+                "roomCategory": category,
+                "comparison": "SPIT" if future else "LY",
+                "comparisonStayDate": comparison_date.isoformat(),
+                "totalAssignedRooms": total_assigned,
+                "totalAveragePrice": total_revenue / total_assigned if total_assigned else None,
+                "totalSpace": float(inventory.get("total_space") or 0),
+                "spaceToSell": float(inventory.get("space_to_sell") or 0),
+                "physicalInventory": float(inventory.get("total_space") or 0),
+                "sellableInventory": float(inventory.get("space_to_sell") or 0),
+                "inventoryBasis": inventory_basis,
+                "inventory": float(
+                    inventory.get(
+                        "space_to_sell" if inventory_basis == "sellable" else "total_space"
+                    ) or 0
+                ),
+                "inventoryExactFrom": INVENTORY_EXACT_FROM.isoformat(),
+                "spitMethod": "lifecycle",
+                "breakdown": breakdown,
+            }
+
+            if include == "summary":
+                # No curve was fetched, so the two fields the curve can influence
+                # are reported from what this half actually knows. The full
+                # request that follows carries the settled values.
+                summary_payload = {
+                    **summary,
+                    "comparisonAvailable": bool(comparison_rows),
+                    "inventoryQuality": (
+                        "approximated-current"
+                        if inventory.get("inventory_quality") == "approximated-current"
+                        else "exact"
+                    ),
+                }
+                with _detail_cache_lock:
+                    if len(_summary_cache) >= 256:
+                        _summary_cache.clear()
+                    _summary_cache[cache_key] = summary_payload
+                return summary_payload
+
+            stored_inventory = _stored_inventory_for_dates(
+                cursor,
+                hotel_code,
+                {
+                    stay_date: publication["data_as_of"],
+                    comparison_date: comparison_pickup_cutoff,
+                },
+                category,
             )
+            current_stored = stored_inventory[stay_date]
+            current_fallback = inventory
+            comparison_stored = stored_inventory[comparison_date]
+            comparison_fallback = latest_inventory[comparison_date]
 
             pickup = []
             for row in _pickup_rows(
@@ -912,8 +1013,6 @@ def fetch_supplement_detail(
                     "sellableInventory": float(row["space_to_sell"] or 0),
                     "inventoryQuality": row["inventory_quality"],
                 })
-            total_assigned = sum(float(row.get("assigned_rooms") or 0) for row in current_rows)
-            total_revenue = sum(float(row.get("room_revenue") or 0) for row in current_rows)
             inventory_quality = (
                 "approximated-current"
                 if inventory.get("inventory_quality") == "approximated-current"
@@ -924,29 +1023,10 @@ def fetch_supplement_detail(
                 else "exact"
             )
             payload = {
-                **status,
-                "hotelCode": hotel_code,
-                "stayDate": stay_date.isoformat(),
-                "roomCategory": category,
-                "comparison": "SPIT" if future else "LY",
-                "comparisonStayDate": comparison_date.isoformat(),
-                "totalAssignedRooms": total_assigned,
-                "totalAveragePrice": total_revenue / total_assigned if total_assigned else None,
-                "totalSpace": float(inventory.get("total_space") or 0),
-                "spaceToSell": float(inventory.get("space_to_sell") or 0),
-                "physicalInventory": float(inventory.get("total_space") or 0),
-                "sellableInventory": float(inventory.get("space_to_sell") or 0),
-                "inventoryBasis": inventory_basis,
-                "inventory": float(
-                    inventory.get(
-                        "space_to_sell" if inventory_basis == "sellable" else "total_space"
-                    ) or 0
-                ),
+                **summary,
+                # The two fields the curves feed into, now that they exist.
                 "inventoryQuality": inventory_quality,
-                "inventoryExactFrom": INVENTORY_EXACT_FROM.isoformat(),
-                "spitMethod": "lifecycle",
                 "comparisonAvailable": bool(comparison_rows or comparison_pickup),
-                "breakdown": breakdown,
                 "pickup": pickup,
                 "comparisonPickup": comparison_pickup,
                 # How far the reconstructed history actually reaches, so the

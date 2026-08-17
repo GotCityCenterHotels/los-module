@@ -81,7 +81,10 @@
         // history back to the first booking.
         pickupWindowDays: 30,
         pickupWindowAll: false,
-        pickupRequest: null,
+        // The complete curve for the open dialog. The window control reads from
+        // this rather than re-requesting a narrower slice of the same history.
+        detailPayload: null,
+        detailRequestId: 0,
         differenceMode: "percent",
         pastLyDiff: true,
         futureSpitDiff: false,
@@ -90,6 +93,8 @@
         payload: null,
         windowStart: 0
     };
+
+    const wholeNumbers = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 0 });
 
     const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
 
@@ -568,7 +573,11 @@
         state.pickupWindowAll = nextAll;
         state.pickupWindowDays = nextDays;
         syncWindowControls();
-        if (state.pickupRequest) refreshDetail();
+        // A repaint of a curve already in memory. This used to be a request, and
+        // the slider fires one input event per step, so a single drag from 30 to
+        // 365 issued 335 of them - every one asking the server to re-slice the
+        // same cached history, and racing the others on the way back.
+        renderPickup();
     }
 
     function bindWindowControls() {
@@ -589,30 +598,30 @@
         });
     }
 
-    async function refreshDetail() {
-        if (!state.pickupRequest) return;
-        elements.pickupCurve.innerHTML = '<div class="pickup-loading" role="progressbar" aria-label="Loading pickup pace"></div>';
-        // The dialog is already open here, so nothing else announces the reload; #pickupCoverage
-        // is the polite region that will carry the new coverage line once the fetch settles.
-        elements.pickupCoverage.textContent = "Loading pickup pace…";
-        try {
-            const payload = await Data.fetchDetail({
-                ...state.pickupRequest,
-                daysBeforeStay: state.pickupWindowAll ? "all" : state.pickupWindowDays
-            }, API_BASE_URL);
-            renderPickup(payload);
-        }
-        catch (error) {
-            elements.pickupCurve.innerHTML = "";
-            elements.pickupCoverage.textContent =
-                `Could not reload the pickup curve: ${error.message}`;
-        }
+    /**
+     * The lookback window, applied to the full curve the dialog already holds.
+     *
+     * Deliberately the same rule as _slice_pickup on the server, because it is
+     * the same operation: the server caches the complete history and hands back
+     * a slice of it. Doing it here means the window control never touches the
+     * network - the whole curve arrives once and every later adjustment is a
+     * filter over an array in memory.
+     */
+    function windowedPickup(points) {
+        if (state.pickupWindowAll) return points;
+        return points.filter((point) => point.daysBeforeStay <= state.pickupWindowDays);
     }
 
-    function renderPickup(payload) {
-        elements.pickupCurve.innerHTML = curveSvg(payload.pickup, payload.comparisonPickup);
-        const currentLast = payload.pickup.at(-1);
-        const comparisonLast = payload.comparisonPickup.at(-1);
+    function renderPickup() {
+        const payload = state.detailPayload;
+        if (!payload) return;
+        const pickup = windowedPickup(payload.pickup);
+        const comparisonPickup = windowedPickup(payload.comparisonPickup);
+        elements.pickupCurve.innerHTML = curveSvg(pickup, comparisonPickup);
+        // Points run oldest first, so the last one is the position closest to
+        // the stay date - the figure the legend names.
+        const currentLast = pickup.at(-1);
+        const comparisonLast = comparisonPickup.at(-1);
         elements.pickupCurrentLabel.textContent = currentLast
             ? `Current · ${currentLast.assignedRooms} rooms` : "Current · no history";
         elements.pickupComparisonLabel.textContent = comparisonLast
@@ -621,11 +630,11 @@
                 ? `${payload.comparison} · no history`
                 : `${payload.comparison} · no history yet`;
         const coverageParts = [];
-        if (payload.pickup.length) {
-            coverageParts.push(`Current: ${payload.pickup.length} day${payload.pickup.length === 1 ? "" : "s"}`);
+        if (pickup.length) {
+            coverageParts.push(`Current: ${pickup.length} day${pickup.length === 1 ? "" : "s"}`);
         }
-        if (payload.comparisonPickup.length) {
-            coverageParts.push(`${payload.comparison}: ${payload.comparisonPickup.length} day${payload.comparisonPickup.length === 1 ? "" : "s"}`);
+        if (comparisonPickup.length) {
+            coverageParts.push(`${payload.comparison}: ${comparisonPickup.length} day${comparisonPickup.length === 1 ? "" : "s"}`);
         }
         if (!payload.comparisonAvailable) {
             coverageParts.push(`${payload.comparison} comparison is not available yet`);
@@ -634,8 +643,42 @@
         elements.pickupWindowHint.textContent = describeWindow(payload);
     }
 
+    // Everything above the chart. Written twice per open - once from the fast
+    // read-model preview, once from the authoritative full response - so it has
+    // to be idempotent and cheap.
+    function renderDetailSummary(payload) {
+        const hotelName = state.hotels.find(({ code }) => code === payload.hotelCode)?.name || payload.hotelCode;
+        const categoryName = (state.categoriesByHotel[payload.hotelCode] || [])
+            .find(({ code }) => code === payload.roomCategory)?.name;
+        // Clear aria-busy before the first success write, not in a finally block. A polite
+        // update inside an aria-busy subtree is withheld, so #detailContext would otherwise
+        // never be announced — the attribute would only come off after the text had settled.
+        elements.dialog.removeAttribute("aria-busy");
+        elements.detailContext.textContent = `${hotelName} · ${categoryName || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
+        const occupancy = payload.inventory > 0
+            ? payload.totalAssignedRooms / payload.inventory * 100 : null;
+        elements.detailRooms.textContent = wholeNumbers.format(payload.totalAssignedRooms || 0);
+        elements.detailAdr.textContent = payload.totalAveragePrice == null
+            ? "—" : `${Data.formatMetric(payload.totalAveragePrice, "adr")} kr`;
+        elements.detailInventoryLabel.textContent = payload.inventoryBasis === "physical"
+            ? "Physical inventory" : "Sellable inventory";
+        elements.detailInventory.textContent = wholeNumbers.format(payload.inventory || 0);
+        elements.detailOccupancy.textContent = Data.formatMetric(occupancy, "occ");
+        elements.detailBreakdown.innerHTML = payload.breakdown.length
+            ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAssignedRooms, "adr") : "—"}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAveragePrice, "adr") : "—"}</td></tr>`).join("")
+            : '<tr><td colspan="5">No assigned rooms for this stay date.</td></tr>';
+        elements.dialogFootnote.textContent = payload.inventoryQuality === "approximated-current"
+            ? `Published through ${payload.dataAsOf} · inventory is approximated from current rooms before ${payload.inventoryExactFrom}.`
+            : `Data through ${payload.dataAsOf}`;
+    }
+
     async function openDetail(button) {
         const metric = button.dataset.detailMetric;
+        // Opening a second cell while the first is still loading has to leave the
+        // second one on screen. Without this the earlier response, arriving late,
+        // painted itself over the cell the user is actually looking at.
+        const requestId = ++state.detailRequestId;
+        state.detailPayload = null;
         elements.detailTitle.textContent = `${metricLabels[metric]} detail`;
         elements.detailContext.textContent = "Loading published detail…";
         elements.detailError.hidden = true;
@@ -653,55 +696,68 @@
         // A blank footnote that fills in a moment later reads as a layout jump, so hold the row.
         elements.dialogFootnote.textContent = "Loading…";
         elements.dialog.showModal();
+        syncWindowControls();
+
+        const request = {
+            hotelCode: button.dataset.detailHotel,
+            stayDate: button.dataset.detailDate,
+            roomCategory: button.dataset.detailCategory || "",
+            lyComparisonBasis: state.lyComparisonType,
+            inventoryBasis: state.inventoryBasis
+        };
+        // Two halves, in flight together. The figures come from the published
+        // read model and land in milliseconds; the curves are rebuilt from
+        // reservation lifecycle in the source database and are what the dialog
+        // used to wait on before showing anything at all. The full request also
+        // carries the settled values for the two fields a curve can influence,
+        // so it is the authoritative one and the summary is a preview.
+        //
+        // Both are wrapped so a rejection is never left unhandled while the
+        // other is still being awaited.
+        const settle = (promise) => promise.then(
+            (payload) => ({ payload }), (error) => ({ error })
+        );
+        const summaryRequest = settle(Data.fetchDetail(
+            { ...request, include: "summary" }, API_BASE_URL
+        ));
+        // Always the complete history, whatever the window is set to. It is a
+        // couple of kilobytes gzipped even for a stay booked years out, and it
+        // is what lets every later window change be a repaint instead of a
+        // request.
+        const fullRequest = settle(Data.fetchDetail(
+            { ...request, daysBeforeStay: "all" }, API_BASE_URL
+        ));
+
         try {
-            state.pickupRequest = {
-                hotelCode: button.dataset.detailHotel,
-                stayDate: button.dataset.detailDate,
-                roomCategory: button.dataset.detailCategory || "",
-                lyComparisonBasis: state.lyComparisonType,
-                inventoryBasis: state.inventoryBasis
-            };
-            syncWindowControls();
-            const payload = await Data.fetchDetail({
-                ...state.pickupRequest,
-                daysBeforeStay: state.pickupWindowAll ? "all" : state.pickupWindowDays
-            }, API_BASE_URL);
-            const hotelName = state.hotels.find(({ code }) => code === payload.hotelCode)?.name || payload.hotelCode;
-            const categoryName = (state.categoriesByHotel[payload.hotelCode] || [])
-                .find(({ code }) => code === payload.roomCategory)?.name;
-            // Clear aria-busy before the first success write, not in the finally block. A polite
-            // update inside an aria-busy subtree is withheld, so #detailContext would otherwise
-            // never be announced — the attribute would only come off after the text had settled.
-            elements.dialog.removeAttribute("aria-busy");
-            elements.detailContext.textContent = `${hotelName} · ${categoryName || "All categories"} · ${formatDateLabel(payload.stayDate)} · ${payload.comparison} comparison`;
-            const occupancy = payload.inventory > 0
-                ? payload.totalAssignedRooms / payload.inventory * 100 : null;
-            elements.detailRooms.textContent = new Intl.NumberFormat("en-SE", {
-                maximumFractionDigits: 0
-            }).format(payload.totalAssignedRooms || 0);
-            elements.detailAdr.textContent = payload.totalAveragePrice == null
-                ? "—" : `${Data.formatMetric(payload.totalAveragePrice, "adr")} kr`;
-            elements.detailInventoryLabel.textContent = payload.inventoryBasis === "physical"
-                ? "Physical inventory" : "Sellable inventory";
-            elements.detailInventory.textContent = new Intl.NumberFormat("en-SE", {
-                maximumFractionDigits: 0
-            }).format(payload.inventory || 0);
-            elements.detailOccupancy.textContent = Data.formatMetric(occupancy, "occ");
-            elements.detailBreakdown.innerHTML = payload.breakdown.length
-                ? payload.breakdown.map((row) => `<tr><td>${escapeHtml(row.requestedRoomName)}</td><td>${Data.formatMetric(row.assignedRooms, "adr")}</td><td>${Data.formatMetric(row.averagePrice, "adr")}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAssignedRooms, "adr") : "—"}</td><td>${payload.comparisonAvailable ? Data.formatMetric(row.comparisonAveragePrice, "adr") : "—"}</td></tr>`).join("")
-                : '<tr><td colspan="5">No assigned rooms for this stay date.</td></tr>';
-            renderPickup(payload);
-            elements.dialogFootnote.textContent = payload.inventoryQuality === "approximated-current"
-                ? `Published through ${payload.dataAsOf} · inventory is approximated from current rooms before ${payload.inventoryExactFrom}.`
-                : `Data through ${payload.dataAsOf}`;
+            const summary = await summaryRequest;
+            if (requestId !== state.detailRequestId) return;
+            // A failed preview is not reported: the full request is right behind
+            // it and will fail the same way, with the error handling that goes
+            // with it.
+            if (summary.payload) renderDetailSummary(summary.payload);
+
+            const full = await fullRequest;
+            if (requestId !== state.detailRequestId) return;
+            if (full.error) throw full.error;
+            const payload = full.payload;
+            state.detailPayload = payload;
+            // Re-applied rather than assumed: the preview reported what the read
+            // model alone could see, and comparisonAvailable and inventoryQuality
+            // can both change once the curves exist.
+            renderDetailSummary(payload);
+            renderPickup();
         } catch (error) {
+            if (requestId !== state.detailRequestId) return;
             elements.dialog.classList.add("has-error");
             elements.detailContext.textContent = "The selected metric could not be opened.";
             elements.detailError.textContent = error.message || "Detail data is unavailable.";
             elements.detailError.hidden = false;
+            elements.pickupCurve.innerHTML = "";
             elements.dialogFootnote.textContent = "Close and try again in a moment.";
         } finally {
-            elements.dialog.removeAttribute("aria-busy");
+            if (requestId === state.detailRequestId) {
+                elements.dialog.removeAttribute("aria-busy");
+            }
         }
     }
 

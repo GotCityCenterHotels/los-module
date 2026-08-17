@@ -68,24 +68,71 @@ class SupplementDomainTests(unittest.TestCase):
             date(2026, 2, 28),
         )
 
+    def test_summary_view_drops_the_curves_and_keeps_every_figure(self):
+        # The figures come from the published read model and are ready in
+        # milliseconds; the curves are rebuilt from the source and are the slow
+        # half. The summary view is what lets the dialog paint the first without
+        # waiting for the second, so it must carry everything above the chart.
+        payload = {
+            "runId": 7, "dataAsOf": "2026-08-16", "hotelCode": "ent-1",
+            "stayDate": "2026-08-17", "roomCategory": None, "comparison": "SPIT",
+            "totalAssignedRooms": 12, "totalAveragePrice": 1200.0,
+            "inventory": 20, "inventoryBasis": "sellable",
+            "inventoryQuality": "exact", "comparisonAvailable": True,
+            "breakdown": [{"requestedRoomName": "Double"}],
+            "pickup": [{"daysBeforeStay": 3}],
+            "comparisonPickup": [{"daysBeforeStay": 3}],
+            "pickupHistoryDays": 399, "daysBeforeStay": None,
+        }
+        view = supplement_service._summary_view(payload)
+
+        for dropped in ("pickup", "comparisonPickup", "pickupHistoryDays", "daysBeforeStay"):
+            self.assertNotIn(dropped, view)
+        for kept in (
+            "runId", "dataAsOf", "hotelCode", "stayDate", "comparison",
+            "totalAssignedRooms", "totalAveragePrice", "inventory",
+            "inventoryBasis", "inventoryQuality", "comparisonAvailable", "breakdown",
+        ):
+            self.assertEqual(view[kept], payload[kept], kept)
+        # And it is a copy: projecting must not empty the cached payload.
+        self.assertEqual(len(payload["pickup"]), 1)
+
+    def test_unknown_include_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "include"):
+            supplement_service.fetch_supplement_detail(
+                "Hotel A", date(2026, 8, 1), None, "sameDate", include="curves"
+            )
+
     def test_all_category_detail_does_not_bind_an_untyped_null(self):
         source = Path(supplement_service.__file__).read_text(encoding="utf-8")
         self.assertNotIn("(%s IS NULL OR space_room_category_id", source)
         self.assertIn("inventory_category_clause", source)
 
     def test_missing_comparison_coverage_does_not_hide_current_detail(self):
+        # The coverage guard bounds the requested stay date and nothing else. A
+        # last-year date outside coverage must leave the current figures intact
+        # and be reported through comparisonAvailable instead of failing the
+        # whole request.
+        #
+        # Anchored on the guard's own raise rather than on whatever statement
+        # happens to follow it, so reorganising the queries around it does not
+        # break the check.
         source = Path(supplement_service.__file__).read_text(encoding="utf-8")
         detail_source = source[source.index("def fetch_supplement_detail"):]
-        coverage_guard = detail_source[detail_source.index("if coverage and ("):detail_source.index(
-            "cursor.execute(\n                \"SELECT 1 FROM functions.hotels",
-            detail_source.index("if coverage and ("),
+        start = detail_source.index("if coverage and (")
+        coverage_guard = detail_source[start:detail_source.index(
+            "The selected detail date has not been backfilled", start
         )]
-        self.assertNotIn("comparison_date <", coverage_guard)
+        self.assertNotIn("comparison_date", coverage_guard)
         self.assertIn('"comparisonAvailable"', detail_source)
 
 
 class SupplementApiBoundaryTests(unittest.TestCase):
     def test_all_read_services_use_only_database_a_pool(self):
+        # Both doors onto integration_db are held shut: the one-off connection
+        # the sync paths use, and the pool the interactive pickup path uses.
+        # Database A has to answer first - publication, coverage, hotel and
+        # category - so an unknown identifier never reaches the source at all.
         calls = (
             supplement_service.fetch_supplement_status,
             supplement_service.list_supplement_hotels,
@@ -111,10 +158,14 @@ class SupplementApiBoundaryTests(unittest.TestCase):
             ), patch(
                 "queries.supplement_source.get_export_connection",
                 side_effect=AssertionError("integration_db must not be opened"),
-            ) as source:
+            ) as source, patch(
+                "queries.supplement_source._pickup_connection_pool",
+                side_effect=AssertionError("integration_db must not be opened"),
+            ) as source_pool:
                 with self.assertRaisesRegex(RuntimeError, "database-a-probe"):
                     call()
                 source.assert_not_called()
+                source_pool.assert_not_called()
 
 
 if __name__ == "__main__":
