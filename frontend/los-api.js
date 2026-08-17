@@ -7,6 +7,12 @@
     // deadline a stalled connection never settles at all, leaving buttons
     // disabled and the page stuck until a manual reload.
     const REQUEST_TIMEOUT_MS = 40000;
+    // Selecting scattered months used to cost one round trip after another, so
+    // a four-month selection waited four times as long as a one-month one. They
+    // are independent queries against a published read model, so they overlap.
+    // The cap is deliberate: the Functions app holds a small connection pool,
+    // and firing a dozen at once would just queue them there instead.
+    const MAX_CONCURRENT_RANGE_REQUESTS = 3;
 
     async function fetchJson(url, options) {
         const settings = {...options};
@@ -30,6 +36,22 @@
             // deliberately does not carry it, so log it before it is discarded.
             console.error("Network request failed", error);
             throw new Error("Could not reach the server. Check your connection and try again.");
+        }
+
+        // The success path is the big one - a year of facts is megabytes of
+        // JSON - and reading it as text first materialises the whole body as a
+        // string before the parser ever sees it. response.json() parses the
+        // bytes directly. The text path below still handles everything that is
+        // not a healthy JSON response, where the raw body is the diagnostic.
+        const contentType = response.headers?.get?.("content-type") || "";
+        if (response.ok && /\bjson\b/i.test(contentType) && typeof response.json === "function") {
+            try {
+                return await response.json();
+            }
+            catch (error) {
+                console.error(`Malformed JSON body from ${url} (HTTP ${response.status})`, error);
+                throw new Error(`API returned a malformed JSON body (HTTP ${response.status}).`);
+            }
         }
 
         const raw = await response.text();
@@ -108,6 +130,10 @@
         };
     }
 
+    // Kept for callers that combine collections which can genuinely overlap.
+    // The range path below no longer needs it: buildContiguousMonthRanges emits
+    // disjoint date ranges, so no key can appear in two collections and the
+    // merge was a per-row key allocation that could never combine anything.
     function mergeFactRows(factCollections) {
         const merged = new Map();
 
@@ -140,6 +166,25 @@
         return Array.from(merged.values());
     }
 
+    async function mapWithConcurrency(items, limit, run) {
+        const results = new Array(items.length);
+        let nextIndex = 0;
+
+        async function worker() {
+            for (;;) {
+                const index = nextIndex;
+                nextIndex += 1;
+                if (index >= items.length) return;
+                results[index] = await run(items[index], index);
+            }
+        }
+
+        await Promise.all(
+            Array.from({ length: Math.min(limit, items.length) }, worker)
+        );
+        return results;
+    }
+
     async function fetchLosFactRanges({
         apiBaseUrl = "/api",
         startDate,
@@ -149,29 +194,34 @@
         fetcher = fetchJson
     }) {
         const ranges = buildContiguousMonthRanges(selectedMonths, startDate, endDate);
-        const collections = [];
-
-        for (const range of ranges) {
-            const params = new URLSearchParams({
-                startDate: range.startDate,
-                endDate: range.endDate,
-                lyComparisonBasis
-            });
-            try {
-                const payload = await fetcher(`${apiBaseUrl}/los/facts?${params}`);
-                collections.push(payload.data || []);
+        const collections = await mapWithConcurrency(
+            ranges,
+            MAX_CONCURRENT_RANGE_REQUESTS,
+            async (range) => {
+                const params = new URLSearchParams({
+                    startDate: range.startDate,
+                    endDate: range.endDate,
+                    lyComparisonBasis
+                });
+                try {
+                    const payload = await fetcher(`${apiBaseUrl}/los/facts?${params}`);
+                    return payload.data || [];
+                }
+                catch (error) {
+                    const rangeError = new Error(
+                        `LOS facts failed for ${range.startDate} to ${range.endDate}: ${error.message}`
+                    );
+                    rangeError.cause = error;
+                    rangeError.range = range;
+                    throw rangeError;
+                }
             }
-            catch (error) {
-                const rangeError = new Error(
-                    `LOS facts failed for ${range.startDate} to ${range.endDate}: ${error.message}`
-                );
-                rangeError.cause = error;
-                rangeError.range = range;
-                throw rangeError;
-            }
-        }
+        );
 
-        const data = mergeFactRows(collections);
+        // Disjoint ranges, so concatenation is exact - and for the single-range
+        // case, which is every request that does not use the month picker, it is
+        // no work at all rather than a full re-keying of every row.
+        const data = collections.length === 1 ? collections[0] : collections.flat();
         return { data, rowCount: data.length, ranges };
     }
 
@@ -239,6 +289,7 @@
 
     const api = {
         HOTEL_CACHE_TTL_MS,
+        MAX_CONCURRENT_RANGE_REQUESTS,
         fetchJson,
         buildContiguousMonthRanges,
         mergeFactRows,

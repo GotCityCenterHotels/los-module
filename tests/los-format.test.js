@@ -85,3 +85,87 @@ test("the money field registry is the single list of SEK inputs", () => {
     assert.equal(LosFormat.isMoneyField("cleaningMinutes"), false);
     assert.equal(LosFormat.isMoneyField("cardCostPercent"), false);
 });
+
+// ---------------------------------------------------------------------------
+// Last year
+//
+// Two bases, the same two the LOS API accepts. Both are easy to get subtly wrong
+// in a way no total on the Cost Data page would reveal: a comparison that is off
+// by a day simply reads as a bad month.
+// ---------------------------------------------------------------------------
+
+const weekdayOf = (iso) => new Date(`${iso}T00:00:00Z`).getUTCDay();
+
+test("same date holds the calendar date and same weekday holds the weekday", () => {
+    assert.equal(LosFormat.lastYearDate("2026-03-01", "sameDate"), "2025-03-01");
+
+    // 364 days is 52 whole weeks, so this is the nearest date a year back that
+    // falls on the same day of the week - which is the whole point of the basis.
+    const weekday = LosFormat.lastYearDate("2026-03-01", "sameWeekday");
+    assert.equal(weekday, "2025-03-02");
+    assert.equal(weekdayOf(weekday), weekdayOf("2026-03-01"));
+    assert.equal(LosFormat.LY_WEEKDAY_OFFSET_DAYS, 364);
+});
+
+test("an unrecognised basis is treated as same date, never as no shift", () => {
+    // A typo in the select's value must not silently compare a period with
+    // itself, which would draw two identical bars and read as no change at all.
+    assert.equal(LosFormat.lastYearDate("2026-03-01", ""), "2025-03-01");
+    assert.equal(LosFormat.lastYearDate("2026-03-01", undefined), "2025-03-01");
+});
+
+test("last year's date and this year's are inverses on ordinary dates", () => {
+    for (const basis of ["sameDate", "sameWeekday"]) {
+        for (const date of ["2026-01-01", "2026-06-15", "2026-12-31"]) {
+            assert.equal(
+                LosFormat.thisYearDate(LosFormat.lastYearDate(date, basis), basis),
+                date,
+                `${date} on ${basis}`
+            );
+        }
+    }
+});
+
+test("29 February lands on the 28th rather than rolling into March", () => {
+    // Date arithmetic rolls it onto 1 March, which at a month grain moves a day
+    // into the wrong bar. Both of a leap year's late-February days compare
+    // against the 28th instead, so the comparison keeps every krona.
+    assert.equal(LosFormat.thisYearDate("2024-02-29", "sameDate"), "2025-02-28");
+    assert.equal(LosFormat.lastYearDate("2024-02-29", "sameDate"), "2023-02-28");
+    // Leap to leap is untouched.
+    assert.equal(LosFormat.lastYearDate("2024-02-29", "sameDate").slice(0, 4), "2023");
+    assert.equal(LosFormat.thisYearDate("2023-02-28", "sameDate"), "2024-02-28");
+    // Nothing else in February moves.
+    assert.equal(LosFormat.thisYearDate("2024-02-28", "sameDate"), "2025-02-28");
+});
+
+test("a range shifts both ends, keeping its length on a weekday basis", () => {
+    const range = { startDate: "2026-01-01", endDate: "2026-08-17" };
+
+    assert.deepEqual(LosFormat.lastYearRange(range, "sameDate"), {
+        startDate: "2025-01-01", endDate: "2025-08-17"
+    });
+    // 364 days off both ends is the same number of days, and both ends keep
+    // their weekday - so the comparison covers the same shape of week.
+    const weekday = LosFormat.lastYearRange(range, "sameWeekday");
+    assert.equal(weekday.startDate, "2025-01-02");
+    assert.equal(weekdayOf(weekday.startDate), weekdayOf(range.startDate));
+    assert.equal(weekdayOf(weekday.endDate), weekdayOf(range.endDate));
+});
+
+test("period keys shift as dates, so a shifted key still labels its own period", () => {
+    // Month buckets are keyed by their first date and week buckets by a Monday.
+    // 364 days is a whole number of weeks, so a Monday stays a Monday.
+    assert.equal(LosFormat.periodLabel(
+        LosFormat.lastYearDate("2026-03-01", "sameDate"), "month"
+    ), "Mar 2025");
+    const monday = LosFormat.lastYearDate("2026-03-02", "sameWeekday");
+    assert.equal(weekdayOf(monday), 1);
+    assert.equal(LosFormat.isoWeek(monday).week, LosFormat.isoWeek("2026-03-02").week);
+});
+
+test("a value that is not an ISO date is handed back rather than mangled", () => {
+    assert.equal(LosFormat.lastYearDate("All", "sameDate"), "All");
+    assert.equal(LosFormat.lastYearDate("", "sameWeekday"), "");
+    assert.equal(LosFormat.thisYearDate(null, "sameDate"), "");
+});

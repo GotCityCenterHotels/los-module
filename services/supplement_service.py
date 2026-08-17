@@ -2,6 +2,7 @@ import logging
 import os
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
@@ -24,6 +25,28 @@ _grid_cache = {}
 _grid_cache_lock = Lock()
 _detail_cache = {}
 _detail_cache_lock = Lock()
+# The hotel and room-category dimensions change only when a sync publishes, so
+# they are held per publication rather than re-read on every grid request that
+# misses the payload cache.
+_metadata_cache = {}
+_metadata_cache_lock = Lock()
+# The two fact loads are the expensive part of building a grid, and they do not
+# depend on which categories are shown or on which inventory basis is applied -
+# both of those are arithmetic over the same rows. Holding them lets a basis
+# switch, or the same period reopened, skip straight to assembling cells.
+_facts_cache = {}
+_facts_cache_lock = Lock()
+# Small on purpose. A year of comparison-mode facts is a large map, and this
+# exists to make a repeated period cheap, not to hold every period ever asked
+# for - the payload cache above already does that, more compactly.
+FACTS_CACHE_LIMIT = 4
+# Two independent stay dates, so the current and comparison pickup curves are
+# rebuilt at the same time instead of one after the other. Each task opens its
+# own read-only source connection, which is why the pool is bounded at two:
+# these are the slowest queries the app issues interactively.
+_pickup_workers = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="supplement-pickup"
+)
 STOCKHOLM_TIME_ZONE = ZoneInfo(
     os.environ.get("SUPPLEMENT_TIME_ZONE", "Europe/Stockholm")
 )
@@ -184,39 +207,69 @@ def fetch_supplement_status():
             return _status_payload(_publication(cursor, required=False))
 
 
+def _dimensions(cursor, publication):
+    """Hotels and room categories for the current publication.
+
+    Both the metadata route and every grid build need these, and they are two
+    small queries whose answer cannot change until a sync publishes again, so
+    they are read once per publication instead of once per request.
+    """
+    run_id = publication["run_id"] if publication else None
+    with _metadata_cache_lock:
+        cached = _metadata_cache.get(run_id)
+    if cached is not None:
+        return cached
+
+    cursor.execute("""
+        SELECT enterprise_id AS hotel_code, hotel_name
+        FROM functions.hotels
+        WHERE active
+        ORDER BY hotel_name, enterprise_id
+    """)
+    hotels = [
+        {"code": row["hotel_code"], "name": row["hotel_name"]}
+        for row in cursor.fetchall()
+    ]
+    cursor.execute("""
+        SELECT hotel_code, room_category_id::text AS room_category_code,
+               space_room_name, short_name, sort_order
+        FROM functions.supplement_room_categories
+        ORDER BY hotel_code, sort_order, space_room_name
+    """)
+    categories = defaultdict(list)
+    for row in cursor.fetchall():
+        categories[row["hotel_code"]].append({
+            "code": row["room_category_code"],
+            "name": row["space_room_name"],
+            "shortName": row["short_name"],
+            "order": row["sort_order"],
+        })
+
+    dimensions = {
+        "hotels": hotels,
+        # Insertion-ordered, so "the first hotel" means the same thing here as
+        # it does in the metadata the browser reads.
+        "hotelNames": {hotel["code"]: hotel["name"] for hotel in hotels},
+        "categoriesByHotel": dict(categories),
+    }
+    with _metadata_cache_lock:
+        # Exactly one publication is live at a time, so anything held against an
+        # older run_id is unreachable.
+        _metadata_cache.clear()
+        _metadata_cache[run_id] = dimensions
+    return dimensions
+
+
 def list_supplement_hotels():
     ensure_supplement_schema()
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             publication = _publication(cursor, required=False)
-            cursor.execute("""
-                SELECT enterprise_id AS hotel_code, hotel_name
-                FROM functions.hotels
-                WHERE active
-                ORDER BY hotel_name, enterprise_id
-            """)
-            hotels = [
-                {"code": row["hotel_code"], "name": row["hotel_name"]}
-                for row in cursor.fetchall()
-            ]
-            cursor.execute("""
-                SELECT hotel_code, room_category_id::text AS room_category_code,
-                       space_room_name, short_name, sort_order
-                FROM functions.supplement_room_categories
-                ORDER BY hotel_code, sort_order, space_room_name
-            """)
-            categories = defaultdict(list)
-            for row in cursor.fetchall():
-                categories[row["hotel_code"]].append({
-                    "code": row["room_category_code"],
-                    "name": row["space_room_name"],
-                    "shortName": row["short_name"],
-                    "order": row["sort_order"],
-                })
+            dimensions = _dimensions(cursor, publication)
             return {
                 **_status_payload(publication),
-                "hotels": hotels,
-                "categoriesByHotel": dict(categories),
+                "hotels": dimensions["hotels"],
+                "categoriesByHotel": dimensions["categoriesByHotel"],
             }
 
 
@@ -269,6 +322,33 @@ def _load_spit_facts(cursor, minimum_date, maximum_date, hotel_codes, as_of_date
         (row["hotel_code"], row["stay_date"], row["room_category_code"]): row
         for row in cursor.fetchall()
     }
+
+
+def _load_facts(
+    cursor, run_id, hotel_codes, latest_from, latest_to, ly_start, ly_end, spit_as_of
+):
+    """The two fact loads behind a grid, held per publication and period.
+
+    Which categories are shown and which inventory basis is applied are both
+    arithmetic over these same rows, so switching either used to re-run the two
+    heaviest queries in the request for an answer that had not changed.
+    """
+    key = (run_id, hotel_codes, latest_from, latest_to, ly_start, ly_end, spit_as_of)
+    with _facts_cache_lock:
+        cached = _facts_cache.get(key)
+    if cached is not None:
+        logging.info("Supplement fact cache hit run_id=%s", run_id)
+        return cached
+
+    facts = (
+        _load_latest_facts(cursor, latest_from, latest_to, list(hotel_codes)),
+        _load_spit_facts(cursor, ly_start, ly_end, list(hotel_codes), spit_as_of),
+    )
+    with _facts_cache_lock:
+        if len(_facts_cache) >= FACTS_CACHE_LIMIT:
+            _facts_cache.clear()
+        _facts_cache[key] = facts
+    return facts
 
 
 def _cell_for_categories(source, hotel_code, stay_date, categories):
@@ -359,12 +439,8 @@ def fetch_supplement_grid(
                 logging.info("Supplement grid cache hit run_id=%s", publication["run_id"])
                 return cached
             logging.info("Supplement grid cache miss run_id=%s", publication["run_id"])
-            cursor.execute("""
-                SELECT enterprise_id AS hotel_code, hotel_name
-                FROM functions.hotels
-                WHERE active ORDER BY hotel_name, enterprise_id
-            """)
-            hotel_lookup = {row["hotel_code"]: row["hotel_name"] for row in cursor.fetchall()}
+            dimensions = _dimensions(cursor, publication)
+            hotel_lookup = dimensions["hotelNames"]
             requested_hotel_set = set(requested_hotels)
             selected_hotels = [code for code in hotel_lookup if code in requested_hotel_set]
             if not selected_hotels and hotel_lookup:
@@ -374,21 +450,15 @@ def fetch_supplement_grid(
             if mode == "single":
                 selected_hotels = selected_hotels[:1]
 
-            cursor.execute("""
-                SELECT hotel_code, room_category_id::text AS room_category_code,
-                       space_room_name, short_name, sort_order
-                FROM functions.supplement_room_categories
-                WHERE hotel_code = ANY(%s)
-                ORDER BY hotel_code, sort_order, space_room_name
-            """, (selected_hotels,))
             category_metadata = defaultdict(list)
             short_names = {}
             category_names = {}
-            for row in cursor.fetchall():
-                code = row["room_category_code"]
-                category_metadata[row["hotel_code"]].append(code)
-                short_names[(row["hotel_code"], code)] = row["short_name"]
-                category_names[(row["hotel_code"], code)] = row["space_room_name"]
+            for hotel_code in selected_hotels:
+                for category in dimensions["categoriesByHotel"].get(hotel_code, ()):
+                    code = category["code"]
+                    category_metadata[hotel_code].append(code)
+                    short_names[(hotel_code, code)] = category["shortName"]
+                    category_names[(hotel_code, code)] = category["name"]
             if mode == "single" and requested_categories:
                 allowed = set(requested_categories)
                 category_metadata[selected_hotels[0]] = [
@@ -397,9 +467,17 @@ def fetch_supplement_grid(
 
             ly_start = shift_last_year(start_date, ly_comparison_basis)
             ly_end = shift_last_year(end_date, ly_comparison_basis)
-            latest = _load_latest_facts(cursor, min(start_date, ly_start), max(end_date, ly_end), selected_hotels)
             spit_as_of = shift_last_year(publication["data_as_of"], ly_comparison_basis)
-            spit = _load_spit_facts(cursor, ly_start, ly_end, selected_hotels, spit_as_of)
+            latest, spit = _load_facts(
+                cursor,
+                publication["run_id"],
+                tuple(selected_hotels),
+                min(start_date, ly_start),
+                max(end_date, ly_end),
+                ly_start,
+                ly_end,
+                spit_as_of,
+            )
             dates = _build_dates(start_date, end_date, ly_comparison_basis, today)
 
             rows = []
@@ -557,7 +635,22 @@ def _stored_inventory_by_snapshot(
     return {row["snapshot_date"]: row for row in cursor.fetchall()}
 
 
-def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
+def _pickup_inventory(cursor, hotel_code, stay_date, category, maximum_snapshot_date):
+    """The Database A half of a pickup curve: stored inventory and its fallback.
+
+    Split out from the lifecycle rebuild so the two can run at the same time -
+    this part reads the published read model over the connection the request
+    already holds, while the rebuild reads the source over its own.
+    """
+    return (
+        _stored_inventory_by_snapshot(
+            cursor, hotel_code, stay_date, category, maximum_snapshot_date
+        ),
+        _latest_inventory(cursor, hotel_code, stay_date, category),
+    )
+
+
+def _pickup_rows(history, stored, fallback):
     """Full pickup curve for one stay date, back to the first booking.
 
     Rooms and revenue are rebuilt from reservation lifecycle in integration_db,
@@ -567,16 +660,8 @@ def _pickup_rows(cursor, hotel_code, stay_date, category, maximum_snapshot_date)
     latest known inventory and are flagged approximated-current, matching how
     pre-2026-02-27 inventory is already reported.
     """
-    history = fetch_pickup_history(
-        hotel_code, stay_date, category, maximum_snapshot_date
-    )
     if not history:
         return []
-
-    stored = _stored_inventory_by_snapshot(
-        cursor, hotel_code, stay_date, category, maximum_snapshot_date
-    )
-    fallback = _latest_inventory(cursor, hotel_code, stay_date, category)
 
     rows = []
     for point in history:
@@ -710,6 +795,26 @@ def fetch_supplement_detail(
                     raise ValueError("Unknown Supplement room category")
             future = stay_date >= today
             comparison_as_of = shift_last_year(publication["data_as_of"], ly_comparison_basis)
+            comparison_pickup_cutoff = (
+                comparison_as_of if future else comparison_date + timedelta(days=7)
+            )
+
+            # The two lifecycle rebuilds are the slowest thing this endpoint
+            # does, they are independent of each other, and they are independent
+            # of every Database A query below. Starting them here means the
+            # dialog waits for the slower of the two rather than for both in
+            # turn, with all the read-model work overlapped behind them. Started
+            # only after the hotel and category have been validated, so an
+            # unknown identifier still costs nothing at the source.
+            current_history = _pickup_workers.submit(
+                fetch_pickup_history,
+                hotel_code, stay_date, category, publication["data_as_of"],
+            )
+            comparison_history = _pickup_workers.submit(
+                fetch_pickup_history,
+                hotel_code, comparison_date, category, comparison_pickup_cutoff,
+            )
+
             current_rows = _detail_rows(cursor, "latest", hotel_code, stay_date, category)
             comparison_rows = _detail_rows(
                 cursor,
@@ -766,9 +871,20 @@ def fetch_supplement_detail(
                 "category": category,
             })
             inventory = cursor.fetchone()
+
+            # Both curves' inventory comes from the read model over the
+            # connection already in hand, so it is gathered while the source
+            # rebuilds are still running.
+            current_stored, current_fallback = _pickup_inventory(
+                cursor, hotel_code, stay_date, category, publication["data_as_of"]
+            )
+            comparison_stored, comparison_fallback = _pickup_inventory(
+                cursor, hotel_code, comparison_date, category, comparison_pickup_cutoff
+            )
+
             pickup = []
             for row in _pickup_rows(
-                cursor, hotel_code, stay_date, category, publication["data_as_of"]
+                current_history.result(), current_stored, current_fallback
             ):
                 rooms = float(row["assigned_rooms"] or 0)
                 pickup.append({
@@ -783,9 +899,8 @@ def fetch_supplement_detail(
                     "inventoryQuality": row["inventory_quality"],
                 })
             comparison_pickup = []
-            comparison_pickup_cutoff = comparison_as_of if future else comparison_date + timedelta(days=7)
             for row in _pickup_rows(
-                cursor, hotel_code, comparison_date, category, comparison_pickup_cutoff
+                comparison_history.result(), comparison_stored, comparison_fallback
             ):
                 rooms = float(row["assigned_rooms"] or 0)
                 comparison_pickup.append({

@@ -246,55 +246,82 @@ function render() {
     renderChart(rows.filter(({ hotelCode }) => hotelCode === "Total"));
 }
 
+const collator = new Intl.Collator();
+
 function pivotAverageRows(rows) {
-    const groups = new Map();
+    // Nested lookups rather than one composite key string per row: the keys are
+    // built fresh every render and the engine has to hash each one end to end,
+    // where the strings the rows already carry are hashed once and cached.
+    const byPeriod = new Map();
+    const pivoted = [];
+
     for (const row of rows) {
-        const key = JSON.stringify([row.periodKey, row.hotelCode]);
-        const group = groups.get(key) || { periodKey: row.periodKey, hotelCode: row.hotelCode, scenarios: {} };
+        let byHotel = byPeriod.get(row.periodKey);
+        if (byHotel === undefined) {
+            byHotel = new Map();
+            byPeriod.set(row.periodKey, byHotel);
+        }
+        let group = byHotel.get(row.hotelCode);
+        if (group === undefined) {
+            group = { periodKey: row.periodKey, hotelCode: row.hotelCode, scenarios: {} };
+            byHotel.set(row.hotelCode, group);
+            pivoted.push(group);
+        }
         group.scenarios[row.scenario] = row;
-        groups.set(key, group);
     }
-    return Array.from(groups.values()).sort((a, b) =>
-        a.periodKey.localeCompare(b.periodKey)
+
+    return pivoted.sort((a, b) =>
+        (a.periodKey < b.periodKey ? -1 : a.periodKey > b.periodKey ? 1 : 0)
         || (a.hotelCode === "Total" ? 1 : 0) - (b.hotelCode === "Total" ? 1 : 0)
-        || a.hotelCode.localeCompare(b.hotelCode)
+        || collator.compare(a.hotelCode, b.hotelCode)
     );
 }
 
 function renderTable(rows) {
-    resultsBody.innerHTML = "";
     document.querySelector("th.los-spit-column").hidden = false;
 
     if (rows.length === 0) {
-        const row = document.createElement("tr");
-        const cell = document.createElement("td");
-        cell.colSpan = 11;
-        cell.className = "empty-table-cell";
-        cell.textContent = "No rows for the selected hotels and period.";
-        row.appendChild(cell);
-        resultsBody.appendChild(row);
+        resultsBody.innerHTML =
+            '<tr><td colspan="11" class="empty-table-cell">No rows for the selected hotels and period.</td></tr>';
+        resultsSection.hidden = false;
+        return;
     }
 
-    for (const item of rows) {
+    const grain = grainInput.value;
+    // A day grain across a full portfolio is a row per date per hotel, and the
+    // period label repeats once per hotel within each date.
+    const periodLabels = new Map();
+    const markup = new Array(rows.length);
+
+    for (let index = 0; index < rows.length; index += 1) {
+        const item = rows[index];
         const current = item.scenarios.current;
         const ly = item.scenarios.ly;
         const spit = item.scenarios.spit;
-        const row = document.createElement("tr");
-        if (item.hotelCode === "Total") row.classList.add("total-row");
-        row.innerHTML = `
-            <td>${escapeHtml(LosFormat.periodLabel(item.periodKey, grainInput.value))}</td>
-            <td>${escapeHtml(item.hotelCode)}</td>
-            <td>${formatDecimal(current?.averageLos ?? null)}</td>
-            <td>${formatDecimal(ly?.averageLos ?? null)}</td>
-            <td class="los-spit-column">${formatDecimal(spit?.averageLos ?? null)}</td>
-            <td>${formatInteger(current?.nightCount ?? null)}</td>
-            <td>${formatInteger(ly?.nightCount ?? null)}</td>
-            <td>${formatInteger(spit?.nightCount ?? null)}</td>
-            <td>${formatInteger(current?.bookingCount ?? null)}</td>
-            <td>${formatInteger(ly?.bookingCount ?? null)}</td>
-            <td>${formatInteger(spit?.bookingCount ?? null)}</td>`;
-        resultsBody.appendChild(row);
+        let periodLabel = periodLabels.get(item.periodKey);
+        if (periodLabel === undefined) {
+            periodLabel = escapeHtml(LosFormat.periodLabel(item.periodKey, grain));
+            periodLabels.set(item.periodKey, periodLabel);
+        }
+
+        markup[index] = `<tr${item.hotelCode === "Total" ? ' class="total-row"' : ""}>`
+            + `<td>${periodLabel}</td>`
+            + `<td>${escapeHtml(item.hotelCode)}</td>`
+            + `<td>${formatDecimal(current?.averageLos ?? null)}</td>`
+            + `<td>${formatDecimal(ly?.averageLos ?? null)}</td>`
+            + `<td class="los-spit-column">${formatDecimal(spit?.averageLos ?? null)}</td>`
+            + `<td>${formatInteger(current?.nightCount ?? null)}</td>`
+            + `<td>${formatInteger(ly?.nightCount ?? null)}</td>`
+            + `<td>${formatInteger(spit?.nightCount ?? null)}</td>`
+            + `<td>${formatInteger(current?.bookingCount ?? null)}</td>`
+            + `<td>${formatInteger(ly?.bookingCount ?? null)}</td>`
+            + `<td>${formatInteger(spit?.bookingCount ?? null)}</td></tr>`;
     }
+
+    // One parse of one string. Assigning innerHTML per row made the browser
+    // parse, build, and insert a fragment thousands of times over, each one
+    // touching a live table.
+    resultsBody.innerHTML = markup.join("");
     resultsSection.hidden = false;
 }
 
@@ -502,9 +529,12 @@ function setHotelMenuOpen(open) {
     hotelToggle.setAttribute("aria-expanded", String(open));
 }
 
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
+
+// One pass instead of five. This runs twice per table row, so on a day-grain
+// year it is thousands of full string rewrites either way.
 function escapeHtml(value) {
-    return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+    return String(value ?? "").replace(/[&<>"']/g, (character) => HTML_ESCAPES[character]);
 }
 
 function showError(message) {
@@ -561,4 +591,10 @@ loadButton.addEventListener("click", loadData);
 document.addEventListener("DOMContentLoaded", () => {
     updateHotelToggleText();
     updateLoadButtonState();
+    // Nothing on the page waits for the hotel list, and it is small, separately
+    // cached, and needed by the first interaction either way. Starting it now
+    // means the dropdown is already populated when it is opened, and it wakes a
+    // cold Functions instance so the Update data click behind it does not also
+    // pay for the start-up.
+    if (isValidPeriod()) loadHotels().catch(handleHotelError);
 });

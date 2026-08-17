@@ -139,6 +139,74 @@
         return {week, weekYear: String(weekYear)};
     }
 
+    // ---------------------------------------------------------------------
+    // Last year
+    //
+    // Two bases, the same two the LOS API accepts. "Same date" is the calendar
+    // date a year away - what a finance reader means by last year. "Same weekday"
+    // is 364 days, which is 52 whole weeks, so a Saturday compares with a
+    // Saturday; for anything driven by day of week - arrivals, departures, a
+    // weekend rate - that is the only comparison that is not mostly noise.
+    // ---------------------------------------------------------------------
+    const LY_WEEKDAY_OFFSET_DAYS = 364;
+
+    function isLeapYear(year) {
+        return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    }
+
+    function isoPlusDays(isoDate, days) {
+        const value = parts(isoDate);
+        if (!value) return String(isoDate ?? "");
+        return new Date(Date.UTC(
+            Number(value.year), value.monthIndex, value.day + days
+        )).toISOString().slice(0, 10);
+    }
+
+    // The same calendar date, one year away, done on the string rather than
+    // through Date. Date rolls 29 February onto 1 March, which would move a day
+    // into the following month and, at a month grain, into the wrong bar. Here
+    // both of a leap year's late-February days land on the 28th instead, so the
+    // comparison keeps every krona rather than dropping a day out of one side.
+    function shiftCalendarYear(isoDate, years) {
+        const iso = String(isoDate ?? "").slice(0, 10);
+        if (!ISO_DATE.test(iso)) return iso;
+        const target = Number(iso.slice(0, 4)) + years;
+        const monthDay = iso.slice(5);
+        return monthDay === "02-29" && !isLeapYear(target)
+            ? `${target}-02-28`
+            : `${target}-${monthDay}`;
+    }
+
+    function shiftYear(isoDate, basis, direction) {
+        return basis === "sameWeekday"
+            ? isoPlusDays(isoDate, direction * LY_WEEKDAY_OFFSET_DAYS)
+            : shiftCalendarYear(isoDate, direction);
+    }
+
+    /** The date one year before this one, on the given basis. */
+    function lastYearDate(isoDate, basis) {
+        return shiftYear(isoDate, basis, -1);
+    }
+
+    /**
+     * The date a last-year date compares against - the inverse of lastYearDate.
+     *
+     * This is what lets last year's rows be restamped with the dates they compare
+     * against, so both years bucket into the same periods by construction rather
+     * than being paired by position.
+     */
+    function thisYearDate(isoDate, basis) {
+        return shiftYear(isoDate, basis, 1);
+    }
+
+    /** A {startDate, endDate} range, one year back. */
+    function lastYearRange(range, basis) {
+        return {
+            startDate: lastYearDate(range.startDate, basis),
+            endDate: lastYearDate(range.endDate, basis)
+        };
+    }
+
     function periodLabel(periodKey, grain = "day") {
         const value = parts(periodKey);
         // "All" and anything that is not an ISO date is already a label.
@@ -189,6 +257,11 @@
         bindSekInput,
         isoWeek,
         periodLabel,
-        periodLabelParts
+        periodLabelParts,
+        LY_WEEKDAY_OFFSET_DAYS,
+        isoPlusDays,
+        lastYearDate,
+        thisYearDate,
+        lastYearRange
     };
 }));

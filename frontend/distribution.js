@@ -165,30 +165,44 @@ function render() {
         selectedMonths: loadedMonths
     });
 
-    results.innerHTML = "";
     if (rows.length === 0) {
         results.innerHTML = '<div class="summary-card">No distribution data found.</div>';
         return;
     }
-    rows.forEach(renderRow);
+
+    const selectedGrain = grain.value;
+    const unit = metric.value === "bookings" ? "reservations" : "nights";
+    // A day grain across a full portfolio is a card per date per hotel, and the
+    // period label is identical for every hotel within a date.
+    const periodLabels = new Map();
+    const markup = rows.map((row) => {
+        let periodLabel = periodLabels.get(row.periodKey);
+        if (periodLabel === undefined) {
+            periodLabel = escapeHtml(LosFormat.periodLabel(row.periodKey, selectedGrain));
+            periodLabels.set(row.periodKey, periodLabel);
+        }
+        return renderRow(row, periodLabel, unit);
+    });
+
+    // One parse of one string, rather than creating, filling, and inserting a
+    // card element at a time into a live document.
+    results.innerHTML = markup.join("");
 }
 
-function renderRow(row) {
-    const card = document.createElement("div");
-    card.className = "distribution-card";
-    card.innerHTML = `
+function renderRow(row, periodLabel, unit) {
+    return `<div class="distribution-card">
         <div class="distribution-heading">
-            <div><h3>${escapeHtml(LosFormat.periodLabel(row.periodKey, grain.value))}</h3><span>${escapeHtml(row.hotelCode)}</span></div>
+            <div><h3>${periodLabel}</h3><span>${escapeHtml(row.hotelCode)}</span></div>
             <div>${scenarioLabel(row.scenario)} &middot; ${formatNumber(row.total)}
-                ${metric.value === "bookings" ? "reservations" : "nights"}</div>
+                ${unit}</div>
         </div>
         <div class="distribution-bar">
             ${row.values.map((item, index) => segment(`los-${Math.min(index + 1, 5)}`, item)).join("")}
         </div>
         <div class="distribution-values">
             ${row.values.map(valueItem).join("")}
-        </div>`;
-    results.appendChild(card);
+        </div>
+    </div>`;
 }
 
 function segment(cssClass, item) {
@@ -205,13 +219,18 @@ function scenarioLabel(value) {
     return value === "ly" ? "Actual LY" : value === "spit" ? "SPIT" : "Current";
 }
 
+// Constructing an Intl formatter is expensive and this is called six times per
+// card, so it is built once rather than once per number.
+const numberFormatter = new Intl.NumberFormat("en-SE");
+
 function formatNumber(value) {
-    return new Intl.NumberFormat("en-SE").format(value);
+    return numberFormatter.format(value);
 }
 
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
+
 function escapeHtml(value) {
-    return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+    return String(value ?? "").replace(/[&<>"']/g, (character) => HTML_ESCAPES[character]);
 }
 
 function handleHotelError(error) {
@@ -233,6 +252,11 @@ scenario.addEventListener("change", render);
 level.addEventListener("change", render);
 document.addEventListener("DOMContentLoaded", () => {
     updateLoadButtonState();
+    // Same reasoning as the Average LOS page: the hotel list is small, cached
+    // separately, and wanted by the first interaction, so fetching it now fills
+    // the select before it is opened and warms a cold Functions instance ahead
+    // of the Update data click.
+    if (isValidPeriod()) loadHotels().catch(handleHotelError);
 });
 hotelName.addEventListener("pointerdown", () => loadHotels().catch(handleHotelError));
 hotelName.addEventListener("focus", () => loadHotels().catch(handleHotelError));

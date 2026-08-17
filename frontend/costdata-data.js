@@ -414,6 +414,42 @@
         return matchedShare * matched + (1 - matchedShare) * fallback;
     }
 
+    // -----------------------------------------------------------------------
+    // Comparing with last year
+    //
+    // Last year's rows, restamped with the current-year dates they compare
+    // against, so both years bucket into the same periods by construction and can
+    // be matched on the period key.
+    //
+    // The alternative - bucketing each year separately and pairing bar 1 with bar
+    // 1 - slips the moment one year has a period the other does not, and then
+    // every bar after it is compared against the wrong month with nothing on
+    // screen to show it.
+    //
+    // Restamping is safe because every figure on the statement is derived per
+    // stay date and the shift is one-to-one on dates: the staffing thresholds
+    // still band each day on its own, and the two mixes still meet the revenue
+    // and departures they belong to, because they are shifted with them.
+    //
+    // hotelsInScope narrows it to the properties this year has. A hotel that
+    // closed would otherwise put revenue in the last-year bar with nothing beside
+    // it to compare against, and read as a collapse.
+    function alignToComparison(source, basis, hotelsInScope) {
+        const scope = hotelsInScope instanceof Set
+            ? hotelsInScope
+            : new Set(hotelsInScope || []);
+        const aligned = {};
+        for (const [dataset, rows] of Object.entries(source || {})) {
+            aligned[dataset] = (rows || [])
+                .filter((row) => row && row.stayDate
+                    && (!row.hotelName || scope.has(row.hotelName)))
+                .map((row) => ({
+                    ...row, stayDate: Format.thisYearDate(row.stayDate, basis)
+                }));
+        }
+        return aligned;
+    }
+
     function zeroTotals() {
         const totals = {};
         for (const {key} of GOP_LINES) totals[key] = 0;
@@ -847,6 +883,7 @@
         aggregate,
         summarize,
         calculateGop,
+        alignToComparison,
         // Exported for the tests: the nearest-band fallback and the checkbox
         // coercion are both easy to get subtly wrong and neither is reachable
         // through calculateGop without building a whole fixture.

@@ -83,7 +83,7 @@ test("fact collections merge duplicate additive keys", () => {
     assert.equal(merged[0].nightCount, 10);
 });
 
-test("non-contiguous fact ranges execute sequentially", async () => {
+test("non-contiguous fact ranges overlap, up to the concurrency cap", async () => {
     const requestedUrls = [];
     let active = 0;
     let maxActive = 0;
@@ -105,9 +105,82 @@ test("non-contiguous fact ranges execute sequentially", async () => {
     });
 
     assert.equal(requestedUrls.length, 2);
-    assert.equal(maxActive, 1);
+    assert.equal(maxActive, 2);
     assert.match(requestedUrls[0], /startDate=2026-01-01/);
     assert.match(requestedUrls[1], /startDate=2026-03-01/);
+});
+
+test("more ranges than the concurrency cap queue instead of all firing", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const fetcher = async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+        return { data: [] };
+    };
+
+    // Six single-month selections, each of which becomes its own range.
+    const selectedMonths = ["2026-01", "2026-03", "2026-05", "2026-07", "2026-09", "2026-11"];
+    await LosApi.fetchLosFactRanges({
+        startDate: "2026-01-01",
+        endDate: "2026-11-30",
+        lyComparisonBasis: "sameDate",
+        selectedMonths,
+        fetcher
+    });
+
+    assert.equal(maxActive, LosApi.MAX_CONCURRENT_RANGE_REQUESTS);
+    assert.ok(maxActive < selectedMonths.length);
+});
+
+test("disjoint ranges concatenate every row without re-keying", async () => {
+    const fetcher = async (url) => ({
+        data: [{
+            arrivalDate: url.includes("2026-01") ? "2026-01-04" : "2026-03-04",
+            hotelCode: "A",
+            scenario: "current",
+            los: 2,
+            bookingCount: 3,
+            nightCount: 6
+        }]
+    });
+
+    const result = await LosApi.fetchLosFactRanges({
+        startDate: "2026-01-01",
+        endDate: "2026-03-31",
+        lyComparisonBasis: "sameDate",
+        selectedMonths: ["2026-01", "2026-03"],
+        fetcher
+    });
+
+    assert.equal(result.rowCount, 2);
+    assert.deepEqual(
+        result.data.map(({ arrivalDate }) => arrivalDate).sort(),
+        ["2026-01-04", "2026-03-04"]
+    );
+});
+
+test("healthy JSON responses are parsed without materialising the body as text", async () => {
+    const originalFetch = global.fetch;
+    let textCalls = 0;
+    global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ data: [{ los: 1 }] }),
+        text: async () => { textCalls += 1; return "{}"; }
+    });
+
+    try {
+        const payload = await LosApi.fetchJson("/api/los/facts");
+        assert.deepEqual(payload, { data: [{ los: 1 }] });
+        assert.equal(textCalls, 0);
+    }
+    finally {
+        global.fetch = originalFetch;
+    }
 });
 
 test("range failures identify the range and return no partial result", async () => {

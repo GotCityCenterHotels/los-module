@@ -68,6 +68,11 @@
         hotel: document.getElementById("costHotel"),
         grain: document.getElementById("costGrain"),
         chartGrain: document.getElementById("gopChartGrain"),
+        showLy: document.getElementById("gopChartShowLy"),
+        lyBasis: document.getElementById("gopChartLyBasis"),
+        chartNote: document.getElementById("gopChartNote"),
+        comparisonNote: document.getElementById("gopComparisonNote"),
+        lyLegend: document.querySelectorAll(".gop-legend-ly-entry"),
         loadButton: document.getElementById("costLoadButton"),
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
@@ -99,6 +104,17 @@
         revenue: "#7c3aed"
     });
 
+    // Last year, in the same four roles at a fraction of the weight. Same hues
+    // rather than four new ones: the reader has to see "the cost bar, last year",
+    // not a second colour scheme to learn - and the pairs stay distinguishable
+    // when they sit side by side a few pixels apart.
+    const LY_COLOURS = Object.freeze({
+        base: "#a9b2c0",
+        profit: "#83c8a5",
+        loss: "#e8a29c",
+        revenue: "#c0aaf3"
+    });
+
     const integerFormatter = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 0 });
     const dateTimeFormatter = new Intl.DateTimeFormat("en-SE", {
         year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
@@ -106,6 +122,13 @@
 
     let loadedData = null;
     let loadedSettings = {};
+    // The range the loaded facts actually cover, which is not the same thing as
+    // what the date inputs currently say: the comparison has to be fetched for
+    // the range on screen, not for one the reader has typed but not applied yet.
+    let loadedRange = null;
+    // Last year's facts, as {key, data}. Fetched only when the comparison is
+    // switched on, and re-fetched when the range or the basis changes.
+    let comparison = null;
     let activeDataset = "roomRevenue";
     // Every group counts until it is switched off in Query settings. Clearing
     // one takes it out of the statement, out of GOP and out of the chart, so
@@ -137,7 +160,77 @@
         elements.loadButton.textContent = value ? "Updating…" : "Update data";
         elements.startDate.disabled = value;
         elements.endDate.disabled = value;
+        // The comparison controls can each start a request of their own, so they
+        // are held while one is already in flight.
+        if (elements.showLy) elements.showLy.disabled = value;
+        if (elements.lyBasis) {
+            elements.lyBasis.disabled = value
+                || !(elements.showLy && elements.showLy.checked);
+        }
         document.querySelector(".cost-workspace").setAttribute("aria-busy", String(value));
+    }
+
+    // ---------------------------------------------------------------------
+    // Last year
+    //
+    // The two bases and the date arithmetic behind them live in los-format.js,
+    // beside the period keys they have to stay consistent with, and are unit
+    // tested there: 29 February and the 364-day offset are both easy to get
+    // subtly wrong in a way no total on this page would reveal.
+    // ---------------------------------------------------------------------
+
+    function comparisonKey() {
+        if (!loadedRange) return "";
+        return `${loadedRange.startDate}|${loadedRange.endDate}|${elements.lyBasis.value}`;
+    }
+
+    function syncComparisonControls() {
+        // A basis that changes nothing while the comparison is off is a control
+        // that lies about having an effect.
+        if (elements.lyBasis) {
+            elements.lyBasis.disabled = !(elements.showLy && elements.showLy.checked);
+        }
+    }
+
+    // Driven by what was actually drawn, not by the checkbox: a comparison that
+    // failed to load leaves the box ticked, and a legend naming marks that are
+    // not on the chart is worse than no legend entry at all.
+    function syncComparisonLegend(drawn) {
+        for (const entry of elements.lyLegend) entry.hidden = !drawn;
+    }
+
+    async function ensureComparison() {
+        if (!elements.showLy || !elements.showLy.checked || !loadedRange) {
+            comparison = null;
+            elements.comparisonNote.hidden = true;
+            return;
+        }
+        const key = comparisonKey();
+        if (comparison && comparison.key === key) return;
+
+        // Busy state belongs to the caller: loadData already holds the controls
+        // through setLoading, and doing it here as well released them halfway
+        // through a load that was still running.
+        const range = LosFormat.lastYearRange(loadedRange, elements.lyBasis.value);
+        elements.comparisonNote.hidden = true;
+        try {
+            const payload = await LosApi.fetchJson(
+                `${API_URL}?${new URLSearchParams(range)}`
+            );
+            comparison = {key, data: payload.data || {}};
+        }
+        catch (error) {
+            console.error(error);
+            comparison = null;
+            // Deliberately not the page's error panel, and deliberately not
+            // clearing the statement: this year's figures are still complete and
+            // correct, and hiding them over a comparison that is an extra reading
+            // would be the larger loss.
+            elements.comparisonNote.textContent =
+                `Last year (${range.startDate} – ${range.endDate}) could not be loaded: `
+                + `${error.message || "the request failed"}. The chart shows this year only.`;
+            elements.comparisonNote.hidden = false;
+        }
     }
 
     async function loadData() {
@@ -155,8 +248,15 @@
             // The cost rulebook travels with the facts, so every figure below is
             // computed from what is currently saved in Cost Input.
             loadedSettings = payload.costSettings || {};
+            loadedRange = {
+                startDate: elements.startDate.value,
+                endDate: elements.endDate.value
+            };
             populateHotels(payload.hotels || []);
             updateFreshness();
+            // Before the first render, so the chart is not drawn once without the
+            // comparison and again with it.
+            await ensureComparison();
             render();
             const totalRows = Object.values(payload.rowCounts || {})
                 .reduce((total, count) => total + Number(count || 0), 0);
@@ -311,7 +411,25 @@
         }));
         elements.gopFlags.hidden = statement.flags.length === 0;
 
-        renderGopChart(statement);
+        // Costed under today's rulebook, not last year's: Cost Input is not
+        // versioned, so the comparison answers "what would last year's volumes
+        // cost to run now" rather than "what did it cost then". Its flags are
+        // dropped - they would repeat this year's, about the same configuration.
+        const lastYear = comparison
+            ? CostData.calculateGop(
+                CostData.alignToComparison(
+                    comparison.data, elements.lyBasis.value, statement.hotels
+                ),
+                {
+                    hotelName: elements.hotel.value,
+                    settingsByHotel: loadedSettings,
+                    grain: elements.grain.value,
+                    activeLines: Array.from(activeLines)
+                }
+            )
+            : null;
+
+        renderGopChart(statement, lastYear);
     }
 
     // ---------------------------------------------------------------------
@@ -358,8 +476,20 @@
         notation: "compact", maximumFractionDigits: 1
     });
 
-    function renderGopChart(statement) {
+    function renderGopChart(statement, lastYear) {
         const periods = statement.periods || [];
+        // Matched on the period key, not on position: alignToThisYear restamped
+        // last year's dates onto this year's, so the keys are the same buckets.
+        const comparisonPeriods = new Map(
+            ((lastYear && lastYear.periods) || []).map(
+                (period) => [period.periodKey, period]
+            )
+        );
+        const showComparison = Boolean(lastYear);
+        // Before the empty check, or an emptied chart keeps the previous
+        // reading's note and legend and claims two bars where there are none.
+        setChartNote(showComparison);
+        syncComparisonLegend(showComparison);
         if (!periods.length) {
             chartEmpty("Nothing to chart for the hotels and period you selected.");
             return;
@@ -376,7 +506,16 @@
         // both sides of zero: clamping the scale at zero drew a half-million
         // krona reversal as a few pixels of red under a tooltip reporting the
         // real figure.
-        const values = periods.flatMap((period) => [period.revenue, period.cost]);
+        // Last year's bars are drawn on this axis too, so they have to be part of
+        // what sets it. Leaving them out drew a bigger last year straight through
+        // the top of the plot.
+        const values = periods.flatMap((period) => {
+            const previous = comparisonPeriods.get(period.periodKey);
+            return [
+                period.revenue, period.cost,
+                ...(previous ? [previous.revenue, previous.cost] : [])
+            ];
+        });
         const maxValue = niceCeiling(Math.max(0, ...values));
         const minValue = -niceCeiling(-Math.min(0, ...values));
         const span = maxValue - minValue || 1;
@@ -390,10 +529,26 @@
             height: Math.abs(y(from) - y(to))
         });
         // Bars keep breathing room at both ends of the band so a single period
-        // is not stretched across the whole plot.
+        // is not stretched across the whole plot, and with last year shown the
+        // band holds a pair with a hairline between them - so two bars of the
+        // same height still read as two.
+        //
+        // Nothing may be wider than the band it sits in. At a daily grain over a
+        // year the band is a couple of pixels, and a bar with a fixed minimum
+        // width draws straight across its neighbours; a pair of them would draw
+        // across two.
         const band = plotWidth / periods.length;
-        const barWidth = Math.max(4, Math.min(64, band * 0.62));
+        const groupWidth = showComparison
+            ? Math.min(band, 84, Math.max(3, band * 0.78))
+            : Math.min(band, 64, Math.max(3, band * 0.62));
+        // The gap shrinks with the pair rather than eating it.
+        const pairGap = showComparison ? Math.min(3, groupWidth * 0.2) : 0;
+        const barWidth = showComparison ? (groupWidth - pairGap) / 2 : groupWidth;
         const centre = (index) => margin.left + band * (index + 0.5);
+        // This year on the left, last year on the right, in every period.
+        const barLeft = (index, isComparison) =>
+            centre(index) - groupWidth / 2
+            + (isComparison ? barWidth + pairGap : 0);
 
         const svg = svgNode("svg", {
             viewBox: `0 0 ${width} ${height}`,
@@ -425,18 +580,20 @@
             }));
         }
 
-        const labelStep = Math.max(1, Math.ceil(periods.length / 14));
-        periods.forEach((period, index) => {
+        // One period's stack: the base cost, the profit or loss against it, and
+        // the revenue marker. Both years draw through this, so the two can never
+        // drift apart in geometry - only in palette and in a modifier class.
+        function drawStack(period, left, palette, isComparison) {
             const revenue = period.revenue;
             const cost = period.cost;
-            const left = centre(index) - barWidth / 2;
+            const modifier = isComparison ? " is-comparison" : "";
 
             // The base runs from the zero line to the cost, downwards when a
             // correction makes the period's cost negative.
             const base = verticalBand(0, cost);
             svg.append(svgNode("rect", {
                 x: left, y: base.y, width: barWidth, height: base.height,
-                class: "gop-bar-base", fill: CHART_COLOURS.base
+                class: `gop-bar-base${modifier}`, fill: palette.base
             }));
 
             // Profit and loss occupy the same span - cost to revenue - and
@@ -447,20 +604,35 @@
                 const result = verticalBand(cost, revenue);
                 svg.append(svgNode("rect", {
                     x: left, y: result.y, width: barWidth, height: result.height,
-                    class: revenue > cost ? "gop-bar-profit" : "gop-bar-loss",
-                    fill: revenue > cost ? CHART_COLOURS.profit : CHART_COLOURS.loss
+                    class: (revenue > cost ? "gop-bar-profit" : "gop-bar-loss") + modifier,
+                    fill: revenue > cost ? palette.profit : palette.loss
                 }));
             }
 
             // The marker spans the bar and nothing more. It used to overhang by
             // 5px each side, which at a daily grain - where the bars are only a
-            // few pixels apart - drew it straight across its neighbours.
+            // few pixels apart - drew it straight across its neighbours. With a
+            // pair in the band it is narrower still, and centred on its own bar
+            // rather than on the period.
             const marker = barWidth / 2;
+            const barCentre = left + barWidth / 2;
             svg.append(svgNode("line", {
-                x1: centre(index) - marker, x2: centre(index) + marker,
+                x1: barCentre - marker, x2: barCentre + marker,
                 y1: y(revenue), y2: y(revenue),
-                class: "gop-bar-revenue", stroke: CHART_COLOURS.revenue
+                class: `gop-bar-revenue${modifier}`, stroke: palette.revenue
             }));
+        }
+
+        const labelStep = Math.max(1, Math.ceil(periods.length / 14));
+        periods.forEach((period, index) => {
+            drawStack(period, barLeft(index, false), CHART_COLOURS, false);
+            const previous = comparisonPeriods.get(period.periodKey);
+            // A period with no counterpart last year draws no second bar at all.
+            // Drawing a zero-height one would read as "last year earned nothing",
+            // which is a different claim from "there is nothing to compare with".
+            if (showComparison && previous) {
+                drawStack(previous, barLeft(index, true), LY_COLOURS, true);
+            }
 
             if (index % labelStep !== 0 && index !== periods.length - 1) return;
             const parts = LosFormat.periodLabelParts(period.periodKey, grain);
@@ -486,22 +658,61 @@
 
         function showPeriod(index) {
             const period = periods[index];
+            const previous = comparisonPeriods.get(period.periodKey);
             tooltip.hidden = false;
             tooltip.classList.toggle("align-right", centre(index) > width * 0.72);
             tooltip.style.left = `${centre(index) / width * 100}%`;
-            tooltip.replaceChildren(
+            const rows = [
                 tooltipTitle(LosFormat.periodLabel(period.periodKey, grain)),
-                tooltipRow("Revenue", CHART_COLOURS.revenue, period.revenue),
-                tooltipRow("Base cost", CHART_COLOURS.base, period.cost),
+                tooltipRow(
+                    "Revenue", CHART_COLOURS.revenue, period.revenue,
+                    showComparison
+                        ? varianceNote(period.revenue, previous && previous.revenue)
+                        : null
+                ),
+                tooltipRow(
+                    "Base cost", CHART_COLOURS.base, period.cost,
+                    showComparison
+                        ? varianceNote(period.cost, previous && previous.cost)
+                        : null
+                ),
                 tooltipRow(
                     period.gop < 0 ? "Loss" : "Profit",
                     period.gop < 0 ? CHART_COLOURS.loss : CHART_COLOURS.profit,
-                    period.gop
+                    period.gop,
+                    showComparison
+                        ? varianceNote(period.gop, previous && previous.gop)
+                        : null
                 )
-            );
+            ];
+            if (showComparison && previous) {
+                rows.push(
+                    tooltipTitle(comparisonLabel(period.periodKey)),
+                    tooltipRow("Revenue", LY_COLOURS.revenue, previous.revenue),
+                    tooltipRow("Base cost", LY_COLOURS.base, previous.cost),
+                    tooltipRow(
+                        previous.gop < 0 ? "Loss" : "Profit",
+                        previous.gop < 0 ? LY_COLOURS.loss : LY_COLOURS.profit,
+                        previous.gop
+                    )
+                );
+            }
+            tooltip.replaceChildren(...rows);
+        }
+
+        // The period this bar's neighbour actually is, rather than a bare "last
+        // year": on a same-weekday basis it is 364 days back, which for a month
+        // grain is a different month from the one the reader would assume.
+        function comparisonLabel(periodKey) {
+            const basis = elements.lyBasis.value === "sameWeekday"
+                ? "same weekday" : "same date";
+            return `${LosFormat.periodLabel(
+                LosFormat.lastYearDate(periodKey, elements.lyBasis.value), grain
+            )} · ${basis} LY`;
         }
 
         periods.forEach((period, index) => {
+            const previous = comparisonPeriods.get(period.periodKey);
             const hit = svgNode("rect", {
                 x: margin.left + band * index, y: margin.top,
                 width: band, height: plotHeight,
@@ -512,6 +723,16 @@
                     + `base cost ${LosFormat.formatSek(period.cost)}, `
                     + `${period.gop < 0 ? "loss" : "profit"} `
                     + `${LosFormat.formatSek(Math.abs(period.gop))}`
+                    // A reader on a screen reader gets the comparison spoken, not
+                    // only drawn - it is half the marks in the band.
+                    + (showComparison
+                        ? previous
+                            ? `. Last year: revenue ${LosFormat.formatSek(previous.revenue)}, `
+                                + `base cost ${LosFormat.formatSek(previous.cost)}, `
+                                + `${previous.gop < 0 ? "loss" : "profit"} `
+                                + `${LosFormat.formatSek(Math.abs(previous.gop))}`
+                            : ". No matching period last year"
+                        : "")
             });
             hit.addEventListener("mouseenter", () => showPeriod(index));
             hit.addEventListener("focus", () => showPeriod(index));
@@ -523,6 +744,28 @@
         elements.gopChartCanvas.replaceChildren(svg, tooltip);
     }
 
+    // Rebuilt rather than retyped as textContent, so the control's name keeps the
+    // emphasis the markup gave it and the note still points at the thing the
+    // reader has to change.
+    function setChartNote(showComparison) {
+        const control = document.createElement("strong");
+        control.textContent = "Group by";
+        elements.chartNote.replaceChildren(
+            document.createTextNode(
+                showComparison ? "Two bars per " : "One bar per "
+            ),
+            control,
+            document.createTextNode(
+                showComparison
+                    ? " period: this year on the left, last year on the right. "
+                        + "Bar height is what the period cost to run; the marker is "
+                        + "the revenue it earned."
+                    : " period. Bar height is what the period cost to run; the "
+                        + "marker is the revenue it earned."
+            )
+        );
+    }
+
     function tooltipTitle(text) {
         const title = document.createElement("strong");
         title.className = "chart-tooltip-title";
@@ -530,7 +773,7 @@
         return title;
     }
 
-    function tooltipRow(label, colour, amount) {
+    function tooltipRow(label, colour, amount, note) {
         const row = document.createElement("div");
         row.className = "chart-tooltip-series";
         const name = document.createElement("span");
@@ -540,7 +783,33 @@
         const value = document.createElement("strong");
         value.textContent = LosFormat.formatSekAmount(amount);
         row.append(name, value);
+        if (note) {
+            const detail = document.createElement("small");
+            detail.textContent = note;
+            row.append(detail);
+        }
         return row;
+    }
+
+    // How this period moved against its counterpart. Rounded before it is judged:
+    // a difference of forty ore is "level with last year", and reporting it as
+    // "+0 kr (+0.0%)" reads as a change nobody can find.
+    function varianceNote(current, previous) {
+        if (previous === null || previous === undefined) {
+            return "No matching period last year";
+        }
+        const delta = LosFormat.roundSek(current - previous) || 0;
+        if (delta === 0) return "Level with last year";
+        const sign = delta > 0 ? "+" : "−";
+        const size = `${sign}${LosFormat.formatSekAmount(Math.abs(delta))}`;
+        // A previous figure of zero has no percentage: everything is an infinite
+        // increase on nothing, which says less than the amount already does. The
+        // same goes for a sign change, where a percentage of a negative base
+        // points the wrong way.
+        const base = LosFormat.roundSek(previous) || 0;
+        if (base <= 0) return `${size} vs last year`;
+        const share = Math.abs(delta / base) * 100;
+        return `${size} (${sign}${share.toFixed(share < 10 ? 1 : 0)}%) vs last year`;
     }
 
     function renderTable() {
@@ -629,8 +898,30 @@
         render();
     }
 
+    // Switching the comparison on is the one control here that can need a
+    // request, so it goes through the same busy state the Update data button does
+    // rather than appearing to do nothing for a second.
+    async function refreshComparison() {
+        syncComparisonControls();
+        if (!loadedData) return;
+        setLoading(true);
+        try {
+            await ensureComparison();
+            render();
+        }
+        finally { setLoading(false); }
+    }
+
     elements.loadButton.addEventListener("click", loadData);
     elements.hotel.addEventListener("change", render);
+    if (elements.showLy) {
+        elements.showLy.addEventListener("change", refreshComparison);
+    }
+    if (elements.lyBasis) {
+        // A different basis is a different range, so this re-fetches rather than
+        // re-drawing what is already loaded.
+        elements.lyBasis.addEventListener("change", refreshComparison);
+    }
     // The grain decides the chart's buckets as well as the table's, so it can
     // no longer redraw the table alone.
     elements.grain.addEventListener("change", () => setGrain(elements.grain.value));
@@ -663,4 +954,5 @@
     // The two selects declare the same default in the markup; this is what keeps
     // them together if one of those defaults is ever edited alone.
     if (elements.chartGrain) elements.chartGrain.value = elements.grain.value;
+    syncComparisonControls();
 }());

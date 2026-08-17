@@ -660,6 +660,78 @@ test("Group by sits beside the chart as well as in Query settings, on one value"
     assert.match(read("styles.css"), /\.chart-grain \{/);
 });
 
+// ---------------------------------------------------------------------------
+// Last year on the chart
+// ---------------------------------------------------------------------------
+
+test("the chart offers last year as a paired bar, with both comparison bases", () => {
+    const html = read("costdata.html");
+    const script = read("costdata.js");
+    const css = read("styles.css");
+
+    const panel = /id="gopChartPanel"[\s\S]*?<\/section>/.exec(html)[0];
+    assert.match(panel, /id="gopChartShowLy"/);
+    assert.match(panel, /id="gopChartLyBasis"/);
+    // The same two values the LOS API accepts, so one vocabulary covers the
+    // whole application.
+    assert.match(panel, /value="sameDate"/);
+    assert.match(panel, /value="sameWeekday"/);
+
+    // Two bars in one band, this year first, each half the group.
+    assert.match(script, /const barLeft = \(index, isComparison\) =>/);
+    assert.match(script, /function drawStack\(period, left, palette, isComparison\)/);
+    assert.match(script, /drawStack\(period, barLeft\(index, false\), CHART_COLOURS, false\)/);
+    assert.match(script, /drawStack\(previous, barLeft\(index, true\), LY_COLOURS, true\)/);
+    assert.match(css, /\.gop-bar-revenue\.is-comparison \{/);
+});
+
+test("last year is fetched only when it is switched on, and cached per range", () => {
+    const script = read("costdata.js");
+
+    // The page's default range is a year to date. Loading last year with every
+    // update would double the cost of a query most readings never compare.
+    assert.match(script, /async function ensureComparison\(\)/);
+    assert.match(script, /if \(comparison && comparison\.key === key\) return;/);
+    // Keyed on the range the facts on screen cover, not on what the date inputs
+    // currently say - and on the basis, because a different basis is a different
+    // range.
+    assert.match(script, /\$\{loadedRange\.startDate\}\|\$\{loadedRange\.endDate\}\|\$\{elements\.lyBasis\.value\}/);
+});
+
+test("the two years are paired by period key, never by bar position", () => {
+    const script = read("costdata.js");
+
+    // Pairing bar 1 with bar 1 slips the moment one year has a period the other
+    // does not, and then every bar after it compares against the wrong month
+    // with nothing on screen to show it.
+    assert.match(script, /CostData\.alignToComparison\(/);
+    assert.match(
+        read("costdata-data.js"), /Format\.thisYearDate\(row\.stayDate, basis\)/
+    );
+    assert.match(script, /comparisonPeriods\.get\(period\.periodKey\)/);
+    // A period with no counterpart draws no bar: a zero-height one would claim
+    // last year earned nothing, which is a different statement.
+    assert.match(script, /if \(showComparison && previous\) \{/);
+    // And the scale has to account for last year, or a bigger last year is drawn
+    // through the top of the plot.
+    assert.match(script, /previous \? \[previous\.revenue, previous\.cost\] : \[\]/);
+});
+
+test("a comparison that fails to load leaves this year's statement standing", () => {
+    const script = read("costdata.js");
+
+    // This year's figures are complete and correct; blanking the page over an
+    // extra reading would be the larger loss.
+    assert.match(script, /elements\.comparisonNote\.hidden = false;/);
+    assert.doesNotMatch(
+        /catch \(error\) \{[\s\S]*?\n {8}\}/.exec(
+            /async function ensureComparison\(\)[\s\S]*?\n {4}\}/.exec(script)[0]
+        )[0],
+        /elements\.gop\.hidden = true/
+    );
+    assert.match(read("styles.css"), /\.gop-chart-warning \{/);
+});
+
 test("a missing control warns instead of killing the page bootstrap", () => {
     const script = read("costdata-input.js");
 

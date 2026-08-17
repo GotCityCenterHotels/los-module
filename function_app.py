@@ -197,12 +197,23 @@ def supplement_etag(payload, request_key):
         str(payload.get("status", "unknown")),
         str(payload.get("publishedAt", "none")),
     ])
+    return content_etag("supplement", identity)
+
+
+def content_etag(prefix, identity):
     fingerprint = sha256(identity.encode("utf-8")).hexdigest()[:20]
-    return f'W/"supplement-{fingerprint}"'
+    return f'W/"{prefix}-{fingerprint}"'
 
 
-def supplement_cached_response(req, payload, request_key):
-    etag = supplement_etag(payload, request_key)
+def cached_json_response(req, payload, etag):
+    """A revalidatable JSON response.
+
+    Everything these read routes serve is a published snapshot: identical
+    parameters against an unchanged publication are identical bytes. Saying so
+    lets the browser answer a repeat itself - the same range opened again, or
+    the sibling page that shows the same facts differently - instead of paying
+    for the query and the transfer a second time.
+    """
     common_headers = {
         "ETag": etag,
         "Cache-Control": "private, max-age=300",
@@ -221,6 +232,10 @@ def supplement_cached_response(req, payload, request_key):
         mimetype="application/json",
         headers=common_headers,
     )
+
+
+def supplement_cached_response(req, payload, request_key):
+    return cached_json_response(req, payload, supplement_etag(payload, request_key))
 
 
 def validate_facts_parameters(req):
@@ -334,25 +349,39 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
     start_date, end_date, ly_comparison_basis = parameters
 
     try:
-        rows = fetch_los_facts(start_date, end_date, ly_comparison_basis)
+        facts = fetch_los_facts(start_date, end_date, ly_comparison_basis)
     except (LosReadModelUnavailableError, LosSchemaError) as error:
         return json_response({"error": str(error)}, 503)
     except Exception:
         logging.exception("LOS facts endpoint failed")
         return json_response({"error": "Unable to retrieve LOS facts"}, 500)
 
-    return compressed_json_response(
-        req,
-        {
-            "parameters": {
-                "startDate": start_date.isoformat(),
-                "endDate": end_date.isoformat(),
-                "lyComparisonBasis": ly_comparison_basis,
-            },
-            "rowCount": len(rows),
-            "data": rows,
+    payload = {
+        "parameters": {
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "lyComparisonBasis": ly_comparison_basis,
         },
-    )
+        "runId": facts.run_id,
+        "rowCount": len(facts.rows),
+        "data": facts.rows,
+    }
+
+    # The raw-query fallback reads live source data, so it has no publication to
+    # validate against and must not be cached.
+    if facts.run_id is None:
+        return compressed_json_response(req, payload)
+
+    # Average LOS and LOS Distribution show the same published facts, so opening
+    # one after the other - or reopening either - is a repeat of a request whose
+    # answer cannot have changed while the publication has not.
+    return cached_json_response(req, payload, content_etag("los-facts", "|".join([
+        start_date.isoformat(),
+        end_date.isoformat(),
+        ly_comparison_basis,
+        str(facts.run_id),
+        facts.published_at.isoformat(),
+    ])))
 
 
 @app.route(

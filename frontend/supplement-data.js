@@ -39,10 +39,18 @@
         return comparison === 0 ? null : (current - comparison) / Math.abs(comparison) * 100;
     }
 
+    // Constructing an Intl.NumberFormat is expensive - it resolves a locale and
+    // builds a formatter - and the grid calls these once per cell. A 31 day
+    // window is several thousand cells per render, so building the formatter
+    // once instead of once per number is worth more here than anything else in
+    // the render path.
+    const wholeNumberFormat = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 0 });
+    const oneDecimalFormat = new Intl.NumberFormat("en-SE", { maximumFractionDigits: 1 });
+
     function formatMetric(value, metric) {
         if (!Number.isFinite(value)) return "–";
         if (metric === "occ") return `${value.toFixed(1)}%`;
-        return new Intl.NumberFormat("en-SE", { maximumFractionDigits: 0 }).format(value);
+        return wholeNumberFormat.format(value);
     }
 
     function formatDifference(value, mode, metric) {
@@ -50,24 +58,68 @@
         const sign = value > 0 ? "+" : "";
         if (mode === "percent") return `${sign}${value.toFixed(1)}%`;
         const suffix = metric === "occ" ? " pp" : " kr";
-        return `${sign}${new Intl.NumberFormat("en-SE", { maximumFractionDigits: 1 }).format(value)}${suffix}`;
+        return `${sign}${oneDecimalFormat.format(value)}${suffix}`;
+    }
+
+    const CELL_MODES = Object.freeze(["today", "spit", "ly"]);
+
+    function deriveMetrics(assignedRooms, revenue, inventory) {
+        return {
+            occ: inventory > 0 ? assignedRooms / inventory * 100 : null,
+            adr: assignedRooms > 0 ? revenue / assignedRooms : null,
+            revpar: inventory > 0 ? revenue / inventory : null,
+            assignedRooms,
+            revenue,
+            inventory
+        };
     }
 
     function computeRowAverages(row) {
         const output = {};
-        for (const mode of ["today", "spit", "ly"]) {
-            const facts = row.cells.reduce((total, cell) => ({
-                assignedRooms: total.assignedRooms + (cell[mode]?.assignedRooms || 0),
-                revenue: total.revenue + (cell[mode]?.revenue || 0),
-                inventory: total.inventory + (cell[mode]?.inventory || 0)
-            }), { assignedRooms: 0, revenue: 0, inventory: 0 });
-            output[mode] = {
-                occ: facts.inventory > 0 ? facts.assignedRooms / facts.inventory * 100 : null,
-                adr: facts.assignedRooms > 0 ? facts.revenue / facts.assignedRooms : null,
-                revpar: facts.inventory > 0 ? facts.revenue / facts.inventory : null
-            };
+        for (const mode of CELL_MODES) {
+            let assignedRooms = 0;
+            let revenue = 0;
+            let inventory = 0;
+            for (const cell of row.cells) {
+                const facts = cell[mode];
+                if (!facts) continue;
+                assignedRooms += facts.assignedRooms || 0;
+                revenue += facts.revenue || 0;
+                inventory += facts.inventory || 0;
+            }
+            output[mode] = deriveMetrics(assignedRooms, revenue, inventory);
         }
         return output;
+    }
+
+    /**
+     * The total row for a subset of the published rows.
+     *
+     * Cells carry the additive facts as well as the ratios, so a subtotal is
+     * exactly the sum of its parts re-divided - the same weighting the server
+     * applies when it builds its own total row. That is what lets a room
+     * category be switched off without asking the server for a new grid.
+     */
+    function sumRowCells(rows, dateCount) {
+        const cells = new Array(dateCount);
+        for (let index = 0; index < dateCount; index += 1) {
+            const cell = {};
+            for (const mode of CELL_MODES) {
+                let assignedRooms = 0;
+                let revenue = 0;
+                let inventory = 0;
+                for (const row of rows) {
+                    const facts = row.cells[index]?.[mode];
+                    if (!facts) continue;
+                    assignedRooms += facts.assignedRooms || 0;
+                    revenue += facts.revenue || 0;
+                    inventory += facts.inventory || 0;
+                }
+                cell[mode] = deriveMetrics(assignedRooms, revenue, inventory);
+            }
+            cells[index] = cell;
+        }
+        return cells;
     }
 
     // Static Web Apps abandons a linked-backend call at ~45s. Without a client
@@ -139,6 +191,7 @@
         formatMetric,
         formatDifference,
         computeRowAverages,
+        sumRowCells,
         fetchMetadata,
         fetchGrid,
         fetchDetail

@@ -1356,6 +1356,32 @@ tbody tr.total-row:hover {
     outline-offset: 1px;
 }
 
+.chart-grain select:disabled {
+    background: #f9fafb;
+    color: #98a2b3;
+    cursor: not-allowed;
+}
+
+.chart-toggle {
+    display: flex;
+    gap: 7px;
+    align-items: center;
+
+    color: #475467;
+    font-size: 12px;
+    font-weight: 650;
+
+    cursor: pointer;
+}
+
+.chart-toggle input {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+
+    accent-color: var(--cost-accent);
+}
+
 .legend-swatch {
     display: inline-block;
     width: 13px;
@@ -1373,6 +1399,21 @@ tbody tr.total-row:hover {
     height: 3px;
     border-radius: 2px;
     background: #7c3aed;
+}
+
+/* Last year, in the same roles at a fraction of the weight. These must track
+   LY_COLOURS in costdata.js: the bars are filled from there and these swatches
+   are what claim to describe them. */
+.gop-legend-ly-base { background: #a9b2c0; }
+
+.gop-legend-ly-revenue {
+    height: 3px;
+    border-radius: 2px;
+    /* Dashed, matching the marker itself, so the pair is still tellable apart
+       printed in grey or read by someone who does not separate the two hues. */
+    background: repeating-linear-gradient(
+        to right, #c0aaf3 0 4px, transparent 4px 6px
+    );
 }
 
 .gop-chart {
@@ -1401,6 +1442,15 @@ tbody tr.total-row:hover {
     stroke-linecap: butt;
 }
 
+/* Last year's marker is dashed as well as paler, so which of a pair is which
+   survives greyscale printing and a reader who does not separate the two hues.
+   The bars themselves need no second cue: they are side by side in one band, and
+   this year is always the left one. */
+.gop-bar-revenue.is-comparison {
+    stroke-width: 2.5;
+    stroke-dasharray: 4 2;
+}
+
 /* Only drawn when a correction period pushes revenue or cost below zero and
    bars grow in both directions. */
 .gop-bar-zero {
@@ -1417,6 +1467,20 @@ tbody tr.total-row:hover {
 .gop-chart-note strong {
     color: #344054;
     font-weight: 650;
+}
+
+/* A comparison that could not be loaded. Not the page's error panel: this
+   year's statement above it is still complete and correct, and only the second
+   set of bars is missing. */
+.gop-chart-warning {
+    margin: 8px 2px 0;
+    padding: 8px 11px;
+
+    border-radius: 6px;
+    background: #fffaeb;
+
+    color: #93370d;
+    font-size: 11.5px;
 }
 
 .cost-results {

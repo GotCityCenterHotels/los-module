@@ -1,6 +1,7 @@
 import logging
 import os
 
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 
@@ -17,6 +18,14 @@ LOS_STALE_AFTER_HOURS = int(os.environ.get("LOS_STALE_AFTER_HOURS", "30"))
 
 class LosReadModelUnavailableError(RuntimeError):
     pass
+
+
+# run_id and published_at identify the publication the rows came from, which is
+# what lets the HTTP layer put a validator on the response: the same range asked
+# for twice against the same publication is the same bytes, and the browser can
+# be told so. They are None on the raw-query fallback, which has no publication
+# to name.
+LosFacts = namedtuple("LosFacts", ("rows", "run_id", "published_at"))
 
 
 def los_read_model_enabled():
@@ -40,6 +49,13 @@ def _fact_json(row):
     }
 
 
+def _is_stale(published_at):
+    return (
+        datetime.now(timezone.utc) - published_at
+        > timedelta(hours=LOS_STALE_AFTER_HOURS)
+    )
+
+
 def fetch_los_read_model_status():
     ensure_los_schema()
     with cost_pool.connection() as connection:
@@ -60,10 +76,7 @@ def fetch_los_read_model_status():
             "runId": None,
             "publishedAt": None,
         }
-    stale = (
-        datetime.now(timezone.utc) - row["published_at"]
-        > timedelta(hours=LOS_STALE_AFTER_HOURS)
-    )
+    stale = _is_stale(row["published_at"])
     return {
         "status": "stale" if stale else "available",
         "stale": stale,
@@ -82,57 +95,87 @@ def _fetch_published_los_facts(start_date, end_date, ly_comparison_basis):
     started_at = monotonic()
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
+            # Resolving the publication first, on its own, is what lets the fact
+            # query below take a constant run_id and read nothing but its own
+            # index. It also fails fast: with nothing published there is no
+            # point scanning for rows that cannot exist.
             cursor.execute("""
-                SELECT daily.arrival_date,
-                       daily.enterprise_id AS hotel_code,
-                       hotel.hotel_name,
-                       daily.scenario, daily.los,
-                       daily.booking_count, daily.night_count,
-                       publication.published_at
-                FROM functions.los_publication publication
-                JOIN functions.reservation_los_daily daily
-                  ON daily.run_id = publication.run_id
-                JOIN functions.hotels hotel
-                  ON hotel.enterprise_id = daily.enterprise_id
-                WHERE publication.singleton
-                  AND daily.comparison_basis = %s
-                  AND daily.arrival_date BETWEEN %s AND %s
-                ORDER BY daily.arrival_date, hotel.hotel_name,
-                         daily.scenario, daily.los
-            """, (ly_comparison_basis, start_date, end_date))
+                SELECT run_id, published_at
+                FROM functions.los_publication
+                WHERE singleton
+            """)
+            publication = cursor.fetchone()
+            if publication is None:
+                raise LosReadModelUnavailableError(
+                    "LOS read model has not been published"
+                )
+
+            # The hotel dimension is a handful of rows and every fact row
+            # carries a foreign key into it, so joining it per row - across a
+            # hundred thousand of them - buys nothing that one lookup table
+            # does not. Without the join the fact query is a covered range scan
+            # over ix_reservation_los_daily_lookup and touches no heap at all.
+            cursor.execute(
+                "SELECT enterprise_id, hotel_name FROM functions.hotels"
+            )
+            hotel_names = {
+                row["enterprise_id"]: row["hotel_name"]
+                for row in cursor.fetchall()
+            }
+
+            # Deliberately unordered. Every consumer of this payload groups and
+            # re-sorts it - the browser sorts its own output rows - so ordering
+            # a hundred thousand rows here was a sort nobody read.
+            cursor.execute("""
+                SELECT arrival_date, enterprise_id, scenario, los,
+                       booking_count, night_count
+                FROM functions.reservation_los_daily
+                WHERE run_id = %s
+                  AND comparison_basis = %s
+                  AND arrival_date BETWEEN %s AND %s
+            """, (
+                publication["run_id"], ly_comparison_basis, start_date, end_date
+            ))
             rows = cursor.fetchall()
-    if not rows:
-        status = fetch_los_read_model_status()
-        if status["runId"] is None:
-            raise LosReadModelUnavailableError(
-                "LOS read model has not been published"
-            )
-        if status["stale"]:
-            logging.warning(
-                "LOS publication is stale run_id=%s published_at=%s",
-                status["runId"],
-                status["publishedAt"],
-            )
-    elif (
-        datetime.now(timezone.utc) - rows[0]["published_at"]
-        > timedelta(hours=LOS_STALE_AFTER_HOURS)
-    ):
+
+    if _is_stale(publication["published_at"]):
         logging.warning(
-            "LOS publication is stale published_at=%s",
-            rows[0]["published_at"].isoformat(),
+            "LOS publication is stale run_id=%s published_at=%s",
+            publication["run_id"],
+            publication["published_at"].isoformat(),
         )
+
+    facts = []
+    for row in rows:
+        enterprise_id = row["enterprise_id"]
+        # The fact table has a foreign key into the hotel dimension, so a miss
+        # is impossible; naming the row by its enterprise ID rather than by null
+        # keeps a broken invariant visible instead of silently regrouping every
+        # unnamed hotel together, which is what the inner join used to risk.
+        hotel_name = hotel_names.get(enterprise_id, enterprise_id)
+        facts.append({
+            "arrivalDate": row["arrival_date"].isoformat(),
+            "hotelCode": hotel_name,
+            "enterpriseId": enterprise_id,
+            "hotelName": hotel_name,
+            "scenario": row["scenario"],
+            "los": int(row["los"]),
+            "bookingCount": int(row["booking_count"]),
+            "nightCount": int(row["night_count"]),
+        })
+
     elapsed_ms = (monotonic() - started_at) * 1000
     logging.info(
         "LOS read model query completed run_id=%s row_count=%d duration_ms=%.1f",
-        status["runId"] if not rows else "published",
-        len(rows),
+        publication["run_id"],
+        len(facts),
         elapsed_ms,
     )
     if elapsed_ms >= 500:
         logging.warning(
             "LOS read model query exceeded target duration_ms=%.1f", elapsed_ms
         )
-    return [_fact_json(row) for row in rows]
+    return LosFacts(facts, publication["run_id"], publication["published_at"])
 
 
 def fetch_los_facts(start_date, end_date, ly_comparison_basis):
@@ -165,4 +208,6 @@ def fetch_los_facts(start_date, end_date, ly_comparison_basis):
         (monotonic() - started_at) * 1000,
     )
 
-    return [_fact_json(row) for row in rows]
+    # The raw query reads live source data, so there is no publication to
+    # validate a cached response against.
+    return LosFacts([_fact_json(row) for row in rows], None, None)

@@ -91,15 +91,27 @@
         windowStart: 0
     };
 
+    const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
+
+    // One pass instead of five, and this runs on every cell's accessible name.
     function escapeHtml(value) {
-        return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+        return String(value ?? "").replace(/[&<>"']/g, (character) => HTML_ESCAPES[character]);
     }
 
+    const dateLabels = new Map();
+
+    // toLocaleDateString parses options and resolves a locale on every call, and
+    // the same dates are relabelled on every re-render - a difference-mode
+    // toggle, a category toggle, a window step.
     function formatDateLabel(dateKey) {
-        return Data.parseDateKey(dateKey).toLocaleDateString("en-SE", {
-            weekday: "short", day: "numeric", month: "short", timeZone: "UTC"
-        });
+        let label = dateLabels.get(dateKey);
+        if (label === undefined) {
+            label = Data.parseDateKey(dateKey).toLocaleDateString("en-SE", {
+                weekday: "short", day: "numeric", month: "short", timeZone: "UTC"
+            });
+            dateLabels.set(dateKey, label);
+        }
+        return label;
     }
 
     function makeCheckboxList(items, selected) {
@@ -149,6 +161,19 @@
     async function initialize() {
         elements.startDate.value = state.startDate;
         elements.endDate.value = state.endDate;
+        // The metadata and the first grid are independent queries, and waiting
+        // for one before starting the other put a whole extra round trip in
+        // front of the first thing anyone sees. With no hotel named, the grid
+        // endpoint falls back to the same first hotel and all of its categories
+        // that the metadata is about to select, so the speculative request is
+        // the request - it is only discarded if that assumption turns out not
+        // to hold. Failures are captured rather than thrown so an unavailable
+        // grid cannot surface as an unhandled rejection while metadata is still
+        // in flight.
+        const speculativeGrid = Data
+            .fetchGrid(gridParameters({ hotelCodes: [] }), API_BASE_URL)
+            .then((payload) => ({ payload }), (error) => ({ error }));
+
         try {
             const metadata = await Data.fetchMetadata(API_BASE_URL);
             state.hotels = metadata.hotels || [];
@@ -161,7 +186,16 @@
             elements.hotelSelectionSummary.textContent = `All ${state.hotels.length}`;
             rebuildCategoryControls(true);
             setFreshness(metadata);
-            await loadGrid();
+
+            const settled = await speculativeGrid;
+            if (settled.error) {
+                // The real request would carry the same dates and bases, so it
+                // would fail the same way. Report it rather than repeat it.
+                showUnavailable(settled.error);
+                return;
+            }
+            const servedHotel = settled.payload?.parameters?.hotelCodes?.[0];
+            await loadGrid(servedHotel === state.hotelCode ? settled.payload : null);
         } catch (error) {
             showUnavailable(error);
         }
@@ -184,28 +218,36 @@
         return Data.calculateDifference(cell.today?.[metric], cell[comparison]?.[metric], state.differenceMode);
     }
 
-    function renderMetricCell(row, date, cell, column, metric) {
-        const detailHotel = state.mode === "comparison" ? row.code : state.hotelCode;
-        const detailCategory = state.mode === "single" && !row.isTotal ? row.code : "";
+    // The button's identity depends on the row and the date but not the metric,
+    // and it carries three escapes, so it is built once per cell column rather
+    // than once per metric row.
+    function detailAttributes(row, date) {
         // A disabled total-row button is pixel-identical to a working one, so point it at the
         // hidden note that says why there is nothing to open behind it.
-        const detailAttributes = row.isTotal
-            ? ' disabled aria-describedby="totalRowNote"'
-            : ` data-detail-hotel="${escapeHtml(detailHotel)}" data-detail-category="${escapeHtml(detailCategory)}" data-detail-date="${date.date}" data-detail-metric="${metric}"`;
+        if (row.isTotal) return ' disabled aria-describedby="totalRowNote"';
+        const detailHotel = state.mode === "comparison" ? row.code : state.hotelCode;
+        const detailCategory = state.mode === "single" ? row.code : "";
+        return ` data-detail-hotel="${escapeHtml(detailHotel)}" data-detail-category="${escapeHtml(detailCategory)}" data-detail-date="${date.date}"`;
+    }
+
+    function renderMetricCell(rowLabel, isTotalRow, detailBase, date, cell, column, metric) {
         const todayClass = date.date === todayKey ? " is-today-column" : "";
+        const metricAttribute = isTotalRow
+            ? detailBase
+            : `${detailBase} data-detail-metric="${metric}"`;
         // The visible figure has to come first in the accessible name. Leading with the metric
         // instead would make the name not start with the label on screen (WCAG 2.5.3) and would
         // bury the number when a screen reader lists the grid's buttons.
-        const nameFor = (figure) => ` aria-label="${escapeHtml(`${figure} ${metricLabels[metric]} ${column.label}, ${row.shortLabel || row.label}, ${date.date}`)}"`;
+        const nameFor = (figure) => ` aria-label="${escapeHtml(`${figure} ${metricLabels[metric]} ${column.label}, ${rowLabel}, ${date.date}`)}"`;
         if (column.comparison) {
             const value = differenceValue(cell, column.comparison, metric);
             const direction = value > 0 ? "is-positive" : value < 0 ? "is-negative" : "";
             const highlight = state.highlightedMetrics.has(metric) ? " is-highlighted" : "";
             const text = Data.formatDifference(value, state.differenceMode, metric);
-            return `<td class="metric-difference ${direction}${highlight}${todayClass}"><button type="button"${detailAttributes}${nameFor(text)}>${escapeHtml(text)}</button></td>`;
+            return `<td class="metric-difference ${direction}${highlight}${todayClass}"><button type="button"${metricAttribute}${nameFor(text)}>${escapeHtml(text)}</button></td>`;
         }
         const text = Data.formatMetric(cell[column.mode]?.[metric], metric);
-        return `<td class="${todayClass.trim()}"><button type="button"${detailAttributes}${nameFor(text)}>${escapeHtml(text)}</button></td>`;
+        return `<td class="${todayClass.trim()}"><button type="button"${metricAttribute}${nameFor(text)}>${escapeHtml(text)}</button></td>`;
     }
 
     function visibleWindow(payload) {
@@ -221,27 +263,79 @@
         return { dates: payload.dates.slice(state.windowStart, end), start: state.windowStart };
     }
 
-    function renderTable(payload) {
+    /**
+     * The rows to show, derived from the published grid rather than requested.
+     *
+     * Every category the hotel has is always fetched, so switching one off is a
+     * filter over data already in memory instead of a new round trip. The total
+     * row is re-derived from the additive facts in the surviving cells, which is
+     * the same weighting the server applies - and when nothing is filtered out,
+     * the server's own total row is used unchanged.
+     */
+    function visibleRows(payload) {
+        if (state.mode !== "single") return payload.rows;
+        const categoryRows = payload.rows.filter((row) => !row.isTotal);
+        const selected = categoryRows.filter((row) => state.enabledCategories.has(row.code));
+        if (!selected.length) return [];
+        if (selected.length === categoryRows.length) return payload.rows;
+        return [...selected, {
+            rowType: "category",
+            code: "total",
+            label: "Selected categories",
+            shortLabel: "Total",
+            isTotal: true,
+            cells: Data.sumRowCells(selected, payload.dates.length)
+        }];
+    }
+
+    function describeRange(payload) {
+        const dayCount = payload.dates.length;
+        return `${dayCount}-day view · ${state.inventoryBasis === "sellable" ? "sellable" : "physical"} inventory`
+            + ` · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
+    }
+
+    // The single place the grid is painted from. It owns the range summary too,
+    // because emptying the category selection is now a local change and the
+    // summary has to follow it back and forth without a reload.
+    function renderGrid() {
+        if (!state.payload) return;
+        const rows = visibleRows(state.payload);
+        elements.rangeSummary.textContent = rows.length
+            ? describeRange(state.payload)
+            : "No rows selected";
+        renderTable(state.payload, rows);
+    }
+
+    function renderTable(payload, rows = payload.rows) {
         // Written before the empty-case return below, so a selection that empties the grid is
         // announced too. payload.dates is the whole requested range; the visible slice does not
         // exist until visibleWindow() runs a few lines down.
-        elements.gridAnnouncement.textContent = payload.rows.length
-            ? `Revenue grid updated: ${payload.rows.length} row${payload.rows.length === 1 ? "" : "s"} across ${payload.dates.length} date${payload.dates.length === 1 ? "" : "s"}.`
+        elements.gridAnnouncement.textContent = rows.length
+            ? `Revenue grid updated: ${rows.length} row${rows.length === 1 ? "" : "s"} across ${payload.dates.length} date${payload.dates.length === 1 ? "" : "s"}.`
             : "Revenue grid is empty. Select at least one room category or hotel.";
-        if (!payload.rows.length) {
+        if (!rows.length) {
             elements.tableMount.innerHTML = '<div class="supplement-empty"><strong>No rows selected</strong><span>Select at least one room category or hotel.</span></div>';
+            elements.dateWindowNav.hidden = true;
             return;
         }
         const window = visibleWindow(payload);
-        const dateHeaders = window.dates.map((date) => `<th scope="colgroup" colspan="${columnsForDate(date).length}" class="date-group${date.isWeekend ? " is-weekend" : ""}${date.date === todayKey ? " is-today" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
-        const modeHeaders = window.dates.map((date) => columnsForDate(date).map((column) => `<th scope="col" class="mode-column${column.comparison ? " difference-column" : ""}${date.date === todayKey ? " is-today-column" : ""}">${column.label}</th>`).join("")).join("");
-        const body = payload.rows.map((row) => {
+        // The column layout depends only on the date, but the body asks for it
+        // once per row per metric per date - on a full window that was thousands
+        // of identical array builds per render.
+        const columnsByDate = window.dates.map(columnsForDate);
+        const dateHeaders = window.dates.map((date, index) => `<th scope="colgroup" colspan="${columnsByDate[index].length}" class="date-group${date.isWeekend ? " is-weekend" : ""}${date.date === todayKey ? " is-today" : ""}"><span>${escapeHtml(formatDateLabel(date.date))}</span><small>${escapeHtml(date.date)}</small></th>`).join("");
+        const modeHeaders = window.dates.map((date, index) => columnsByDate[index].map((column) => `<th scope="col" class="mode-column${column.comparison ? " difference-column" : ""}${date.date === todayKey ? " is-today-column" : ""}">${column.label}</th>`).join("")).join("");
+        const body = rows.map((row) => {
             const averages = Data.computeRowAverages(row);
+            // Both of these depend on the row and the date but not the metric,
+            // so they are built once rather than three times over.
+            const rowLabelText = row.shortLabel || row.label;
+            const detailAttributesByDate = window.dates.map((date) => detailAttributes(row, date));
             return Data.METRICS.map((metric, metricIndex) => {
                 const rowLabel = metricIndex === 0
-                    ? `<th class="row-group-label" rowspan="3" scope="rowgroup"><strong>${escapeHtml(row.shortLabel || row.label)}</strong><span>${escapeHtml(row.label)}</span></th>`
+                    ? `<th class="row-group-label" rowspan="3" scope="rowgroup"><strong>${escapeHtml(rowLabelText)}</strong><span>${escapeHtml(row.label)}</span></th>`
                     : "";
-                const cells = window.dates.map((date, localIndex) => columnsForDate(date).map((column) => renderMetricCell(row, date, row.cells[window.start + localIndex], column, metric)).join("")).join("");
+                const cells = window.dates.map((date, localIndex) => columnsByDate[localIndex].map((column) => renderMetricCell(rowLabelText, row.isTotal, detailAttributesByDate[localIndex], date, row.cells[window.start + localIndex], column, metric)).join("")).join("");
                 const averageCells = ["today", "spit", "ly"].map((mode) => `<td class="average-cell">${escapeHtml(Data.formatMetric(averages[mode][metric], metric))}</td>`).join("");
                 const classes = `${row.isTotal ? " total-metric-row" : ""}${metricIndex === 0 ? " group-start" : ""}`;
                 return `<tr class="${classes.trim()}">${rowLabel}<th class="metric-label" scope="row">${metricLabels[metric]}</th>${cells}${averageCells}</tr>`;
@@ -253,18 +347,63 @@
         elements.tableMount.classList.add("is-refreshing");
     }
 
-    async function loadGrid() {
+    function gridParameters(overrides = {}) {
+        return {
+            startDate: elements.startDate.value || state.startDate,
+            endDate: elements.endDate.value || state.endDate,
+            mode: state.mode,
+            hotelCodes: state.mode === "single"
+                ? [elements.hotel.value || state.hotelCode].filter(Boolean)
+                : [...state.enabledHotels],
+            // Deliberately never narrowed to the enabled categories: fetching
+            // the hotel's full set makes a category toggle a local filter, and
+            // it keeps one cache entry per hotel and period instead of one per
+            // subset of categories a user happens to tick.
+            roomCategories: [],
+            lyComparisonBasis: elements.lyBasis.value || state.lyComparisonType,
+            inventoryBasis: elements.inventoryBasis.value || state.inventoryBasis,
+            ...overrides
+        };
+    }
+
+    // Requests that only differ in which categories are ticked now collapse onto
+    // one key, so going back to a hotel or period already looked at this session
+    // repaints without touching the network at all. The lifetime matches the
+    // Cache-Control the API sends, so nothing is shown for longer than the API
+    // considers it fresh.
+    const GRID_CACHE_TTL_MS = 5 * 60 * 1000;
+    const GRID_CACHE_LIMIT = 8;
+    const gridCache = new Map();
+
+    function cachedGrid(key) {
+        const entry = gridCache.get(key);
+        if (!entry) return null;
+        if (Date.now() - entry.storedAt > GRID_CACHE_TTL_MS) {
+            gridCache.delete(key);
+            return null;
+        }
+        return entry.payload;
+    }
+
+    function cacheGrid(key, payload) {
+        if (gridCache.size >= GRID_CACHE_LIMIT) gridCache.clear();
+        gridCache.set(key, { storedAt: Date.now(), payload });
+    }
+
+    async function loadGrid(preloadedPayload = null) {
         state.startDate = elements.startDate.value;
         state.endDate = elements.endDate.value;
         state.hotelCode = elements.hotel.value || state.hotelCode;
-        state.lyComparisonType = elements.lyBasis.value;
-        state.inventoryBasis = elements.inventoryBasis.value;
+        // Falling back rather than overwriting, the same way the hotel does:
+        // these feed the request key and the cache key, and a control that has
+        // not been populated yet must not silently drop the basis from both.
+        state.lyComparisonType = elements.lyBasis.value || state.lyComparisonType;
+        state.inventoryBasis = elements.inventoryBasis.value || state.inventoryBasis;
         const validation = Data.validateDateRange(state.startDate, state.endDate);
         elements.validation.hidden = validation.valid;
         elements.validation.textContent = validation.error || "";
         if (!validation.valid) return;
-        if ((state.mode === "single" && state.enabledCategories.size === 0)
-                || (state.mode === "comparison" && state.enabledHotels.size === 0)) {
+        if (state.mode === "comparison" && state.enabledHotels.size === 0) {
             state.payload = { dates: [], rows: [] };
             // This path never reaches renderTable, so it has to announce the empty grid itself.
             elements.gridAnnouncement.textContent = "Revenue grid is empty. Select at least one room category or hotel.";
@@ -273,26 +412,23 @@
             elements.dateWindowNav.hidden = true;
             return;
         }
+        const parameters = gridParameters();
+        const cacheKey = JSON.stringify(parameters);
         const requestId = ++state.requestId;
-        elements.tableMount.setAttribute("aria-busy", "true");
-        elements.rangeSummary.textContent = "Loading published revenue facts…";
+        const alreadyHave = preloadedPayload || cachedGrid(cacheKey);
+        if (!alreadyHave) {
+            elements.tableMount.setAttribute("aria-busy", "true");
+            elements.rangeSummary.textContent = "Loading published revenue facts…";
+        }
         try {
-            const hotelCodes = state.mode === "single" ? [state.hotelCode] : [...state.enabledHotels];
-            const payload = await Data.fetchGrid({
-                startDate: state.startDate,
-                endDate: state.endDate,
-                mode: state.mode,
-                hotelCodes,
-                roomCategories: state.mode === "single" ? [...state.enabledCategories] : [],
-                lyComparisonBasis: state.lyComparisonType,
-                inventoryBasis: state.inventoryBasis
-            }, API_BASE_URL);
+            const payload = alreadyHave
+                || await Data.fetchGrid(parameters, API_BASE_URL);
             if (requestId !== state.requestId) return;
+            cacheGrid(cacheKey, payload);
             state.payload = payload;
             state.windowStart = 0;
             setFreshness(payload);
-            elements.rangeSummary.textContent = `${validation.dayCount}-day view · ${state.inventoryBasis === "sellable" ? "sellable" : "physical"} inventory · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
-            renderTable(payload);
+            renderGrid();
         } catch (error) {
             if (requestId === state.requestId) showUnavailable(error);
         } finally {
@@ -305,7 +441,7 @@
         state.pastLyDiff = elements.pastLyDiff.checked;
         state.futureSpitDiff = elements.futureSpitDiff.checked;
         state.futureLyDiff = elements.futureLyDiff.checked;
-        if (state.payload) renderTable(state.payload);
+        renderGrid();
     }
 
     function updateViewMode(mode) {
@@ -599,7 +735,9 @@
     elements.categoryOptions.addEventListener("change", () => {
         state.enabledCategories = readSelected(elements.categoryOptions);
         rebuildCategoryControls(false);
-        loadGrid();
+        // Every category is already in state.payload, so this is a repaint, not
+        // a request.
+        renderGrid();
     });
     elements.hotelVisibilityOptions.addEventListener("change", () => {
         state.enabledHotels = readSelected(elements.hotelVisibilityOptions);
@@ -608,8 +746,8 @@
         loadGrid();
     });
     elements.highlights.addEventListener("change", () => { state.highlightedMetrics = readSelected(elements.highlights); renderLocalChange(); });
-    elements.previousDateWindow.addEventListener("click", () => { state.windowStart = Math.max(0, state.windowStart - DATE_WINDOW_SIZE); renderTable(state.payload); });
-    elements.nextDateWindow.addEventListener("click", () => { state.windowStart += DATE_WINDOW_SIZE; renderTable(state.payload); });
+    elements.previousDateWindow.addEventListener("click", () => { state.windowStart = Math.max(0, state.windowStart - DATE_WINDOW_SIZE); renderGrid(); });
+    elements.nextDateWindow.addEventListener("click", () => { state.windowStart += DATE_WINDOW_SIZE; renderGrid(); });
     elements.tableMount.addEventListener("click", (event) => {
         const button = event.target.closest("button[data-detail-metric]");
         if (button) openDetail(button);

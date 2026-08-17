@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 from threading import Lock
 from zoneinfo import ZoneInfo
 
-from shared.db import get_export_connection
+from shared.db import HTTP_EXPORT_STATEMENT_TIMEOUT_MS, get_export_connection
 from shared.mews_source import (
     CATEGORY_ORDERING_COLUMNS,
     UNORDERED_CATEGORY_RANK,
@@ -378,9 +378,9 @@ def _require_integration_settings():
 
 
 @contextmanager
-def _read_only_source_connection():
+def _read_only_source_connection(statement_timeout_ms=None):
     expected_database = _require_integration_settings()
-    with get_export_connection() as connection:
+    with get_export_connection(statement_timeout_ms) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT current_database() AS database_name, "
@@ -439,9 +439,18 @@ def fetch_pickup_history(hotel_code, stay_date, category, as_of_date):
     Returns one row per day from the first booking through the stay date (plus a
     week of post-stay corrections, bounded by as_of_date). The caller slices the
     window it wants to display; nothing here caps how far back it reaches.
+
+    Unlike the sync paths this one serves a browser, so it takes the tighter
+    HTTP statement ceiling: past ~45s Static Web Apps has already given up on
+    the response, and anything still running is holding a source backend for a
+    request nobody is waiting on any more. It also uses an ordinary cursor
+    rather than a named one - the result is a row per day, so the DECLARE and
+    FETCH round trips a server-side cursor adds buy nothing.
     """
-    with _read_only_source_connection() as connection:
-        with connection.cursor(name="supplement_pickup_history") as cursor:
+    with _read_only_source_connection(
+        HTTP_EXPORT_STATEMENT_TIMEOUT_MS
+    ) as connection:
+        with connection.cursor() as cursor:
             cursor.execute(PICKUP_HISTORY_SQL, {
                 "hotel_code": str(hotel_code),
                 "stay_date": stay_date,

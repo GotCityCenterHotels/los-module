@@ -648,3 +648,139 @@ test("revenue in another currency is excluded and reported", () => {
     assert.equal(lineFor(statement, "roomRevenue"), 16000);
     assert.equal(statement.flags.some((message) => /EUR was excluded/.test(message)), true);
 });
+
+// ---------------------------------------------------------------------------
+// Comparing with last year
+//
+// The chart draws two bars per period, so the two years have to land in the same
+// buckets. They are matched on the period key rather than on bar position: a
+// pairing by position slips the moment one year has a period the other does not,
+// and then every bar after it compares against the wrong month.
+// ---------------------------------------------------------------------------
+
+const LosFormat = require("../frontend/los-format.js");
+
+function factsFor(dates) {
+    return {
+        roomRevenue: dates.map(([stayDate, amount]) => ({
+            stayDate, hotelName: "A", amountCurrency: "SEK",
+            roomRevenueInclProducts1Net: String(amount)
+        })),
+        arrivalsDepartures: dates.map(([stayDate]) => ({
+            stayDate, hotelName: "A", totalArrivals: 10, totalDepartures: 10
+        }))
+    };
+}
+
+test("last year's rows are restamped onto the periods they compare against", () => {
+    const lastYear = factsFor([["2025-01-15", 5000], ["2025-02-15", 4000]]);
+    const aligned = CostData.alignToComparison(lastYear, "sameDate", ["A"]);
+
+    assert.deepEqual(
+        aligned.roomRevenue.map((row) => row.stayDate), ["2026-01-15", "2026-02-15"]
+    );
+    // Every dataset is shifted, not only the one the caller happened to need:
+    // the departure and revenue rows for a day have to stay on the same day, or
+    // the cost and the revenue for a period stop belonging to each other.
+    assert.deepEqual(
+        aligned.arrivalsDepartures.map((row) => row.stayDate),
+        ["2026-01-15", "2026-02-15"]
+    );
+    // Nothing else on the row is touched.
+    assert.equal(aligned.roomRevenue[0].roomRevenueInclProducts1Net, "5000");
+    assert.equal(aligned.roomRevenue[0].hotelName, "A");
+});
+
+test("both years bucket into the same period keys, on either basis", () => {
+    const thisYear = factsFor([["2026-01-15", 10000], ["2026-02-15", 8000]]);
+    const options = { settingsByHotel: settings, grain: "month" };
+
+    for (const basis of ["sameDate", "sameWeekday"]) {
+        const lastYear = factsFor([
+            [LosFormat.lastYearDate("2026-01-15", basis), 5000],
+            [LosFormat.lastYearDate("2026-02-15", basis), 4000]
+        ]);
+        const current = CostData.calculateGop(thisYear, options);
+        const previous = CostData.calculateGop(
+            CostData.alignToComparison(lastYear, basis, current.hotels), options
+        );
+
+        assert.deepEqual(
+            previous.periods.map(({ periodKey }) => periodKey),
+            current.periods.map(({ periodKey }) => periodKey),
+            `${basis} must produce the same buckets`
+        );
+        // And the right figure in the right bucket, not merely the right count.
+        assert.equal(previous.periods[0].revenue, 5000);
+        assert.equal(previous.periods[1].revenue, 4000);
+    }
+});
+
+test("a period only one year has stays unpaired instead of shifting the rest", () => {
+    const thisYear = factsFor([
+        ["2026-01-15", 10000], ["2026-02-15", 8000], ["2026-03-15", 6000]
+    ]);
+    // Nothing at all last February: the March bars must still face each other.
+    const lastYear = factsFor([["2025-01-15", 5000], ["2025-03-15", 3000]]);
+    const options = { settingsByHotel: settings, grain: "month" };
+
+    const current = CostData.calculateGop(thisYear, options);
+    const previous = CostData.calculateGop(
+        CostData.alignToComparison(lastYear, "sameDate", current.hotels), options
+    );
+    const byKey = new Map(previous.periods.map((period) => [period.periodKey, period]));
+
+    assert.deepEqual(
+        current.periods.map(({ periodKey }) => periodKey),
+        ["2026-01-01", "2026-02-01", "2026-03-01"]
+    );
+    assert.equal(byKey.get("2026-01-01").revenue, 5000);
+    assert.equal(byKey.has("2026-02-01"), false, "an absent month must stay absent");
+    assert.equal(byKey.get("2026-03-01").revenue, 3000);
+});
+
+test("a hotel last year no longer has in scope is left out of the comparison", () => {
+    const lastYear = {
+        roomRevenue: [
+            { stayDate: "2025-01-15", hotelName: "A", amountCurrency: "SEK", roomRevenueInclProducts1Net: "5000" },
+            { stayDate: "2025-01-15", hotelName: "Closed", amountCurrency: "SEK", roomRevenueInclProducts1Net: "9000" }
+        ]
+    };
+    const aligned = CostData.alignToComparison(lastYear, "sameDate", ["A"]);
+
+    // A property that has since closed would otherwise put revenue in the
+    // last-year bar with nothing beside it, and read as a collapse.
+    assert.deepEqual(aligned.roomRevenue.map((row) => row.hotelName), ["A"]);
+    // A Set and an array are both accepted, because the caller has a Set.
+    assert.equal(
+        CostData.alignToComparison(lastYear, "sameDate", new Set(["A"]))
+            .roomRevenue.length,
+        1
+    );
+});
+
+test("a row with no stay date is dropped rather than restamped to nothing", () => {
+    const broken = { roomRevenue: [{ hotelName: "A", roomRevenueInclProducts1Net: "1" }, null] };
+    assert.deepEqual(
+        CostData.alignToComparison(broken, "sameDate", ["A"]).roomRevenue, []
+    );
+    assert.deepEqual(CostData.alignToComparison(null, "sameDate", ["A"]), {});
+});
+
+test("the comparison is costed under the same rulebook, so a change moves both", () => {
+    // Cost Input is not versioned: the comparison answers "what would last
+    // year's volumes cost to run now", which is only meaningful if both years go
+    // through the same configuration.
+    const lastYear = CostData.alignToComparison(
+        factsFor([["2025-01-15", 5000]]), "sameDate", ["A"]
+    );
+    const doubled = {
+        A: { ...settings.A, profile: { ...settings.A.profile, distributionDefaultPercent: "20" } }
+    };
+
+    const before = CostData.calculateGop(lastYear, { settingsByHotel: settings });
+    const after = CostData.calculateGop(lastYear, { settingsByHotel: doubled });
+
+    assert.equal(lineFor(before, "distributionCost"), 500);
+    assert.equal(lineFor(after, "distributionCost"), 1000);
+});
