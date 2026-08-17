@@ -8,7 +8,7 @@
          preceding stylesheet is still loading, so putting this after the link
          would put the whole of styles.css in front of the first API call. -->
     <script src="costdata-boot.js?v=627fe31331"></script>
-    <link rel="stylesheet" href="styles.css?v=c0beb452ef">
+    <link rel="stylesheet" href="styles.css?v=8bf1534b3d">
 </head>
 <body>
 <main class="container cost-workspace settings-workspace">
@@ -29,13 +29,6 @@
 
     <div id="settingsStatus" class="cost-status-line" role="status" aria-live="polite">Select a hotel to begin.</div>
     <section id="settingsError" class="error-panel" role="alert" hidden></section>
-    <div class="settings-maintenance">
-        <div>
-            <h2>Cost data import</h2>
-            <p>Re-imports every cost dataset for every hotel. Runs for up to 35 minutes.</p>
-        </div>
-        <button type="button" id="runImportButton" class="secondary-button">Run import for all hotels</button>
-    </div>
     <div id="settingsLayout" class="settings-layout">
         <!-- The rail is not site navigation: aria-current="page" is already taken
              by the Cost Input link in the main nav above, and two elements
@@ -108,6 +101,6 @@
         </form>
     </div>
 </main>
-<script src="los-api.js?v=7a6e7f351b"></script><script src="los-format.js?v=5c3cad90fe"></script><script src="costdata-cleaning.js?v=0db8517c1b"></script><script src="costdata-match.js?v=b276a6fc99"></script><script src="costdata-input.js?v=3848e52d53"></script>
+<script src="los-api.js?v=7a6e7f351b"></script><script src="los-format.js?v=5c3cad90fe"></script><script src="costdata-cleaning.js?v=0db8517c1b"></script><script src="costdata-match.js?v=0a847ab958"></script><script src="costdata-input.js?v=23cc628e2c"></script>
 </body>
 </html>

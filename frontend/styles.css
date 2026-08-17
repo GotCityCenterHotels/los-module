@@ -1323,6 +1323,39 @@ tbody tr.total-row:hover {
     font-size: 12px;
 }
 
+/* The grain control repeated beside the chart. Quieter than the one in Query
+   settings - it is the same value, not a second decision - but a real control,
+   not a label. */
+.chart-grain {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.chart-grain label {
+    color: #475467;
+    font-size: 12px;
+    font-weight: 650;
+}
+
+.chart-grain select {
+    height: 32px;
+    padding: 0 8px;
+
+    border: 1px solid #d0d5dd;
+    border-radius: 6px;
+
+    background: white;
+
+    color: #101828;
+    font-size: 13px;
+}
+
+.chart-grain select:focus {
+    outline: 2px solid #98a2b3;
+    outline-offset: 1px;
+}
+
 .legend-swatch {
     display: inline-block;
     width: 13px;
@@ -2195,10 +2228,6 @@ tbody tr.total-row:hover {
    reading "Property", which read as an action scoped to the selected hotel. It
    is a 35-minute job across every hotel and every dataset, so it gets its own
    block that says so before the click rather than inside the confirm. */
-.settings-maintenance { display:flex; justify-content:space-between; align-items:center; gap:24px; margin:0 0 22px; padding:14px 18px; border:1px solid #e4e7ec; border-radius:9px; background:#f9fafb; }
-.settings-maintenance h2 { margin:0; color:var(--cost-ink); font-size:15px; }
-.settings-maintenance p { max-width:60ch; margin:3px 0 0; color:#667085; font-size:13px; }
-.settings-maintenance .secondary-button { flex:0 0 auto; }
 
 /* Stands in for the repeating rows while the rulebook is in flight. Everything
    around it - the rail, the headings, the fixed strips - is already correct
@@ -2309,6 +2338,9 @@ tbody tr.total-row:hover {
     background:#f2f4f7; color:#667085; font-size:10.5px; font-weight:650;
     max-width:45%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .combo-empty { padding:12px 10px; color:#98a2b3; font-size:12.5px; }
+/* A lookup that failed is not a lookup that found nothing, and it must not read
+   like one. */
+.combo-empty.is-error { color:#b42318; }
 
 /* --- Section on/off switches -------------------------------------------
    Switching a cost off greys its inputs rather than hiding them: the
@@ -2376,9 +2408,6 @@ tbody tr.total-row:hover {
 .tree-empty { margin:8px 0; color:#98a2b3; font-size:12px; }
 .tree-warning { margin:10px 0 0; color:#b54708; font-size:11.5px;
     font-weight:600; }
-.tree-manual { display:flex; flex:1 1 260px; gap:8px; align-items:center; }
-.settings-editor .tree-manual input { flex:1 1 auto; height:34px; }
-.settings-editor .tree-manual .secondary-button { flex:0 0 auto; height:34px; }
 .tree-filter-row { display:grid; flex:1 1 100%;
     grid-template-columns:minmax(180px,1fr) 34px; gap:8px; align-items:center; }
 .tree-filter-row .remove-rule { width:34px; height:34px; padding:0; }
@@ -2386,6 +2415,11 @@ tbody tr.total-row:hover {
 .origin-choices { flex:1 1 100%; }
 .origin-choices small { margin-left:5px; color:#98a2b3; font-weight:400; }
 .origin-choices .is-orphaned-choice { color:#b54708; }
+/* An origin belongs to one group only. The ones another group has claimed stay
+   on the list, greyed and named, so it is clear where the origin went rather
+   than it simply being absent. */
+.origin-choices .is-taken-choice { color:#98a2b3; cursor:not-allowed; }
+.origin-choices .is-taken-choice small { font-style:italic; }
 
 /* Picked rates read as a set, not as a list of rows: at this depth a row per
    rate would push the percentage that owns them off the top of the screen. */
@@ -2435,10 +2469,14 @@ tbody tr.total-row:hover {
 .cleaning-unset { margin-left:auto; padding:1px 7px; border-radius:9px;
     background:#fef0c7; color:#b54708; font-size:10.5px; font-weight:650; }
 .cleaning-grid { display:flex; flex-direction:column; }
+/* Guests, beds, minutes, staff cost, linen, total, then the row's own remove
+   button. Minutes and linen used to be inputs into a figure nobody could see;
+   the two money columns beside them are what the Cost Data page charges per
+   departure. */
 .cleaning-grid-head,
 .cleaning-grid-row { display:grid;
-    grid-template-columns:44px minmax(180px,1fr) 74px 82px auto; gap:10px;
-    align-items:center; }
+    grid-template-columns:44px minmax(150px,1fr) 74px 86px 82px 92px auto;
+    gap:10px; align-items:center; }
 .cleaning-grid-head { padding-bottom:3px; color:#98a2b3; font-size:10px;
     font-weight:650; letter-spacing:.05em; text-transform:uppercase; }
 .cleaning-grid-head span:nth-child(n+3) { text-align:right; }
@@ -2458,7 +2496,14 @@ tbody tr.total-row:hover {
 .settings-editor .cleaning-minutes { height:30px; padding:0 7px; font-size:12.5px;
     text-align:right; }
 .settings-editor .cleaning-minutes::placeholder { color:#b8c0cc; font-style:italic; }
-.cleaning-linen { color:#475467; font-size:12.5px;
+.cleaning-linen,
+.cleaning-staff { color:#475467; font-size:12.5px;
+    font-variant-numeric:tabular-nums; text-align:right; }
+.cleaning-staff { color:#98a2b3; }
+/* The row's own answer: what one departure from this room at this guest count
+   costs. It carries the weight of the line because it is the figure that leaves
+   this page. */
+.cleaning-total { color:var(--cost-ink); font-size:12.5px; font-weight:650;
     font-variant-numeric:tabular-nums; text-align:right; }
 .settings-editor .cleaning-remove { width:24px; height:24px; padding:0; }
 
@@ -2488,7 +2533,7 @@ tbody tr.total-row:hover {
 .settings-savebar button { background:var(--cost-accent); }
 
 @media(max-width:800px){
-    .settings-header{align-items:stretch;flex-direction:column}.settings-header>div{min-width:0}.settings-header p{overflow-wrap:anywhere}.settings-property{width:100%;min-width:0}.settings-property>div{width:100%}.settings-property select{width:0}.settings-maintenance{flex-direction:column;align-items:stretch;gap:12px}.settings-layout{grid-template-columns:1fr;gap:24px}.settings-nav{position:static;flex-direction:row;overflow-x:auto;border-bottom:1px solid #d0d5dd}.settings-nav button{display:block;flex:0 0 auto;width:auto;padding:11px 14px;border:0}.settings-nav button span{margin-right:6px}.setting-grid{grid-template-columns:1fr}.rule-main{grid-template-columns:1fr 110px}.rule-main .remove-rule{grid-column:1/-1}.rule-row{grid-template-columns:1fr 1fr}.rule-row>.remove-rule{grid-column:1/-1}.match-row{grid-template-columns:100px minmax(140px,1fr) 38px}.bed-type-row{grid-template-columns:minmax(100px,1fr) 70px auto 26px}.cleaning-grid-head,.cleaning-grid-row{grid-template-columns:34px minmax(120px,1fr) 62px 70px auto;gap:6px}.settings-savebar{bottom:8px;flex-direction:column;align-items:stretch}.settings-savebar button{width:100%}.editor-heading{flex-direction:column;gap:14px}.section-switch{align-self:flex-start}.tree-children{margin-left:8px;padding-left:10px}.tree-manual{flex:1 1 100%}.rate-popup{width:min(300px,86vw)}.rate-actions{flex-direction:column;gap:0}
+    .settings-header{align-items:stretch;flex-direction:column}.settings-header>div{min-width:0}.settings-header p{overflow-wrap:anywhere}.settings-property{width:100%;min-width:0}.settings-property>div{width:100%}.settings-property select{width:0}.settings-layout{grid-template-columns:1fr;gap:24px}.settings-nav{position:static;flex-direction:row;overflow-x:auto;border-bottom:1px solid #d0d5dd}.settings-nav button{display:block;flex:0 0 auto;width:auto;padding:11px 14px;border:0}.settings-nav button span{margin-right:6px}.setting-grid{grid-template-columns:1fr}.rule-main{grid-template-columns:1fr 110px}.rule-main .remove-rule{grid-column:1/-1}.rule-row{grid-template-columns:1fr 1fr}.rule-row>.remove-rule{grid-column:1/-1}.match-row{grid-template-columns:100px minmax(140px,1fr) 38px}.bed-type-row{grid-template-columns:minmax(100px,1fr) 70px auto 26px}.cleaning-grid-head,.cleaning-grid-row{grid-template-columns:32px minmax(96px,1fr) 56px 68px 62px 74px auto;gap:6px}.settings-savebar{bottom:8px;flex-direction:column;align-items:stretch}.settings-savebar button{width:100%}.editor-heading{flex-direction:column;gap:14px}.section-switch{align-self:flex-start}.tree-children{margin-left:8px;padding-left:10px}.rate-popup{width:min(300px,86vw)}.rate-actions{flex-direction:column;gap:0}
 }
 
 /* =====================================

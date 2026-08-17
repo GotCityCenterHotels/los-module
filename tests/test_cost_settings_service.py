@@ -750,6 +750,45 @@ class DistributionTreeValidationTests(unittest.TestCase):
         self.assertEqual(rate_group["rates"][0]["rateId"], "r1")
         self.assertIsNone(rate_group["rates"][1]["rateId"])
 
+    def test_an_origin_cannot_belong_to_two_groups(self):
+        # The same origin in two groups gives every reservation from it two
+        # fallback percentages with nothing to choose between them, so the cost is
+        # not merely wrong - it is undefined. The editor greys the origin out in
+        # the groups that do not own it; this is the same rule for a request that
+        # did not come from the editor.
+        with self.assertRaisesRegex(ValueError, "belongs to one group only"):
+            self._tree([
+                {
+                    "groupName": "Channel manager",
+                    "fallbackPercent": "15",
+                    "origins": ["ChannelManager"],
+                },
+                {
+                    "groupName": "Direct",
+                    "fallbackPercent": "3",
+                    # Different casing, same origin: the match is case-insensitive
+                    # everywhere else in this rulebook and has to be here too.
+                    "origins": ["channelmanager"],
+                },
+            ])
+
+    def test_the_same_origin_twice_in_one_group_is_still_just_one_origin(self):
+        result = self._tree([
+            {
+                "groupName": "Channel manager",
+                "fallbackPercent": "15",
+                "origins": ["ChannelManager", "channelmanager"],
+            },
+            {
+                "groupName": "Direct",
+                "fallbackPercent": "3",
+                "origins": ["Commander"],
+            },
+        ])
+
+        self.assertEqual(result[0]["origins"], ["ChannelManager"])
+        self.assertEqual(result[1]["origins"], ["Commander"])
+
     def test_a_group_that_matches_nothing_is_rejected(self):
         # Saved as-is it would either swallow every reservation or none of
         # them, depending on how the cost algorithm reads an empty filter.

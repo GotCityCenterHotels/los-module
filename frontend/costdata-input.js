@@ -8,7 +8,7 @@
     const hotel = document.getElementById("settingsHotel"), form = document.getElementById("settingsForm");
     const layout = document.getElementById("settingsLayout"), status = document.getElementById("settingsStatus");
     const errorPanel = document.getElementById("settingsError"), save = document.getElementById("saveSettings");
-    const dirtyState = document.getElementById("dirtyState"), importButton = document.getElementById("runImportButton");
+    const dirtyState = document.getElementById("dirtyState");
     let model = null, dirty = false, loadedEnterpriseId = "";
 
     if (typeof CostCleaning === "undefined") {
@@ -21,6 +21,14 @@
         throw new Error(
             "los-format.js did not load - hard refresh the page, and check that "
             + "the script deployed alongside costdata-input.js."
+        );
+    }
+    // The origin picker asks it which group already owns each origin, so this
+    // is needed on the first render now, not only when a rate picker is opened.
+    if (typeof CostMatch === "undefined") {
+        throw new Error(
+            "costdata-match.js did not load - hard refresh the page, and check "
+            + "that the script deployed alongside costdata-input.js."
         );
     }
 
@@ -116,20 +124,15 @@
         });
     }
 
-    async function loadHotels(options) {
-        const fresh = Boolean(options && options.forceRefresh);
+    async function loadHotels() {
         status.textContent = "Loading hotels…";
         hotel.disabled = true;
         try {
-            // No cache directive on the ordinary path: the route sends
-            // private, max-age=300 and the list only changes when the nightly
-            // import runs. An operator who has just imported a new hotel must
-            // see it at once, so that caller asks for a reload - the one thing
-            // that actually bypasses an HTTP cache. Clearing a storage key,
-            // which an earlier draft of this did, would not have.
-            const payload = await LosApi.fetchJson(
-                PROPERTIES_API, fresh ? {cache: "reload"} : undefined
-            );
+            // No cache directive: the route sends private, max-age=300 and the
+            // list only changes when the nightly import runs, so at worst a
+            // hotel imported in the last five minutes takes a second load to
+            // appear.
+            const payload = await LosApi.fetchJson(PROPERTIES_API);
             const properties = (payload.data || []).filter((property) =>
                 property && property.enterpriseId != null && String(property.enterpriseId).trim()
                 && property.hotelName && String(property.hotelName).trim()
@@ -218,7 +221,6 @@
             rememberProperty(loadedEnterpriseId);
             rateCache.clear();
             agencyCache.clear();
-            originDrafts = new WeakMap();
             render();
             setEditorState("ready");
             setDirty(false);
@@ -582,11 +584,38 @@
         return group.rows.some(row => (row.beds || []).length);
     }
 
+    // What the minutes on one row cost in staff time. The rate lives in the
+    // profile field at the top of the section, so this is read from the form
+    // rather than from the model: the two are only reconciled in collect().
+    function cleaningCostPerMinute() {
+        const input = form.elements.namedItem("cleaningCostPerMinute");
+        return CostCleaning.numberValue(input ? input.value : 0);
+    }
+
+    function rowStaffCost(row) {
+        return CostCleaning.numberValue(effectiveRow(row).minutes)
+            * cleaningCostPerMinute();
+    }
+
     function refreshCleaningTotals() {
         const progress = document.getElementById("cleaningProgress");
         for (const node of document.querySelectorAll("[data-linen-for]")) {
             const row = (model.cleaningCategories || [])[Number(node.dataset.linenFor)];
             if (row) node.textContent = LosFormat.formatSekAmount(effectiveRow(row).linen);
+        }
+        // Staff cost and the row total both move when the cost per minute at the
+        // top of the section changes, not only when this row is edited.
+        for (const node of document.querySelectorAll("[data-staff-for]")) {
+            const row = (model.cleaningCategories || [])[Number(node.dataset.staffFor)];
+            if (row) node.textContent = LosFormat.formatSekAmount(rowStaffCost(row));
+        }
+        for (const node of document.querySelectorAll("[data-total-for]")) {
+            const row = (model.cleaningCategories || [])[Number(node.dataset.totalFor)];
+            if (row) {
+                node.textContent = LosFormat.formatSekAmount(
+                    rowStaffCost(row) + effectiveRow(row).linen
+                );
+            }
         }
         for (const node of document.querySelectorAll("[data-minutes-for]")) {
             const row = (model.cleaningCategories || [])[Number(node.dataset.minutesFor)];
@@ -632,7 +661,10 @@
         table.className = "cleaning-grid";
         const header = document.createElement("div");
         header.className = "cleaning-grid-head";
-        for (const label of ["Guests", "Beds", "Minutes", "Linen"]) {
+        // Minutes and linen are inputs into a cost nobody could see: the row now
+        // prices its own staff time and reports what turning that room over at
+        // that guest count actually costs.
+        for (const label of ["Guests", "Beds", "Minutes", "Staff cost", "Linen", "Total cost"]) {
             const cell = document.createElement("span");
             cell.textContent = label;
             header.append(cell);
@@ -734,12 +766,34 @@
         });
         line.append(minutes);
 
+        // --- Staff cost -------------------------------------------------------
+        // The minutes themselves say nothing about money until they are
+        // multiplied by the rate at the top of the section, which is a long way
+        // up the page from here.
+        const staff = document.createElement("span");
+        staff.className = "cleaning-staff";
+        staff.dataset.staffFor = String(index);
+        staff.textContent = LosFormat.formatSekAmount(rowStaffCost(row));
+        staff.title = "Cleaning minutes at this hotel's cost per minute";
+        line.append(staff);
+
         // --- Linen ------------------------------------------------------------
         const linen = document.createElement("span");
         linen.className = "cleaning-linen";
         linen.dataset.linenFor = String(index);
         linen.textContent = LosFormat.formatSekAmount(state.linen);
         line.append(linen);
+
+        // --- Total ------------------------------------------------------------
+        // What one departure from this room at this guest count costs: the two
+        // figures beside it added up, and the number the Cost Data page charges
+        // per departure.
+        const total = document.createElement("span");
+        total.className = "cleaning-total";
+        total.dataset.totalFor = String(index);
+        total.textContent = LosFormat.formatSekAmount(rowStaffCost(row) + state.linen);
+        total.title = "Staff cost plus linen for this room and guest count";
+        line.append(total);
 
         // Marked and removable per ROW, not per category: a category that is
         // still in the hotel can lose an occupancy - Mews dropping an extra bed
@@ -862,11 +916,6 @@
     // rebuild is the only way to keep the "already assigned" state on every
     // rate picker honest after an edit anywhere in the tree.
     // ======================================================================
-    // Text typed into an origin group's free-text box but not yet added. Keyed
-    // by the group object itself so it survives the rebuild and is collected
-    // with the group when it is removed.
-    let originDrafts = new WeakMap();
-
     function newOriginGroup() {
         return {groupName: "", fallbackPercent: 0, origins: [], agencyGroups: []};
     }
@@ -958,7 +1007,7 @@
         main.append(name.wrap, percent.wrap, remove);
         row.append(main);
 
-        row.append(buildOriginPicker(group));
+        row.append(buildOriginPicker(group, originIndex));
 
         const subgroups = document.createElement("div");
         subgroups.className = "tree-children tree-agency-list";
@@ -993,7 +1042,14 @@
     // Origins are a short, closed list per property, so checkboxes beat a
     // combo: everything available is visible at once and the count next to each
     // says which ones the property actually books through.
-    function buildOriginPicker(group) {
+    //
+    // There is no free-text entry. It offered nothing the checkboxes do not -
+    // every origin the property books through is already listed - and it sat
+    // directly above the subgroups, so a travel agency name typed while looking
+    // for the agency search box landed in this list instead. An origin that is
+    // not in the source matches no reservation, which then silently emptied the
+    // matching-rate picker for the whole branch.
+    function buildOriginPicker(group, originIndex) {
         const field = document.createElement("div");
         field.className = "tree-field";
         const heading = document.createElement("span");
@@ -1003,6 +1059,11 @@
 
         const available = (sources && sources.origins) || [];
         const selected = new Set((group.origins || []).map(value => value.toLowerCase()));
+        // An origin belongs to one group only, so the ones another group has
+        // already claimed are shown but cannot be ticked here.
+        const takenElsewhere = CostMatch.originAssignmentIndex(
+            model.distributionOriginGroups, originIndex
+        );
         // A saved origin the source no longer reports still has to be visible
         // and removable - dropping it silently would change the rulebook.
         const orphans = (group.origins || []).filter(value =>
@@ -1012,69 +1073,45 @@
         const choices = document.createElement("div");
         choices.className = "compact-checks origin-choices";
         for (const option of available) {
-            choices.append(originChoice(group, option.name, option.reservationCount, selected));
+            choices.append(originChoice(group, option.name, {
+                count: option.reservationCount,
+                selected,
+                owner: takenElsewhere.get(option.name.toLowerCase())
+            }));
         }
         for (const value of orphans) {
-            choices.append(originChoice(group, value, null, selected, true));
+            choices.append(originChoice(group, value, {
+                selected, orphaned: true,
+                owner: takenElsewhere.get(value.toLowerCase())
+            }));
         }
         if (!available.length && !orphans.length) {
             const empty = document.createElement("span");
             empty.className = "tree-field-empty";
             empty.textContent = sourceCapability("origin")
                 ? "This hotel has no reservation origins in the source window."
-                : "Origins are unavailable for this hotel, so type one below.";
+                : "This hotel's reservations carry no origin, so this group can "
+                    + "only match through its travel agency subgroups below.";
             choices.append(empty);
         }
         field.append(choices);
-
-        // Free text stays available whatever the source says: a mirror without
-        // an origin column must not make the whole level unusable.
-        const manual = document.createElement("div");
-        manual.className = "tree-manual";
-        const entry = document.createElement("input");
-        entry.type = "text";
-        entry.placeholder = "Add an origin by name…";
-        entry.setAttribute("aria-label", "Add an origin by name");
-        // Half-typed text is not in the model, and every edit anywhere in the
-        // tree rebuilds this input from scratch - so ticking a checkbox used to
-        // throw away whatever was being typed here, with no sign it had gone.
-        entry.value = originDrafts.get(group) || "";
-        entry.addEventListener("input", () => {
-            originDrafts.set(group, entry.value);
-        });
-        const add = document.createElement("button");
-        add.type = "button";
-        add.className = "secondary-button";
-        add.textContent = "Add origin";
-        add.onclick = () => {
-            const value = entry.value.trim();
-            if (!value) return;
-            group.origins = group.origins || [];
-            if (!group.origins.some(existing => existing.toLowerCase() === value.toLowerCase())) {
-                group.origins.push(value);
-            }
-            originDrafts.delete(group);
-            renderDistributionTree();
-            setDirty(true);
-        };
-        entry.addEventListener("keydown", (event) => {
-            if (event.key !== "Enter") return;
-            // Otherwise Enter submits the whole form and the typed origin is lost.
-            event.preventDefault();
-            add.click();
-        });
-        manual.append(entry, add);
-        field.append(manual);
         return field;
     }
 
-    function originChoice(group, value, count, selected, orphaned) {
+    function originChoice(group, value, options) {
+        const {count, selected, owner, orphaned} = options || {};
         const label = document.createElement("label");
         if (orphaned) label.classList.add("is-orphaned-choice");
         const box = document.createElement("input");
         box.type = "checkbox";
         box.value = value;
         box.checked = selected.has(value.toLowerCase());
+        // Claimed by another group and not ticked here: offered for context, so
+        // it is obvious where the origin went rather than simply missing.
+        if (owner && !box.checked) {
+            label.classList.add("is-taken-choice");
+            box.disabled = true;
+        }
         box.onchange = () => {
             group.origins = (group.origins || []).filter(
                 existing => existing.toLowerCase() !== value.toLowerCase()
@@ -1092,6 +1129,12 @@
         if (orphaned) {
             const badge = document.createElement("small");
             badge.textContent = "not in source";
+            label.append(badge);
+        }
+        if (owner) {
+            const badge = document.createElement("small");
+            badge.textContent = box.checked
+                ? `also in ${owner}` : `in ${owner}`;
             label.append(badge);
         }
         return label;
@@ -1219,11 +1262,23 @@
                 popup.hidden = true;
                 return;
             }
-            const matches = await searchAgencies(term, originGroup.origins);
+            const result = await searchAgencies(term, originGroup.origins);
             // The field may have moved on while the request was in flight.
             if (input.value.trim() !== term) return;
+            const matches = result.agencies;
             popup.replaceChildren();
-            if (!matches.length) {
+            if (result.error) {
+                // A failed lookup used to come back as an empty list, which the
+                // message below then reported as "no agency contains that" - so
+                // a broken search read as a successful one that found nothing.
+                const failed = document.createElement("div");
+                failed.className = "combo-empty is-error";
+                failed.textContent =
+                    `Travel agency search failed: ${result.error} The term is `
+                    + "still saved and matched when the cost is calculated.";
+                popup.append(failed);
+            }
+            else if (!matches.length) {
                 const empty = document.createElement("div");
                 empty.className = "combo-empty";
                 empty.textContent =
@@ -1409,6 +1464,9 @@
 
         const api = {root: combo, close};
         let options = [];
+        // What the last lookup reported about itself, so the empty state can say
+        // whether there was nothing to find or nothing was asked.
+        let lookup = {};
 
         function sourceRateId(name) {
             const match = options.find(
@@ -1478,13 +1536,39 @@
         }
 
         function emptyReason() {
+            if (lookup.error) {
+                return `The rate lookup failed: ${lookup.error} `
+                    + "Use \"Add any rate on the property\" while this is being fixed.";
+            }
             if (sources && sources.error) return "This hotel's rate list could not be loaded.";
             if (mode === "all") return "This hotel has no rates in the source.";
             if (!sourceCapability("rateFromReservations")) {
                 return "Reservations here have no rate recorded, so there is "
                     + "nothing to narrow. Use \"Add any rate on the property\" instead.";
             }
-            return "No reservations under these filters were sold on a rate.";
+            // Naming the filters that were applied is the difference between a
+            // dead end and a message someone can act on: it is almost always one
+            // of them that is too narrow, and until now the picker never said
+            // which ones it had used.
+            return `No reservations ${describeFilters()} were sold on a rate.`;
+        }
+
+        function describeFilters() {
+            const parts = [];
+            const origins = (originGroup.origins || []).filter(Boolean);
+            if (origins.length) parts.push(`from ${origins.join(" or ")}`);
+            const terms = (agency.filters || [])
+                .map(rule => String(rule.containsValue || "").trim())
+                .filter(Boolean);
+            if (terms.length) {
+                parts.push(
+                    lookup.agencyFilterApplied
+                        ? `with a travel agency containing ${terms.map(term => `"${term}"`).join(" or ")}`
+                        : "(this hotel's reservations carry no travel agency, so that "
+                            + "term was not applied)"
+                );
+            }
+            return parts.length ? parts.join(" ") : "in this hotel's source window";
         }
 
         function rateOption(item, owner) {
@@ -1547,9 +1631,14 @@
             setExpanded(true);
             openCombo = api;
             list.replaceChildren(loadingRow());
-            options = mode === "all"
-                ? ((sources && sources.rates) || [])
-                : await matchingRates(originGroup.origins, agency.filters);
+            if (mode === "all") {
+                lookup = {};
+                options = (sources && sources.rates) || [];
+            }
+            else {
+                lookup = await matchingRates(originGroup.origins, agency.filters);
+                options = lookup.rates;
+            }
             if (popup.hidden) return;
             draw();
             search.focus();
@@ -1603,6 +1692,10 @@
         return (origins || []).join(",");
     }
 
+    // Returns {agencies, error}. A failure is reported rather than returned as
+    // an empty list: the two look identical to the caller, and the caller's
+    // message for an empty list ("no agency contains that") is a lie about a
+    // request that never completed. A failure is deliberately not cached.
     async function searchAgencies(term, origins) {
         // The property has to be part of the key. Without it, searching "boo"
         // on one hotel served the next hotel's agency names, with the first
@@ -1615,19 +1708,24 @@
             const payload = await LosApi.fetchJson(
                 `${AGENCIES_API}/${encodeURIComponent(loadedEnterpriseId)}?${parameters}`
             );
-            const matches = payload.data || [];
-            agencyCache.set(key, matches);
-            return matches;
+            const result = {agencies: payload.data || [], error: null};
+            agencyCache.set(key, result);
+            return result;
         }
         catch (error) {
             console.warn("Travel agency lookup failed", error);
-            return [];
+            return {agencies: [], error: error.message || "Unknown error."};
         }
     }
 
     // One request per search term, merged. The API narrows by a single term,
     // and a subgroup with two terms matches the union of both - so the picker
     // has to show the union too, or it would hide rates the subgroup covers.
+    //
+    // Returns {rates, error, agencyFilterApplied}. As with the agency search, a
+    // failure is reported rather than collapsed into an empty list: "no
+    // reservations under these filters were sold on a rate" is a statement about
+    // the property's data, and it must not stand in for a request that failed.
     async function matchingRates(origins, filters) {
         const terms = (filters || [])
             .map(rule => String(rule.containsValue || "").trim())
@@ -1647,25 +1745,37 @@
             const payload = await LosApi.fetchJson(
                 `${RATES_API}/${encodeURIComponent(loadedEnterpriseId)}${query ? `?${query}` : ""}`
             );
-            return (payload.data && payload.data.rates) || [];
+            return payload.data || {};
         });
 
         try {
             const merged = new Map();
-            for (const rates of await Promise.all(requests)) {
-                for (const rate of rates) {
+            // The mirror reports whether it could honour the agency term at
+            // all. A full rate list returned as if it had been narrowed reads
+            // as truth, so the picker says which filters actually applied.
+            let agencyFilterApplied = terms.length === 0;
+            for (const answer of await Promise.all(requests)) {
+                if (answer.agencyFilterApplied) agencyFilterApplied = true;
+                for (const rate of answer.rates || []) {
                     if (!merged.has(rate.name.toLowerCase())) merged.set(rate.name.toLowerCase(), rate);
                 }
             }
-            const result = Array.from(merged.values()).sort(
-                (left, right) => left.name.localeCompare(right.name)
-            );
+            const result = {
+                rates: Array.from(merged.values()).sort(
+                    (left, right) => left.name.localeCompare(right.name)
+                ),
+                error: null,
+                agencyFilterApplied
+            };
             rateCache.set(key, result);
             return result;
         }
         catch (error) {
             console.warn("Matching rate lookup failed", error);
-            return [];
+            return {
+                rates: [], error: error.message || "Unknown error.",
+                agencyFilterApplied: false
+            };
         }
     }
 
@@ -1957,107 +2067,12 @@
         status.textContent = context ? `${context} failed.` : "Something went wrong.";
         console.error(context || "Cost Input error", error);
     }
-    const IMPORT_POLL_INTERVAL_MS = 2000;
-    const IMPORT_POLL_TIMEOUT_MS = 35 * 60 * 1000;
-    const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
-    async function waitForImport(statusUrl) {
-        const deadline = Date.now() + IMPORT_POLL_TIMEOUT_MS;
-        while (Date.now() < deadline) {
-            const payload = await LosApi.fetchJson(statusUrl, {cache: "no-store"});
-            const job = payload.job || {};
-            if (job.status === "succeeded") return job;
-            if (job.status === "failed") throw new Error(job.error || "Import failed.");
-            status.textContent = `Cost data import ${job.status || "queued"}${job.attemptCount ? ` (attempt ${job.attemptCount})` : ""}…`;
-            await delay(IMPORT_POLL_INTERVAL_MS);
-        }
-        throw new Error("The import is still running. Reload this page to check its status.");
-    }
-    // costdata/import is a FUNCTION-level route: it triggers a full
-    // cross-database import, and the Function App is reachable on its own public
-    // hostname, so it cannot be left open. Static Web Apps does not attach the
-    // key for us, so the operator supplies it once per browser session.
-    //
-    // The key itself is in the Azure portal under los-functions > App Keys.
-    // That belongs here rather than in the prompt: the person clicking this is a
-    // revenue manager who has been given a key, not someone with portal access,
-    // and a dialog naming a resource they cannot open only makes them stop.
-    const IMPORT_KEY_STORAGE = "costdata-import-key";
-    function importKey() {
-        let key = "";
-        try { key = sessionStorage.getItem(IMPORT_KEY_STORAGE) || ""; } catch { key = ""; }
-        if (!key) {
-            key = (prompt(
-                "Enter the import key.\n\n"
-                + "Ask IT if you do not have it. It is kept for this browser session only."
-            ) || "").trim();
-            if (!key) return "";
-            try { sessionStorage.setItem(IMPORT_KEY_STORAGE, key); } catch { /* session-only */ }
-        }
-        return key;
-    }
-    function forgetImportKey() {
-        try { sessionStorage.removeItem(IMPORT_KEY_STORAGE); } catch { /* nothing cached */ }
-    }
-    async function runImport(){
-        if(!confirm("Import all cost datasets for every hotel now? This can take up to 35 minutes.")) return;
-        const key = importKey();
-        if (!key) { status.textContent = "Import cancelled — no key was entered."; return; }
-        importButton.disabled=true; errorPanel.hidden=true;
-        const importLabel = importButton.textContent;
-        const startedAt = Date.now();
-        // The only sign an import was running was a greyed-out button still
-        // reading "Run import", and one line of status text that scrolls off the
-        // moment a section is opened. For a job that can run 35 minutes, the
-        // button itself has to be the progress surface.
-        const elapsed = setInterval(() => {
-            const seconds = Math.floor((Date.now() - startedAt) / 1000);
-            importButton.textContent =
-                `Importing… ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-        }, 1000);
-        try {
-            status.textContent = "Queueing cost data import…";
-            let accepted;
-            try {
-                accepted = await LosApi.fetchJson("/api/costdata/import", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json", "x-functions-key": key},
-                    body: JSON.stringify({dataset:"all"})
-                });
-            }
-            catch (error) {
-                // A rejected key must not stay cached, or every later attempt
-                // fails without ever asking again.
-                if (/\b401\b|\b403\b/.test(error.message || "")) {
-                    forgetImportKey();
-                    throw new Error("That key was not accepted. Click the button again to enter it.");
-                }
-                throw error;
-            }
-            const job = await waitForImport(accepted.statusUrl);
-            const count = job.result?.results?.length || 0;
-            // Reloading pulls the server's copy over the form, and the form is
-            // where the operator may have half an hour of unsaved work. It used
-            // to do exactly that, silently, and then report "No unsaved
-            // changes" - losing the edits and lying about it. The property
-            // picker has guarded this since it was written; this path was
-            // simply missed.
-            if (dirty) {
-                status.textContent =
-                    `Import complete (${count} datasets). Your unsaved changes are still here — `
-                    + "save them, then reload the page to see the new data.";
-                return;
-            }
-            status.textContent = `Import complete (${count} datasets, ${job.result?.durationSeconds ?? "?"} seconds).`;
-            await loadHotels({forceRefresh: true});
-        }
-        catch (error) { showError(error, "Cost data import"); }
-        finally {
-            clearInterval(elapsed);
-            importButton.disabled = false;
-            importButton.textContent = importLabel;
-        }
-    }
-    importButton.onclick=runImport;
+    // There is deliberately no import control on this page. Triggering a
+    // 35-minute cross-database rebuild of every hotel's cost facts is not a
+    // property-settings task, and putting it one click from the editor meant the
+    // page's most destructive action sat above its safest ones. CostDataTimer
+    // owns the schedule; /api/costdata/import is still there for an operator with
+    // the function key when a rebuild really is needed out of hours.
     document.querySelectorAll(".settings-nav button").forEach(button => {
         button.onclick = () => {
             showSection(button.dataset.section);
@@ -2125,6 +2140,11 @@
         if (CHECKBOX_FIELDS.has(event.target.name) || event.target.name === "franchiseBasis") {
             syncSectionSwitches();
         }
+    });
+    // Every room row prices its own minutes, so the rate at the top of the
+    // Cleaning section moves every staff cost and every row total on screen.
+    form.addEventListener("input", (event) => {
+        if (event.target.name === "cleaningCostPerMinute") refreshCleaningTotals();
     });
     hotel.onchange=()=>{if(dirty&&!confirm("Discard unsaved changes?")){hotel.value=loadedEnterpriseId;return}loadSettings(hotel.value)};form.addEventListener("input",()=>setDirty(true));form.onsubmit=submit;window.addEventListener("beforeunload",event=>{if(dirty){event.preventDefault();event.returnValue=""}});
     showSection(sectionFromHash());

@@ -346,13 +346,85 @@ test("collect builds a pruned copy instead of editing the model in place", () =>
     assert.match(collect, /return \{\s*\n\s*\.\.\.model,/);
 });
 
-test("text typed into the origin box survives an edit elsewhere in the tree", () => {
+// The free-text origin box offered nothing the checkboxes do not, and it sat
+// directly above the travel agency subgroups: an agency name typed while looking
+// for the agency search box landed in the origin list instead. An origin that is
+// not in the source matches no reservation, which then silently emptied the
+// matching-rate picker for that whole branch.
+test("origins are picked from the source list only, with no free-text entry", () => {
+    const script = read("costdata-input.js");
+    const css = read("styles.css");
+
+    assert.doesNotMatch(script, /Add an origin by name/);
+    assert.doesNotMatch(script, /originDrafts/);
+    assert.doesNotMatch(script, /tree-manual/);
+    assert.doesNotMatch(css, /\.tree-manual/);
+    // The checkboxes are still the way in.
+    assert.match(script, /function originChoice\(group, value, options\)/);
+});
+
+test("an origin belongs to one group, and the others say which one has it", () => {
+    const script = read("costdata-input.js");
+    const service = fs.readFileSync(
+        path.join(__dirname, "..", "services", "cost_settings_service.py"), "utf8"
+    );
+
+    // The same origin in two groups gives every reservation from it two fallback
+    // percentages with nothing to choose between them.
+    assert.match(script, /CostMatch\.originAssignmentIndex\(/);
+    assert.match(script, /box\.disabled = true;/);
+    assert.match(read("styles.css"), /\.is-taken-choice/);
+    // And the rule is real, not only drawn: a hand-built request is rejected too.
+    assert.match(service, /belongs to one group only/);
+    assert.match(service, /origin_owner\[value\.casefold\(\)\] = name/);
+});
+
+test("a failed source lookup is reported as a failure, not as an empty result", () => {
+    const script = read("costdata-input.js");
+    const service = fs.readFileSync(
+        path.join(__dirname, "..", "services", "cost_source_service.py"), "utf8"
+    );
+
+    // Both lookups used to swallow the error and return [], so a 500 read as
+    // "no agency contains that" and "no reservations under these filters were
+    // sold on a rate" - two statements about the property's data that were not
+    // true of it.
+    assert.match(script, /error: error\.message \|\| "Unknown error\."/);
+    assert.match(script, /Travel agency search failed/);
+    assert.match(script, /The rate lookup failed/);
+    // The 500 itself: staging.travel_agency is an ETL landing table, so its key
+    // is not typed like the reservation's foreign key on every deployment.
+    assert.match(service, /agency\.\{agency_key\}::text = reservation\.\{agency_fk\}::text/);
+    assert.match(service, /JOIN rate_current rate ON rate\.id::text = scoped\.rate_id/);
+});
+
+test("an empty matching-rate list names the filters that produced it", () => {
     const script = read("costdata-input.js");
 
-    // Every tree edit rebuilds the whole tree, so anything not in the model is
-    // destroyed unless it is parked somewhere keyed by the group.
-    assert.match(script, /originDrafts = new WeakMap\(\)/);
-    assert.match(script, /entry\.value = originDrafts\.get\(group\) \|\| ""/);
+    // It is almost always one of the filters that is too narrow, and the picker
+    // never said which ones it had applied.
+    assert.match(script, /function describeFilters\(\)/);
+    assert.match(script, /No reservations \$\{describeFilters\(\)\} were sold on a rate/);
+    assert.match(script, /lookup\.agencyFilterApplied/);
+});
+
+test("the Cost Input page no longer triggers the cost data import", () => {
+    const html = read("costdata-input.html");
+    const script = read("costdata-input.js");
+    const css = read("styles.css");
+
+    // A 35-minute cross-database rebuild of every hotel is not a
+    // property-settings task, and it sat one click above the safest controls on
+    // the page.
+    assert.doesNotMatch(html, /runImportButton/);
+    assert.doesNotMatch(html, /settings-maintenance/);
+    assert.doesNotMatch(css, /settings-maintenance/);
+    // The route itself still exists for an operator with the function key, so
+    // this looks for the call and the machinery around it, not the word.
+    assert.doesNotMatch(script, /fetchJson\("\/api\/costdata\/import"/);
+    assert.doesNotMatch(script, /IMPORT_POLL_TIMEOUT_MS/);
+    assert.doesNotMatch(script, /costdata-import-key/);
+    assert.doesNotMatch(script, /x-functions-key/);
 });
 
 test("the chart axis spans both sides of zero so a reversal is drawn to scale", () => {
@@ -548,6 +620,44 @@ test("linen cost is derived from beds only, with nothing to type per row", () =>
     // the client sent.
     assert.match(service, /linen = linen_of\(beds\)/);
     assert.match(service, /row\["linenCost"\] = _round_sek/);
+});
+
+// Minutes and linen were inputs into a figure nobody could see: the rate that
+// prices the minutes lives at the top of the section, a long way up the page.
+test("each room row prices its own minutes and totals the departure", () => {
+    const script = read("costdata-input.js");
+    const css = read("styles.css");
+
+    assert.match(script, /"Guests", "Beds", "Minutes", "Staff cost", "Linen", "Total cost"/);
+    assert.match(script, /function rowStaffCost\(row\)/);
+    assert.match(script, /data-staff-for/);
+    assert.match(script, /data-total-for/);
+    // The total is the two figures beside it, not a third independent number.
+    assert.match(script, /rowStaffCost\(row\) \+ state\.linen/);
+    // Both move when the cost per minute at the top of the section changes, not
+    // only when this row is edited.
+    assert.match(script, /event\.target\.name === "cleaningCostPerMinute"/);
+    assert.match(css, /\.cleaning-total \{/);
+    // Six columns and the remove button, in both the desktop and mobile grids.
+    const grid = /\.cleaning-grid-head,\n\.cleaning-grid-row \{[\s\S]*?\}/.exec(css)[0];
+    assert.equal((grid.match(/px/g) || []).length >= 6, true, grid);
+});
+
+test("Group by sits beside the chart as well as in Query settings, on one value", () => {
+    const html = read("costdata.html");
+    const script = read("costdata.js");
+
+    const panel = /id="gopChartPanel"[\s\S]*?<\/section>/.exec(html)[0];
+    assert.match(panel, /id="gopChartGrain"/);
+    for (const grain of ["day", "week", "month", "year"]) {
+        assert.match(panel, new RegExp(`value="${grain}"`), `chart Group by missing ${grain}`);
+    }
+    // One value, mirrored both ways: neither control may be left showing a grain
+    // that is not in force.
+    assert.match(script, /function setGrain\(value\)/);
+    assert.match(script, /elements\.chartGrain\.value = value/);
+    assert.match(script, /elements\.grain\.value = value/);
+    assert.match(read("styles.css"), /\.chart-grain \{/);
 });
 
 test("a missing control warns instead of killing the page bootstrap", () => {

@@ -167,6 +167,34 @@ test("tree rate assignments are matched case-insensitively and skip blanks", () 
     assert.equal(assigned.size, 1);
 });
 
+// An origin in two groups gives every reservation from it two fallback
+// percentages with nothing to choose between them.
+test("an origin already in another group names that group", () => {
+    const assigned = CostMatch.originAssignmentIndex(tree(), null);
+
+    assert.equal(assigned.get("channelmanager"), "Channel manager");
+    assert.equal(assigned.get("commander"), "Direct");
+});
+
+test("the group being drawn never reports its own origins as taken", () => {
+    const assigned = CostMatch.originAssignmentIndex(tree(), 0);
+
+    assert.equal(assigned.has("channelmanager"), false);
+    assert.equal(assigned.get("commander"), "Direct");
+});
+
+test("origin assignments are case-insensitive, trimmed, and skip blanks", () => {
+    const messy = [
+        {groupName: "  ", origins: ["  ChannelManager ", "", "   "]},
+        {groupName: "Direct", origins: null}
+    ];
+    const assigned = CostMatch.originAssignmentIndex(messy, null);
+
+    // An unnamed group still has to be identifiable, or the badge reads "in ".
+    assert.equal(assigned.get("channelmanager"), "Group 1");
+    assert.equal(assigned.size, 1);
+});
+
 test("the same partition powers the tree picker, so taken rates sort last", () => {
     // Editing the Expedia package group frees its own two rates; the one held
     // by the other branch stays taken and drops to the bottom of the list.

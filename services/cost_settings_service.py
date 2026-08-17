@@ -1053,6 +1053,10 @@ def _validate_distribution_tree(origin_groups):
     meant when they created it.
     """
     clean_groups = []
+    # Which group already claims each origin. An origin in two groups gives every
+    # reservation from it two fallback percentages with nothing to choose between
+    # them, so the cost is not merely wrong - it is undefined.
+    origin_owner = {}
     for index, group in enumerate(_entries(origin_groups, "distributionOriginGroups")):
         group_label = f"Distribution group {index + 1}"
         name = _required_text(group.get("groupName"), f"{group_label} name")
@@ -1064,8 +1068,15 @@ def _validate_distribution_tree(origin_groups):
                 continue
             if len(value) > 250:
                 raise ValueError(f"{name}: an origin value is too long")
+            owner = origin_owner.get(value.casefold())
+            if owner is not None and owner != name:
+                raise ValueError(
+                    f"\"{value}\" is in both {owner} and {name}. An origin "
+                    "belongs to one group only - remove it from one of them."
+                )
             if value.casefold() not in {existing.casefold() for existing in origins}:
                 origins.append(value)
+                origin_owner[value.casefold()] = name
 
         agency_groups = []
         for agency_index, agency in enumerate(

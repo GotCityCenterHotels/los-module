@@ -171,10 +171,197 @@ test("an unconfigured property is flagged, not costed with invented values", () 
 test("derivations the fact data cannot support exactly are flagged", () => {
     const statement = CostData.calculateGop(data, { settingsByHotel: settings });
 
+    // No departure mix in this fixture, so the rate is the flat average of the
+    // configured rows - which is a real limitation, and named as one.
     assert.equal(
-        statement.flags.some((message) => /no per-category or per-occupancy/.test(message)),
+        statement.flags.some((message) => /flat average of its configured/.test(message)),
         true,
         "the blended cleaning rate must be flagged"
+    );
+    assert.equal(
+        statement.flags.some((message) => /only the fallback distribution %/.test(message)),
+        false,
+        "a property with no rulebook tree has nothing to warn about"
+    );
+});
+
+// ---------------------------------------------------------------------------
+// The reservation mixes
+//
+// Both replace an approximation the page used to apologise for. Both are weights
+// only: the departure count and the room revenue they apportion still come from
+// the movement and revenue facts, so a mix that is out cannot move a total.
+// ---------------------------------------------------------------------------
+
+test("cleaning is weighted by the rooms actually vacated, not by row count", () => {
+    // Double at 1 guest costs 20x5 + 50 = 150; at 2 guests 30x5 + 70 = 220. The
+    // flat average of the two rows is 185, but 45 of the 50 departures were
+    // single-occupancy, so the real rate is much closer to 150.
+    const withMix = {
+        ...data,
+        cleaningDepartures: [
+            { stayDate: "2026-01-02", hotelName: "A", categoryName: "Double", occupancy: 1, departures: 27 },
+            { stayDate: "2026-01-02", hotelName: "A", categoryName: "Double", occupancy: 2, departures: 3 },
+            { stayDate: "2026-01-03", hotelName: "A", categoryName: "Double", occupancy: 1, departures: 18 },
+            { stayDate: "2026-01-03", hotelName: "A", categoryName: "Double", occupancy: 2, departures: 2 }
+        ]
+    };
+    const statement = CostData.calculateGop(withMix, { settingsByHotel: settings });
+
+    // (45 x 150 + 5 x 220) / 50 = 157, and the 50 departures being charged for
+    // are still the movement facts' own count.
+    assert.equal(lineFor(statement, "cleaningCost"), 50 * 157);
+    assert.equal(
+        statement.flags.some((message) => /flat average of its configured/.test(message)),
+        false,
+        "the mix removes the caveat rather than sitting beside it"
+    );
+});
+
+test("a guest count above every configured row takes the nearest one below it", () => {
+    const overflowing = {
+        ...data,
+        cleaningDepartures: [
+            { stayDate: "2026-01-02", hotelName: "A", categoryName: "Double", occupancy: 4, departures: 30 },
+            { stayDate: "2026-01-03", hotelName: "A", categoryName: "Double", occupancy: 4, departures: 20 }
+        ]
+    };
+    const statement = CostData.calculateGop(overflowing, { settingsByHotel: settings });
+
+    // Four guests in a category configured to two is the two-guest row, not zero.
+    assert.equal(lineFor(statement, "cleaningCost"), 50 * 220);
+});
+
+test("a category with no cleaning rows is costed at the average and named", () => {
+    const unknown = {
+        ...data,
+        cleaningDepartures: [
+            { stayDate: "2026-01-02", hotelName: "A", categoryName: "Suite", occupancy: 2, departures: 30 },
+            { stayDate: "2026-01-03", hotelName: "A", categoryName: "Double", occupancy: 1, departures: 20 }
+        ]
+    };
+    const statement = CostData.calculateGop(unknown, { settingsByHotel: settings });
+
+    // 30 at the 185 average, 20 at Double's own 150, over 50 departures.
+    assert.equal(lineFor(statement, "cleaningCost"), 50 * ((30 * 185 + 20 * 150) / 50));
+    assert.equal(
+        statement.flags.some((message) => /Suite were costed at/.test(message)), true
+    );
+});
+
+test("the mix decides the rate and never the number of departures charged", () => {
+    // A mix that disagrees with the movement facts - half the departures missing -
+    // must not halve the cost line. It is a weighting, not a count.
+    const partial = {
+        ...data,
+        cleaningDepartures: [
+            { stayDate: "2026-01-02", hotelName: "A", categoryName: "Double", occupancy: 1, departures: 1 }
+        ]
+    };
+    const statement = CostData.calculateGop(partial, { settingsByHotel: settings });
+
+    assert.equal(lineFor(statement, "cleaningCost"), 50 * 150);
+});
+
+test("distribution charges each day at its own matched percentage", () => {
+    const tree = {
+        A: {
+            ...settings.A,
+            distributionOriginGroups: [
+                { groupName: "OTA", fallbackPercent: "15", origins: ["ChannelManager"], agencyGroups: [] }
+            ]
+        }
+    };
+    const withRates = {
+        ...data,
+        // Day one is entirely matched at 15%; day two is half matched, so it
+        // blends 15% with the property's 10% fallback.
+        distributionRates: [
+            { stayDate: "2026-01-02", hotelName: "A", mixRevenue: "9000", matchedRevenue: "9000", matchedPercent: "15" },
+            { stayDate: "2026-01-03", hotelName: "A", mixRevenue: "8000", matchedRevenue: "4000", matchedPercent: "15" }
+        ]
+    };
+    const statement = CostData.calculateGop(withRates, { settingsByHotel: tree });
+
+    // 10000 at 15% plus 6000 at 12.5%.
+    assert.equal(lineFor(statement, "distributionCost"), 1500 + 750);
+    assert.equal(
+        statement.flags.some((message) => /only the fallback distribution %/.test(message)),
+        false
+    );
+    // Revenue no group covers is charged the fallback, and saying so is the one
+    // thing that makes it fixable.
+    assert.equal(
+        statement.flags.some((message) => /origin no group covers/.test(message)), true
+    );
+});
+
+test("a day with revenue but no imported mix falls back and says so", () => {
+    const tree = {
+        A: {
+            ...settings.A,
+            distributionOriginGroups: [
+                { groupName: "OTA", fallbackPercent: "15", origins: ["ChannelManager"], agencyGroups: [] }
+            ]
+        }
+    };
+    const partial = {
+        ...data,
+        distributionRates: [
+            { stayDate: "2026-01-02", hotelName: "A", mixRevenue: "9000", matchedRevenue: "9000", matchedPercent: "20" }
+        ]
+    };
+    const statement = CostData.calculateGop(partial, { settingsByHotel: tree });
+
+    // 10000 at 20%, and 2026-01-03's 6000 at the 10% fallback.
+    assert.equal(lineFor(statement, "distributionCost"), 2000 + 600);
+    assert.equal(
+        statement.flags.some((message) => /days with no imported reservation mix/.test(message)),
+        true
+    );
+});
+
+test("a matched share outside nought to one cannot move the blend outside its inputs", () => {
+    // A correction period can carry negative revenue on either side of the ratio.
+    const fallback = CostData.effectiveDistributionPercent(null, "10");
+    assert.equal(fallback, 10);
+    assert.equal(
+        CostData.effectiveDistributionPercent(
+            { mixRevenue: "0", matchedRevenue: "0", matchedPercent: null }, "10"
+        ),
+        10
+    );
+    assert.equal(
+        CostData.effectiveDistributionPercent(
+            { mixRevenue: "100", matchedRevenue: "-50", matchedPercent: "30" }, "10"
+        ),
+        10
+    );
+    assert.equal(
+        CostData.effectiveDistributionPercent(
+            { mixRevenue: "100", matchedRevenue: "400", matchedPercent: "30" }, "10"
+        ),
+        30
+    );
+});
+
+test("an unweighted mix is no mix at all, and reports itself as absent", () => {
+    // Every row zero: there is nothing to weight by, so the caller has to fall
+    // back rather than divide by zero.
+    assert.equal(
+        CostData.mixedCleaningCost(
+            [{ categoryName: "Double", occupancy: 1, departures: 0 }],
+            settings.A.cleaningCategories,
+            "5"
+        ),
+        null
+    );
+    assert.equal(CostData.mixedCleaningCost([], settings.A.cleaningCategories, "5"), null);
+    assert.equal(
+        CostData.mixedCleaningCost(
+            [{ categoryName: "Double", occupancy: 1, departures: 5 }], [], "5"
+        ),
+        null
     );
 });
 
@@ -374,7 +561,7 @@ test("a group switched off leaves the rows, GOP and every period", () => {
     }
     // The blended-rate caveat explains a line that is no longer on the page.
     assert.equal(
-        withoutCleaning.flags.some((message) => /no per-category or per-occupancy/.test(message)),
+        withoutCleaning.flags.some((message) => /flat average of its configured/.test(message)),
         false
     );
     // Warnings about the scope itself are not tied to a line and still stand.

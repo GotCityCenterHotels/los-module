@@ -710,10 +710,20 @@ def _list_travel_agencies_uncached(enterprise_id, search, origins, cursor):
 
 
 def _scope_with_agency(join):
-    """The stay scope with the travel agency table joined in for the search."""
+    """The stay scope with the travel agency table joined in for the search.
+
+    Both sides of the join are cast to text. staging.travel_agency is an ETL
+    landing table, not a Mews *_current mirror, so its key is not typed like the
+    reservation's foreign key on every deployment - and an uuid = text comparison
+    is not a wrong answer, it is `operator does not exist`, a 500 that both
+    callers turned into an empty list. The agency search then read "no agency in
+    this hotel's reservations contains that" and the matching-rate picker read
+    "no reservations under these filters were sold on a rate", neither of which
+    was true. Same reason service.enterprise_id is compared as text above.
+    """
     return SQL(
         "{head} JOIN {agency_table} agency "
-        "ON agency.{agency_key} = reservation.{agency_fk} {tail}"
+        "ON agency.{agency_key}::text = reservation.{agency_fk}::text {tail}"
     ).format(
         head=_STAY_SCOPE_HEAD,
         agency_table=table_identifier(join.table),
@@ -796,7 +806,7 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
 
         query = SQL("""
             WITH scoped_rates AS MATERIALIZED (
-                SELECT reservation.{rate_fk} AS rate_id,
+                SELECT reservation.{rate_fk}::text AS rate_id,
                        count(*)::bigint AS reservation_count
                 {scope}
                   AND reservation.{rate_fk} IS NOT NULL
@@ -808,7 +818,7 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
                    trim(rate.{rate_name})::text AS rate_name,
                    scoped.reservation_count
             FROM scoped_rates scoped
-            JOIN rate_current rate ON rate.id = scoped.rate_id
+            JOIN rate_current rate ON rate.id::text = scoped.rate_id
             WHERE nullif(trim(rate.{rate_name}), '') IS NOT NULL
             ORDER BY rate_name
             LIMIT {limit}

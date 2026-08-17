@@ -64,17 +64,19 @@ class FakePool:
 
 class CostDataServiceTests(unittest.TestCase):
     def test_all_datasets_are_date_bounded_and_json_safe(self):
-        result_sets = [
-            [{
+        # Keyed by dataset rather than positional. The fake used to hand back
+        # result sets in order, so adding a query to COST_DATA_QUERIES gave one
+        # dataset another's rows - or, once the list outgrew the fixture, a bare
+        # StopIteration out of the middle of the service.
+        result_sets = {
+            "arrivalsDepartures": [{
                 "hotel_name": "Hotel A",
                 "stay_date": date(2026, 1, 2),
                 "total_arrivals": 3,
                 "total_departures": 2,
                 "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
             }],
-            [],
-            [],
-            [{
+            "roomRevenue": [{
                 "hotel_name": "Hotel A",
                 "stay_date": date(2026, 1, 2),
                 "amount_currency": "SEK",
@@ -83,10 +85,29 @@ class CostDataServiceTests(unittest.TestCase):
                 "product_revenue_1_net": Decimal("23.45"),
                 "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
             }],
-            [],
+            "cleaningDepartures": [{
+                "hotel_name": "Hotel A",
+                "stay_date": date(2026, 1, 2),
+                "category_name": "Double",
+                "occupancy": 2,
+                "departures": 4,
+                "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
+            }],
+            "distributionRates": [{
+                "hotel_name": "Hotel A",
+                "stay_date": date(2026, 1, 2),
+                "mix_revenue": Decimal("500.00"),
+                "matched_revenue": Decimal("400.00"),
+                "matched_percent": Decimal("12.5000"),
+                "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
+            }],
+        }
+        ordered = [
+            result_sets.get(dataset, [])
+            for dataset in cost_data_service.COST_DATA_QUERIES
         ]
         original_pool = cost_data_service.cost_pool
-        fake_pool = FakePool(result_sets)
+        fake_pool = FakePool(ordered)
         cost_data_service.cost_pool = fake_pool
 
         try:
@@ -98,7 +119,8 @@ class CostDataServiceTests(unittest.TestCase):
             cost_data_service.cost_pool = original_pool
 
         self.assertEqual(set(datasets), {
-            "arrivalsDepartures", "breakfast", "parking", "roomRevenue", "payments"
+            "arrivalsDepartures", "breakfast", "parking", "roomRevenue", "payments",
+            "cleaningDepartures", "distributionRates",
         })
         self.assertEqual(row_counts["arrivalsDepartures"], 1)
         self.assertEqual(datasets["arrivalsDepartures"][0]["stayDate"], "2026-01-02")
@@ -106,7 +128,17 @@ class CostDataServiceTests(unittest.TestCase):
             datasets["roomRevenue"][0]["roomRevenueInclProducts1Net"],
             "123.45",
         )
-        self.assertEqual(len(fake_pool.cursor.executions), 5)
+        # The mixes travel in the same envelope and through the same JSON
+        # coercion: a Decimal percentage reaching the browser as a float would
+        # round differently there than the statement rounds here.
+        self.assertEqual(datasets["cleaningDepartures"][0]["categoryName"], "Double")
+        self.assertEqual(datasets["cleaningDepartures"][0]["occupancy"], 2)
+        self.assertEqual(datasets["distributionRates"][0]["matchedPercent"], "12.5000")
+        self.assertEqual(datasets["distributionRates"][0]["mixRevenue"], "500.00")
+
+        self.assertEqual(
+            len(fake_pool.cursor.executions), len(cost_data_service.COST_DATA_QUERIES)
+        )
         for query, parameters in fake_pool.cursor.executions:
             self.assertIn("stay_date BETWEEN", query)
             self.assertEqual(parameters["start_date"], date(2026, 1, 1))

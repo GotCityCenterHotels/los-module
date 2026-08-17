@@ -90,7 +90,36 @@
         return assigned;
     }
 
-    const api = {assignmentIndex, partitionOptions, rateAssignmentIndex};
+    /**
+     * Which origin group already claims each reservation origin.
+     *
+     * An origin belongs to exactly one origin group. The same origin in two
+     * groups gives every reservation from it two fallback percentages with
+     * nothing to choose between them, so the picker greys it out in the groups
+     * that do not own it and the server rejects it outright.
+     *
+     * `exceptOriginIndex` is the group being drawn; it never reports its own
+     * origins as taken.
+     */
+    function originAssignmentIndex(originGroups, exceptOriginIndex) {
+        const assigned = new Map();
+        (originGroups || []).forEach((group, originIndex) => {
+            if (originIndex === exceptOriginIndex) return;
+            const owner = String(group.groupName || "").trim()
+                || `Group ${originIndex + 1}`;
+            for (const origin of group.origins || []) {
+                const value = String(origin || "").trim();
+                if (!value) continue;
+                assigned.set(value.toLowerCase(), owner);
+            }
+        });
+        return assigned;
+    }
+
+    const api = {
+        assignmentIndex, partitionOptions, rateAssignmentIndex,
+        originAssignmentIndex
+    };
 
     if (typeof module === "object" && module.exports) {
         module.exports = api;

@@ -44,6 +44,10 @@ MIGRATIONS = (
         "015_bed_types_and_cleaning_inheritance",
         APP_ROOT / "sql" / "migrations" / "015_bed_types_and_cleaning_inheritance.sql",
     ),
+    (
+        "016_cost_reservation_mix",
+        APP_ROOT / "sql" / "migrations" / "016_cost_reservation_mix.sql",
+    ),
 )
 
 _schema_ready = False

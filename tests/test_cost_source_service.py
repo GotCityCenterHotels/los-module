@@ -459,7 +459,15 @@ class TravelAgencyTests(unittest.TestCase):
         # Unqualified, this resolves to whatever the search path finds - which
         # for this table is nothing at all.
         self.assertIn('JOIN "staging"."travel_agency" agency', query)
-        self.assertIn('ON agency."id" = reservation."travel_agency_id"', query)
+        # Both sides cast to text. staging.travel_agency is an ETL landing table,
+        # not a Mews *_current mirror, so its key is not typed like the
+        # reservation's foreign key on every deployment - and an uuid = text
+        # comparison is not a wrong answer, it is `operator does not exist`. Both
+        # callers swallowed that 500 and returned an empty list, so the page said
+        # no agency matched and no rate was sold under these filters.
+        self.assertIn(
+            'ON agency."id"::text = reservation."travel_agency_id"::text', query
+        )
         self.assertIn("ILIKE %(agency_pattern)s", query)
 
     def test_an_unqualified_probe_never_sees_the_staging_table(self):

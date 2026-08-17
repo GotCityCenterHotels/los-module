@@ -67,6 +67,7 @@
         endDate: document.getElementById("costEndDate"),
         hotel: document.getElementById("costHotel"),
         grain: document.getElementById("costGrain"),
+        chartGrain: document.getElementById("gopChartGrain"),
         loadButton: document.getElementById("costLoadButton"),
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
@@ -617,11 +618,27 @@
         renderTable();
     }
 
+    // Two controls, one value. #costGrain in Query settings stays the one the
+    // rest of the file reads; the copy beside the chart mirrors it in both
+    // directions, so neither can be left showing a grain that is not in force.
+    function setGrain(value) {
+        if (elements.grain.value !== value) elements.grain.value = value;
+        if (elements.chartGrain && elements.chartGrain.value !== value) {
+            elements.chartGrain.value = value;
+        }
+        render();
+    }
+
     elements.loadButton.addEventListener("click", loadData);
     elements.hotel.addEventListener("change", render);
     // The grain decides the chart's buckets as well as the table's, so it can
     // no longer redraw the table alone.
-    elements.grain.addEventListener("change", render);
+    elements.grain.addEventListener("change", () => setGrain(elements.grain.value));
+    if (elements.chartGrain) {
+        elements.chartGrain.addEventListener(
+            "change", () => setGrain(elements.chartGrain.value)
+        );
+    }
     elements.lineReset.addEventListener("click", showEveryLine);
     for (const tab of document.querySelectorAll("[data-dataset]")) {
         tab.addEventListener("click", () => selectDataset(tab));
@@ -643,4 +660,7 @@
 
     setDefaultDates();
     buildLineToggles();
+    // The two selects declare the same default in the markup; this is what keeps
+    // them together if one of those defaults is ever edited alone.
+    if (elements.chartGrain) elements.chartGrain.value = elements.grain.value;
 }());

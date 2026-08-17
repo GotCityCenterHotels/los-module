@@ -252,24 +252,166 @@
         return total;
     }
 
-    // The mean cost of turning over one room, across every configured room
-    // category and occupancy. The cost facts carry a total departure count
-    // only - no per-category, per-occupancy breakdown - so a single blended
-    // rate is the most the data supports. The caller flags this.
+    // The same rows under the same currency rule as currencyTotal, bucketed by
+    // stay date. The two have to agree exactly: this is what a day's own
+    // distribution percentage is charged on, and their sum is the room revenue
+    // line the statement shows.
+    function currencyDailyTotals(rows, field, currency) {
+        const totals = new Map();
+        for (const row of rows) {
+            const rowCurrency = row.amountCurrency || "Unspecified";
+            if (rowCurrency !== currency && rowCurrency !== "Unspecified") continue;
+            totals.set(
+                row.stayDate,
+                (totals.get(row.stayDate) || 0) + numberOf(row[field])
+            );
+        }
+        return totals;
+    }
+
+    // What turning over one room costs, for one configured (category, occupancy)
+    // row.
+    //
+    // The effective figures are the ones inheritance has already resolved: a row
+    // that takes its bed setup or its minutes from the category's lowest
+    // occupancy has no figures of its own, and reading its raw fields would cost
+    // it at zero. Older payloads carry only the raw fields, so those still stand
+    // in.
+    function rowCleaningCost(row, costPerMinute) {
+        return numberOf(row.effectiveCleaningMinutes ?? row.cleaningMinutes)
+            * numberOf(costPerMinute)
+            + numberOf(row.effectiveLinenCost ?? row.linenCost);
+    }
+
+    // The mean cost of turning over one room, across every configured row,
+    // weighting each equally. Used only where the departure mix is unavailable -
+    // it treats a rarely sold suite as heavily as the double room the property
+    // mostly sells, which is exactly what the mix exists to correct.
     function averageCleaningCost(cleaningCategories, costPerMinute) {
         const rows = cleaningCategories || [];
         if (!rows.length) return null;
-        // The effective figures are the ones inheritance has already resolved:
-        // a row that takes its bed setup or its minutes from the category's
-        // lowest occupancy has no figures of its own, and reading its raw
-        // fields would cost it at zero. Older payloads carry only the raw
-        // fields, so those still stand in.
-        const total = rows.reduce((running, row) =>
-            running
-            + numberOf(row.effectiveCleaningMinutes ?? row.cleaningMinutes)
-                * numberOf(costPerMinute)
-            + numberOf(row.effectiveLinenCost ?? row.linenCost), 0);
+        const total = rows.reduce(
+            (running, row) => running + rowCleaningCost(row, costPerMinute), 0
+        );
         return total / rows.length;
+    }
+
+    function cleaningKey(categoryName, occupancy) {
+        return `${String(categoryName ?? "").trim().toLowerCase()}|${Number(occupancy)}`;
+    }
+
+    function cleaningCostIndex(cleaningCategories, costPerMinute) {
+        const index = new Map();
+        for (const row of cleaningCategories || []) {
+            index.set(
+                cleaningKey(row.categoryName, row.occupancy),
+                rowCleaningCost(row, costPerMinute)
+            );
+        }
+        return index;
+    }
+
+    // The guest counts configured for each category, ascending.
+    function occupancyIndex(cleaningCategories) {
+        const index = new Map();
+        for (const row of cleaningCategories || []) {
+            const category = String(row.categoryName ?? "").trim().toLowerCase();
+            if (!index.has(category)) index.set(category, []);
+            index.get(category).push(Number(row.occupancy));
+        }
+        for (const counts of index.values()) counts.sort((left, right) => left - right);
+        return index;
+    }
+
+    // A guest count with no row of its own takes the nearest one below it, and
+    // the lowest when it clears none. Same nearest-band rule as matchTier, for
+    // the same reason: a property that configured 1 to 3 guests and then houses a
+    // fourth has not said a fourth guest costs nothing to clean up after.
+    function nearestOccupancy(occupancies, categoryName, occupancy) {
+        const configured = occupancies.get(
+            String(categoryName ?? "").trim().toLowerCase()
+        );
+        if (!configured || !configured.length) return null;
+        let below = null;
+        for (const value of configured) {
+            if (value <= occupancy && (below === null || value > below)) below = value;
+        }
+        return below === null ? configured[0] : below;
+    }
+
+    // The cost of turning over one room, weighted by how the period's departures
+    // actually split across room category and guest count.
+    //
+    // This is the whole point of the departure mix: the property's own mix is
+    // what decides whether a period leans on its cheapest category or its most
+    // expensive one, and no amount of configuration could express that from the
+    // hotel-per-day totals the page used to have.
+    //
+    // Returns null when there is no mix for these rows, so the caller can fall
+    // back to the flat average and say why.
+    function mixedCleaningCost(mixRows, cleaningCategories, costPerMinute) {
+        const rows = mixRows || [];
+        if (!rows.length) return null;
+        const costs = cleaningCostIndex(cleaningCategories, costPerMinute);
+        if (!costs.size) return null;
+        const occupancies = occupancyIndex(cleaningCategories);
+        const blended = averageCleaningCost(cleaningCategories, costPerMinute) || 0;
+
+        let departures = 0;
+        let cost = 0;
+        const unconfigured = new Set();
+        for (const row of rows) {
+            const count = numberOf(row.departures);
+            if (count <= 0) continue;
+            departures += count;
+
+            const exact = costs.get(cleaningKey(row.categoryName, row.occupancy));
+            if (exact !== undefined) {
+                cost += count * exact;
+                continue;
+            }
+            const nearest = nearestOccupancy(
+                occupancies, row.categoryName, numberOf(row.occupancy)
+            );
+            const nearestCost = nearest === null
+                ? undefined
+                : costs.get(cleaningKey(row.categoryName, nearest));
+            if (nearestCost !== undefined) {
+                cost += count * nearestCost;
+                continue;
+            }
+            // The room category itself has no cleaning rows at all. Costing
+            // these departures at zero would understate the period silently, so
+            // they take the property's average and the caller names the category.
+            unconfigured.add(String(row.categoryName ?? "").trim() || "(unnamed)");
+            cost += count * blended;
+        }
+        if (departures <= 0) return null;
+        return {
+            costPerDeparture: cost / departures,
+            unconfigured: Array.from(unconfigured).sort()
+        };
+    }
+
+    // The distribution percentage for one hotel-day, blending the share of
+    // revenue the rulebook matched with the property's fallback for the rest.
+    //
+    // The matching itself happens in SQL, where the rulebook and the mix live
+    // together; the fallback stays here so it is defined in exactly one place.
+    function effectiveDistributionPercent(rate, fallbackPercent) {
+        const fallback = numberOf(fallbackPercent);
+        if (!rate) return fallback;
+        const mixRevenue = numberOf(rate.mixRevenue);
+        if (mixRevenue === 0) return fallback;
+        // A correction period can carry negative revenue, which would otherwise
+        // produce a share outside 0-1 and a percentage outside both inputs.
+        const matchedShare = Math.min(
+            1, Math.max(0, numberOf(rate.matchedRevenue) / mixRevenue)
+        );
+        const matched = rate.matchedPercent === null || rate.matchedPercent === undefined
+            ? fallback
+            : numberOf(rate.matchedPercent);
+        return matchedShare * matched + (1 - matchedShare) * fallback;
     }
 
     function zeroTotals() {
@@ -403,18 +545,71 @@
                 + breakfastStaffHours * numberOf(profile.breakfastStaffCostPerHour);
 
             // --- Distribution --------------------------------------------------
-            totals.distributionCost += percentOf(
-                roomRevenue, profile.distributionDefaultPercent
-            );
+            // Charged per stay date, at the percentage that day's own mix of
+            // origins, travel agencies and rates works out to. The mix is matched
+            // against the rulebook in SQL and arrives as one row per hotel per
+            // day; what is not matched by any origin group is charged the
+            // property's fallback, which is why the two figures travel together.
             const hasDistributionTree = (settings.distributionOriginGroups || []).length
                 || (settings.distributionGroups || []).length;
-            if (hasDistributionTree) {
-                flag(
-                    `${hotel}: only the fallback distribution % could be applied. Your `
-                    + "per-origin, per-agency and per-rate percentages need reservation-level "
-                    + "data, which this page does not have.",
-                    "distributionCost"
+            const distributionRates = filterRows(source.distributionRates, hotel);
+            if (distributionRates.length) {
+                const rateByDay = new Map(
+                    distributionRates.map((row) => [row.stayDate, row])
                 );
+                const revenueByDay = currencyDailyTotals(
+                    roomRevenueRows, "roomRevenueInclProducts1Net", currency
+                );
+                let unmixedRevenue = 0;
+                for (const [day, amount] of revenueByDay) {
+                    const rate = rateByDay.get(day);
+                    if (!rate) unmixedRevenue += amount;
+                    totals.distributionCost += percentOf(
+                        amount,
+                        effectiveDistributionPercent(
+                            rate, profile.distributionDefaultPercent
+                        )
+                    );
+                }
+                const mixRevenue = distributionRates.reduce(
+                    (running, row) => running + numberOf(row.mixRevenue), 0
+                );
+                const matchedRevenue = distributionRates.reduce(
+                    (running, row) => running + numberOf(row.matchedRevenue), 0
+                );
+                // Both of these are actionable, which is the difference between
+                // them and the flag they replaced: one says to add an origin to a
+                // group, the other says a stretch of the period predates the mix.
+                if (hasDistributionTree && mixRevenue > 0
+                    && matchedRevenue < mixRevenue * 0.999) {
+                    flag(
+                        `${hotel}: ${Format.formatSek(mixRevenue - matchedRevenue)} of room `
+                        + "revenue came from an origin no group covers, so it was charged the "
+                        + "fallback distribution %. Add that origin to a group in Cost Input.",
+                        "distributionCost"
+                    );
+                }
+                if (unmixedRevenue > 0) {
+                    flag(
+                        `${hotel}: ${Format.formatSek(unmixedRevenue)} of room revenue falls on `
+                        + "days with no imported reservation mix, so it was charged the fallback "
+                        + "distribution %.",
+                        "distributionCost"
+                    );
+                }
+            }
+            else {
+                totals.distributionCost += percentOf(
+                    roomRevenue, profile.distributionDefaultPercent
+                );
+                if (hasDistributionTree) {
+                    flag(
+                        `${hotel}: only the fallback distribution % was applied. The `
+                        + "reservation mix your per-origin, per-agency and per-rate percentages "
+                        + "are matched against has not been imported for this period.",
+                        "distributionCost"
+                    );
+                }
             }
 
             // --- Franchise & card ----------------------------------------------
@@ -464,9 +659,19 @@
             }
 
             // --- Cleaning --------------------------------------------------------
+            // Departures come from the movement facts, which are authoritative;
+            // the departure mix says how they split across room category and
+            // guest count, which is the pair the rulebook is configured per. The
+            // count being charged for therefore never depends on the mix - only
+            // the rate does.
             const departures = sum(movementRows, "totalDepartures");
             const perDeparture = averageCleaningCost(
                 settings.cleaningCategories, profile.cleaningCostPerMinute
+            );
+            const mixed = mixedCleaningCost(
+                filterRows(source.cleaningDepartures, hotel),
+                settings.cleaningCategories,
+                profile.cleaningCostPerMinute
             );
             if (perDeparture === null) {
                 if (departures > 0) {
@@ -477,14 +682,26 @@
                     );
                 }
             }
-            else {
+            else if (mixed === null) {
                 totals.cleaningCost += departures * perDeparture;
                 flag(
-                    "Cleaning cost uses the average of your configured category and occupancy "
-                    + "rows, multiplied by departures — the source data has "
-                    + "no per-category or per-occupancy split.",
+                    `${hotel}: cleaning cost is the flat average of its configured category and `
+                    + "occupancy rows, multiplied by departures. The departure mix that would "
+                    + "weight it by the rooms actually vacated has not been imported for this "
+                    + "period.",
                     "cleaningCost"
                 );
+            }
+            else {
+                totals.cleaningCost += departures * mixed.costPerDeparture;
+                if (mixed.unconfigured.length) {
+                    flag(
+                        `${hotel}: departures from ${mixed.unconfigured.join(", ")} were costed at `
+                        + "this property's average, because that room category has no cleaning "
+                        + "rows. Set its beds and minutes in Cost Input.",
+                        "cleaningCost"
+                    );
+                }
             }
 
             // --- Arrivals ---------------------------------------------------------
@@ -634,7 +851,12 @@
         // coercion are both easy to get subtly wrong and neither is reachable
         // through calculateGop without building a whole fixture.
         matchTier,
-        isEnabled
+        isEnabled,
+        // The two halves of the reservation-mix arithmetic. Both blend a matched
+        // figure with a fallback, which is the part that is easy to get wrong in
+        // a way no total would reveal.
+        mixedCleaningCost,
+        effectiveDistributionPercent
     };
     if (typeof module === "object" && module.exports) module.exports = api;
     root.CostData = api;

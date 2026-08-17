@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data</title>
-    <link rel="stylesheet" href="styles.css?v=c0beb452ef">
+    <link rel="stylesheet" href="styles.css?v=8bf1534b3d">
 </head>
 <body>
     <main class="container cost-workspace">
@@ -103,13 +103,28 @@
                 <div>
                     <h2 id="gopChartTitle">Cost against revenue</h2>
                 </div>
-                <!-- ARIA prohibits naming a generic element, so the aria-label here
-                     was simply dropped; the list roles give it something nameable. -->
-                <div class="chart-legend gop-chart-legend" role="list" aria-label="Chart legend">
-                    <span role="listitem"><i class="legend-swatch gop-legend-base"></i>Base amount</span>
-                    <span role="listitem"><i class="legend-swatch gop-legend-profit"></i>Profit</span>
-                    <span role="listitem"><i class="legend-swatch gop-legend-loss"></i>Loss</span>
-                    <span role="listitem"><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
+                <div class="gop-heading-actions">
+                    <!-- The same control as the one in Query settings, and the
+                         same value: the bars ARE the grain, and reaching back up
+                         to the settings panel to change it was the one thing
+                         nobody looking at the chart could do from here. -->
+                    <div class="chart-grain">
+                        <label for="gopChartGrain">Group by</label>
+                        <select id="gopChartGrain">
+                            <option value="day">Day</option>
+                            <option value="week">Week</option>
+                            <option value="month" selected>Month</option>
+                            <option value="year">Year</option>
+                        </select>
+                    </div>
+                    <!-- ARIA prohibits naming a generic element, so the aria-label here
+                         was simply dropped; the list roles give it something nameable. -->
+                    <div class="chart-legend gop-chart-legend" role="list" aria-label="Chart legend">
+                        <span role="listitem"><i class="legend-swatch gop-legend-base"></i>Base amount</span>
+                        <span role="listitem"><i class="legend-swatch gop-legend-profit"></i>Profit</span>
+                        <span role="listitem"><i class="legend-swatch gop-legend-loss"></i>Loss</span>
+                        <span role="listitem"><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
+                    </div>
                 </div>
             </div>
 
@@ -148,7 +163,7 @@
 
     <script src="los-api.js?v=7a6e7f351b"></script>
     <script src="los-format.js?v=5c3cad90fe"></script>
-    <script src="costdata-data.js?v=785dd603fc"></script>
-    <script src="costdata.js?v=0429040cc6"></script>
+    <script src="costdata-data.js?v=68559290be"></script>
+    <script src="costdata.js?v=ceea3efc5e"></script>
 </body>
 </html>

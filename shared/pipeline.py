@@ -32,6 +32,21 @@ DATASETS = {
         "export_sql": "export/breakfast_data.sql",
         "import_sql": "import/upsert_breakfast_data.sql",
     },
+    # The two reservation-level mixes, last because they are the two most
+    # expensive statements here and because everything above them is what the
+    # statement's totals come from. Their export SQL is built at run time from
+    # information_schema rather than read from a file - the Mews mirror's naming
+    # for origin, travel agency, rate, room category and guest counts is not
+    # knowable from this repository, and a guess that misses has to skip the
+    # dataset rather than fail the import.
+    "departure_mix": {
+        "export_builder": "departure_mix",
+        "import_sql": "import/upsert_departure_mix_data.sql",
+    },
+    "distribution_mix": {
+        "export_builder": "distribution_mix",
+        "import_sql": "import/upsert_distribution_mix_data.sql",
+    },
 }
 
 
@@ -51,11 +66,25 @@ def run_dataset(dataset_name):
 
     config = DATASETS[dataset_name]
 
-    result = transfer_dataset(
-        export_sql_file=config["export_sql"],
-        import_sql_file=config["import_sql"],
-        batch_size=5000,
-    )
+    if "export_builder" in config:
+        from services.cost_mix_export_service import build_mix_export
+
+        builder_name = config["export_builder"]
+        result = transfer_dataset(
+            export_sql_builder=lambda source: build_mix_export(builder_name, source),
+            import_sql_file=config["import_sql"],
+            # Mix rows are narrow and there are far more of them than in any
+            # other dataset, so a smaller batch keeps each import transaction
+            # short rather than holding one open across thousands of upserts.
+            batch_size=2000,
+            name=dataset_name,
+        )
+    else:
+        result = transfer_dataset(
+            export_sql_file=config["export_sql"],
+            import_sql_file=config["import_sql"],
+            batch_size=5000,
+        )
 
     if dataset_name == "properties":
         if result["export_rows"] == 0:
