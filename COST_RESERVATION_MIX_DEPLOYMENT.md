@@ -50,11 +50,30 @@ it tried and returns `None`. The dataset then imports nothing, and the page keep
 its previous figure and its flag. Candidate lists live at the top of
 `services/cost_mix_export_service.py`; adding a synonym there is the fix.
 
-Required for the departure mix, on `staging.room_nights_source`: `end_utc`,
-`hotel_name`, and a reservation key. Plus a room category foreign key and guest
-counts - taken from the nights when they are there and from
-`reservation_current` when they are not - and a name column on
+Required for the departure mix, on the room-nights relation
+(`staging.room_nights_source`, else `staging.room_nights_current`): `end_utc`,
+`hotel_name`, `reservation_id`. Plus a room category and guest counts - looked for
+on the nights first and on `reservation_current` otherwise - and a name column on
 `resource_category_current`.
+
+Against the current source none of that needs a join: `staging.room_nights_current`
+already exposes both category ids and a `person_count` that is the summed
+PersonCounts list, so the export reads the nights, joins
+`resource_category_current` for the name, and nothing else.
+
+### Which room category
+
+`coalesce(assigned_resource_category_id, requested_resource_category_id)`.
+Assigned is the room that was actually occupied and therefore actually cleaned;
+requested is what was booked. An upgrade from a double to a suite is cleaned as a
+suite. Assigned comes from a LEFT JOIN in the view and is null for a stay with no
+room assigned, which is what the fallback covers.
+
+The category *name* still comes from `resource_category_current`, not from the
+view's own `requested_space_name`. The view reads that out of
+`resource_category_history`, which can hold a superseded spelling, and the cleaning
+rows the page matches against were saved with the name the Cost Input picker showed
+- which is the current one.
 
 ### Guests in the room
 

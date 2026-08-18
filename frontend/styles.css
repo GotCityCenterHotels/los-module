@@ -2444,6 +2444,27 @@ tbody tr.total-row:hover {
 .franchise-fields small { color:#98a2b3; font-weight:400; }
 .franchise-card.is-switched-off .franchise-fields { opacity:.5; }
 @media (max-width:700px) { .franchise-fields { grid-template-columns:minmax(0,1fr); } }
+/* --- Cost data import -----------------------------------------------------
+   Reachable from this page and effectively nowhere else: the Function App sits
+   behind App Service Authentication as a Static Web Apps linked backend, so only
+   a request carrying this site's own auth cookie gets through to it. */
+.settings-maintenance { display:flex; justify-content:space-between;
+    align-items:center; flex-wrap:wrap; gap:16px 24px; margin:0 0 22px;
+    padding:14px 18px; border:1px solid #e4e7ec; border-radius:9px;
+    background:#f9fafb; }
+.settings-maintenance h2 { margin:0; color:var(--cost-ink); font-size:15px; }
+.settings-maintenance p { max-width:60ch; margin:3px 0 0; color:#667085;
+    font-size:13px; }
+.settings-maintenance > div:first-child { flex:1 1 320px; }
+.settings-maintenance .secondary-button { flex:0 0 auto; height:38px; }
+.import-dataset { display:flex; flex-direction:column; gap:5px; flex:0 0 auto; }
+.import-dataset span { color:#475467; font-size:11px; font-weight:650;
+    letter-spacing:.04em; text-transform:uppercase; }
+.import-dataset select { height:38px; padding:0 9px; border:1px solid #d0d5dd;
+    border-radius:6px; background:white; color:#101828; font-size:13px; }
+.import-dataset select:disabled { background:#f2f4f7; color:#98a2b3;
+    cursor:not-allowed; }
+
 .settings-editor .is-switched-off input:disabled,
 .settings-editor .is-switched-off select:disabled { background:#f9fafb;
     cursor:not-allowed; }
@@ -2606,7 +2627,7 @@ tbody tr.total-row:hover {
 .settings-savebar button { background:var(--cost-accent); }
 
 @media(max-width:800px){
-    .settings-header{align-items:stretch;flex-direction:column}.settings-header>div{min-width:0}.settings-header p{overflow-wrap:anywhere}.settings-property{width:100%;min-width:0}.settings-property>div{width:100%}.settings-property select{width:0}.settings-layout{grid-template-columns:1fr;gap:24px}.settings-nav{position:static;flex-direction:row;overflow-x:auto;border-bottom:1px solid #d0d5dd}.settings-nav button{display:block;flex:0 0 auto;width:auto;padding:11px 14px;border:0}.settings-nav button span{margin-right:6px}.setting-grid{grid-template-columns:1fr}.rule-main{grid-template-columns:1fr 110px}.rule-main .remove-rule{grid-column:1/-1}.rule-row{grid-template-columns:1fr 1fr}.rule-row>.remove-rule{grid-column:1/-1}.match-row{grid-template-columns:100px minmax(140px,1fr) 38px}.bed-type-row{grid-template-columns:minmax(100px,1fr) 70px auto 26px}.cleaning-grid-head,.cleaning-grid-row{grid-template-columns:32px minmax(96px,1fr) 56px 68px 62px 74px auto;gap:6px}.settings-savebar{bottom:8px;flex-direction:column;align-items:stretch}.settings-savebar button{width:100%}.editor-heading{flex-direction:column;gap:14px}.section-switch{align-self:flex-start}.tree-children{margin-left:8px;padding-left:10px}.rate-popup{width:min(300px,86vw)}.rate-actions{flex-direction:column;gap:0}
+    .settings-header{align-items:stretch;flex-direction:column}.settings-header>div{min-width:0}.settings-header p{overflow-wrap:anywhere}.settings-property{width:100%;min-width:0}.settings-property>div{width:100%}.settings-property select{width:0}.settings-maintenance{flex-direction:column;align-items:stretch;gap:12px}.import-dataset select{width:100%}.settings-layout{grid-template-columns:1fr;gap:24px}.settings-nav{position:static;flex-direction:row;overflow-x:auto;border-bottom:1px solid #d0d5dd}.settings-nav button{display:block;flex:0 0 auto;width:auto;padding:11px 14px;border:0}.settings-nav button span{margin-right:6px}.setting-grid{grid-template-columns:1fr}.rule-main{grid-template-columns:1fr 110px}.rule-main .remove-rule{grid-column:1/-1}.rule-row{grid-template-columns:1fr 1fr}.rule-row>.remove-rule{grid-column:1/-1}.match-row{grid-template-columns:100px minmax(140px,1fr) 38px}.bed-type-row{grid-template-columns:minmax(100px,1fr) 70px auto 26px}.cleaning-grid-head,.cleaning-grid-row{grid-template-columns:32px minmax(96px,1fr) 56px 68px 62px 74px auto;gap:6px}.settings-savebar{bottom:8px;flex-direction:column;align-items:stretch}.settings-savebar button{width:100%}.editor-heading{flex-direction:column;gap:14px}.section-switch{align-self:flex-start}.tree-children{margin-left:8px;padding-left:10px}.rate-popup{width:min(300px,86vw)}.rate-actions{flex-direction:column;gap:0}
 }
 
 /* =====================================

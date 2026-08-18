@@ -8,7 +8,7 @@
          preceding stylesheet is still loading, so putting this after the link
          would put the whole of styles.css in front of the first API call. -->
     <script src="costdata-boot.js?v=627fe31331"></script>
-    <link rel="stylesheet" href="styles.css?v=86cda912bd">
+    <link rel="stylesheet" href="styles.css?v=8de8db331c">
 </head>
 <body>
 <main class="container cost-workspace settings-workspace">
@@ -29,6 +29,34 @@
 
     <div id="settingsStatus" class="cost-status-line" role="status" aria-live="polite">Select a hotel to begin.</div>
     <section id="settingsError" class="error-panel" role="alert" hidden></section>
+    <!-- The import lives on this page because this is the only place it can be
+         reached from. The Function App sits behind App Service Authentication as a
+         Static Web Apps linked backend, so a direct call is rejected before the
+         function key is read; a call from this page carries the site's own auth
+         cookie and works. CostDataTimer still owns the nightly schedule - this is
+         for the times you cannot wait for it. -->
+    <div class="settings-maintenance">
+        <div>
+            <h2>Cost data import</h2>
+            <p>Re-imports cost data from the source for every hotel. Everything can
+                run for up to 35 minutes; a single dataset is usually a minute or two.</p>
+        </div>
+        <label class="import-dataset">
+            <span>Dataset</span>
+            <select id="importDataset">
+                <option value="all" selected>Everything</option>
+                <option value="properties">Properties</option>
+                <option value="parking">Parking</option>
+                <option value="room_revenue">Room revenue</option>
+                <option value="total_payment">Payments</option>
+                <option value="arr_dep">Arrivals &amp; departures</option>
+                <option value="breakfast">Breakfast</option>
+                <option value="departure_mix">Cleaning departure mix</option>
+                <option value="distribution_mix">Distribution revenue mix</option>
+            </select>
+        </label>
+        <button type="button" id="runImportButton" class="secondary-button">Run import</button>
+    </div>
     <div id="settingsLayout" class="settings-layout">
         <!-- The rail is not site navigation: aria-current="page" is already taken
              by the Cost Input link in the main nav above, and two elements
@@ -101,6 +129,6 @@
         </form>
     </div>
 </main>
-<script src="los-api.js?v=9b170a3022"></script><script src="los-format.js?v=15781a9639"></script><script src="costdata-cleaning.js?v=0db8517c1b"></script><script src="costdata-match.js?v=0a847ab958"></script><script src="costdata-input.js?v=ca3e5e2678"></script>
+<script src="los-api.js?v=9b170a3022"></script><script src="los-format.js?v=15781a9639"></script><script src="costdata-cleaning.js?v=0db8517c1b"></script><script src="costdata-match.js?v=0a847ab958"></script><script src="costdata-input.js?v=eedaccb594"></script>
 </body>
 </html>

@@ -41,6 +41,7 @@ from services.cost_source_service import (
     CostSourceUnavailableError,
     _agency_join,
     _resolve_column,
+    _resolve_table,
     _table_columns,
     table_identifier,
 )
@@ -64,22 +65,40 @@ MIX_WINDOW_DAYS = int(os.environ.get("COST_MIX_WINDOW_DAYS", "730"))
 # It was built from reservation_current first, which was wrong: a mix drawn from
 # a different relation than the total can disagree with it, and a weighting that
 # disagrees with the thing it weights is not a weighting.
-NIGHTS_TABLE = "staging.room_nights_source"
+# Two names for the same shape. sql/export/arr_dep_data.sql reads
+# staging.room_nights_source and this mix has to agree with it, so that one is
+# tried first; staging.room_nights_current is the view behind it and carries the
+# same columns. Resolved rather than picked, because a deployment may have only one.
+NIGHTS_TABLES = ("staging.room_nights_source", "staging.room_nights_current")
 NIGHTS_END_COLUMNS = ("end_utc",)
 NIGHTS_CANCELED_COLUMNS = ("canceled_utc", "cancelled_utc")
 NIGHTS_HOTEL_COLUMNS = ("hotel_name",)
-# The reservation this room night belongs to, for reaching its category and guest
-# count. room_nights_source carries both this and `number` - the human-readable
-# confirmation number - so the key is resolved rather than assumed.
-NIGHTS_RESERVATION_KEY_COLUMNS = (
-    "reservation_id", "reservation_key", "service_order_id",
+# staging.room_nights_source.reservation_id is the foreign key to
+# reservation_current.id - confirmed against the source, not inferred. It is still
+# looked up rather than written into the SQL directly so that a renamed column
+# skips this dataset with a message naming it, instead of failing the whole cost
+# import with an UndefinedColumn.
+#
+# The distinction matters here: the view also carries `number`, the human-readable
+# confirmation number, and arr_dep_data.sql only ever counts reservation_id - it
+# never joins on it - so nothing in this repository proved which of the two was the
+# key. That is why it was a guess until it was confirmed.
+NIGHTS_RESERVATION_KEY_COLUMNS = ("reservation_id",)
+# The cleaning rulebook is written per room category, so this is what binds a
+# departure to a configured row - and there are two candidates for it, which are
+# not interchangeable.
+#
+# The ASSIGNED category is the room that was actually occupied and therefore
+# actually cleaned; the REQUESTED one is what the guest booked. An upgrade from a
+# double to a suite is cleaned as a suite, so assigned wins where it exists and
+# requested is the fallback for a stay with no room assigned. Both are read when
+# both are present, as coalesce(assigned, requested).
+ASSIGNED_CATEGORY_COLUMNS = (
+    "assigned_resource_category_id", "assigned_category_id",
 )
-# Mews Reservation.RequestedResourceCategoryId / AssignedResourceCategoryId. The
-# cleaning rulebook is written per room category, so this is what binds a
-# departure to a configured row.
-RESERVATION_CATEGORY_COLUMNS = (
+REQUESTED_CATEGORY_COLUMNS = (
     "requested_resource_category_id", "requested_category_id",
-    "assigned_resource_category_id", "resource_category_id", "category_id",
+    "resource_category_id", "category_id",
 )
 # Mews Reservation.AdultCount and .ChildCount, where the mirror flattened them
 # into two integers. Kept as two separate lists, and the person-count column below
@@ -249,33 +268,82 @@ def _canceled_predicate(source):
     return SQL("AND reservation.{} IS NULL").format(Identifier(column))
 
 
-def _departure_dimensions(source):
+def _category_expression(source, table_name, alias):
+    """The room category this departure should be costed as.
+
+    coalesce(assigned, requested) where the table carries both: assigned is the
+    room actually occupied and cleaned, requested is what was booked, and a stay
+    with no room assigned still has to be costed as something.
+    """
+    assigned = _resolve_column(
+        source, table_name, ASSIGNED_CATEGORY_COLUMNS, required=False
+    )
+    requested = _resolve_column(
+        source, table_name, REQUESTED_CATEGORY_COLUMNS, required=False
+    )
+    columns = [column for column in (assigned, requested) if column]
+    if not columns:
+        return None, None
+    if len(columns) == 1:
+        return SQL("{}.{}").format(Identifier(alias), Identifier(columns[0])), columns[0]
+    return (
+        SQL("coalesce({}.{}, {}.{})").format(
+            Identifier(alias), Identifier(assigned),
+            Identifier(alias), Identifier(requested),
+        ),
+        f"coalesce({assigned}, {requested})",
+    )
+
+
+def _key_comparison(source, left, left_table, left_column, right, right_table, right_column):
+    """`left = right`, casting both to text only when the two types differ.
+
+    The cast is correct either way, but it is not free: on matching types it
+    throws away the index on reservation_current's primary key and turns what
+    should be an index lookup into a scan. Comparing the declared types first
+    keeps the cast for the deployments that need it - the mirror types some keys
+    as uuid and some as text, and uuid = text is `operator does not exist`, a 500
+    rather than a wrong answer - and drops it everywhere else.
+    """
+    left_type = _column_type(source, left_table, left_column)
+    right_type = _column_type(source, right_table, right_column)
+    if left_type is not None and left_type == right_type:
+        return SQL("{} = {}").format(left, right)
+    logging.info(
+        "Joining %s.%s (%s) to %s.%s (%s) as text: the two types differ",
+        left_table, left_column, left_type or "unknown",
+        right_table, right_column, right_type or "unknown",
+    )
+    return SQL("{}::text = {}::text").format(left, right)
+
+
+def _departure_dimensions(source, nights_table):
     """Where the room category and the guest count come from.
 
-    Preferred on staging.room_nights_source itself, because that avoids a join
-    into reservation_current across hundreds of thousands of rows. Falls back to
-    reservation_current, which is where Mews puts both. Returns the two
-    expressions and whether the reservation join is needed for them.
+    Both are preferred on the room-nights view itself, which is not a
+    micro-optimisation: that view already resolves them - it exposes the category
+    ids and a person_count that is the summed PersonCounts list - so taking them
+    from there avoids joining reservation_current across every departing
+    reservation to recompute what has already been computed.
+
+    Falls back to reservation_current, which is where Mews puts both. Returns the
+    two expressions, a label for the log, and whether the join is needed.
     """
-    for table, alias in ((NIGHTS_TABLE, "nights"), ("reservation_current", "reservation")):
-        category_fk = _resolve_column(
-            source, table, RESERVATION_CATEGORY_COLUMNS, required=False
-        )
+    for table, alias in ((nights_table, "nights"), ("reservation_current", "reservation")):
+        category, label = _category_expression(source, table, alias)
         occupancy = _occupancy_expression(source, table, alias)
-        if category_fk and occupancy:
-            return category_fk, occupancy, alias == "reservation"
+        if category and occupancy:
+            return category, label, occupancy, alias == "reservation"
     # Split across the two: the category on one, the counts on the other. Rare,
     # but the join is already paid for in that case so there is nothing to lose.
-    category_fk = _resolve_column(
-        source, "reservation_current", RESERVATION_CATEGORY_COLUMNS, required=False
-    ) or _resolve_column(
-        source, NIGHTS_TABLE, RESERVATION_CATEGORY_COLUMNS, required=False
-    )
+    category, label = _category_expression(source, "reservation_current", "reservation")
+    if not category:
+        category, label = _category_expression(source, nights_table, "nights")
     occupancy = (
         _occupancy_expression(source, "reservation_current", "reservation")
-        or _occupancy_expression(source, NIGHTS_TABLE, "nights")
+        or _occupancy_expression(source, nights_table, "nights")
     )
-    return category_fk, occupancy, True
+    return category, label, occupancy, True
 
 
 def build_departure_mix_export(source):
@@ -291,29 +359,45 @@ def build_departure_mix_export(source):
     the question - in which case the Cost Data page keeps its blended
     per-departure rate and the flag that explains it.
     """
+    nights_table = _resolve_table(source, NIGHTS_TABLES)
+    if nights_table is None:
+        logging.warning(
+            "Departure mix unavailable: none of %s exists, and it is the relation "
+            "arr_dep_data.sql counts total_departures from. Cleaning cost keeps "
+            "its flat average per departure.",
+            list(NIGHTS_TABLES),
+        )
+        return None
+
     end_column = _resolve_column(
-        source, NIGHTS_TABLE, NIGHTS_END_COLUMNS, required=False
+        source, nights_table, NIGHTS_END_COLUMNS, required=False
     )
     hotel_column = _resolve_column(
-        source, NIGHTS_TABLE, NIGHTS_HOTEL_COLUMNS, required=False
+        source, nights_table, NIGHTS_HOTEL_COLUMNS, required=False
     )
     reservation_key = _resolve_column(
-        source, NIGHTS_TABLE, NIGHTS_RESERVATION_KEY_COLUMNS, required=False
+        source, nights_table, NIGHTS_RESERVATION_KEY_COLUMNS, required=False
     )
     category_name = _resolve_column(
         source, "resource_category_current", CATEGORY_NAME_COLUMNS, required=False
     )
-    category_fk, occupancy, needs_reservation = _departure_dimensions(source)
+    category, category_label, occupancy, needs_reservation = _departure_dimensions(
+        source, nights_table
+    )
     if not (end_column and hotel_column and reservation_key and category_name
-            and category_fk and occupancy):
+            and category and occupancy):
         logging.warning(
-            "Departure mix unavailable: end=%s hotel=%s reservation_key=%s "
-            "category_name=%s category_fk=%s occupancy=%s. Cleaning cost keeps "
-            "its flat average per departure.",
-            end_column, hotel_column, reservation_key, category_name,
-            category_fk, bool(occupancy),
+            "Departure mix unavailable: table=%s end=%s hotel=%s "
+            "reservation_key=%s category_name=%s category=%s occupancy=%s. "
+            "Cleaning cost keeps its flat average per departure.",
+            nights_table, end_column, hotel_column, reservation_key,
+            category_name, category_label, bool(occupancy),
         )
         return None
+    logging.info(
+        "Departure mix reads %s, category from %s, joining reservation_current: %s",
+        nights_table, category_label, needs_reservation,
+    )
 
     departure_date = SQL("(nights.{} {})::date").format(
         Identifier(end_column), STOCKHOLM
@@ -324,23 +408,26 @@ def build_departure_mix_export(source):
     # reservation_current is paid for at all.
     if needs_reservation:
         nights_extra = SQL("")
-        reservation_join = SQL(
-            "JOIN reservation_current reservation "
-            "ON reservation.id::text = departing.reservation_key::text"
+        reservation_join = SQL("JOIN reservation_current reservation ON {}").format(
+            _key_comparison(
+                source,
+                SQL("reservation.id"), "reservation_current", "id",
+                SQL("departing.reservation_key"), nights_table, reservation_key,
+            )
         )
-        category_reference = SQL("reservation.{}").format(Identifier(category_fk))
+        category_reference = category
         occupancy_reference = occupancy
     else:
         # Both are per-reservation constants, so carrying them through the DISTINCT
         # cannot split a reservation into two rows.
         nights_extra = SQL(
-            ", nights.{category_fk} AS category_key, {occupancy} AS occupancy"
-        ).format(category_fk=Identifier(category_fk), occupancy=occupancy)
+            ", {category} AS category_key, {occupancy} AS occupancy"
+        ).format(category=category, occupancy=occupancy)
         reservation_join = SQL("")
         category_reference = SQL("departing.category_key")
         occupancy_reference = SQL("departing.occupancy")
     canceled = _resolve_column(
-        source, NIGHTS_TABLE, NIGHTS_CANCELED_COLUMNS, required=False
+        source, nights_table, NIGHTS_CANCELED_COLUMNS, required=False
     )
 
     export_sql = SQL("""
@@ -422,7 +509,7 @@ def build_departure_mix_export(source):
         occupancy_reference=occupancy_reference,
         nights_extra=nights_extra,
         reservation_key=Identifier(reservation_key),
-        nights_table=table_identifier(NIGHTS_TABLE),
+        nights_table=table_identifier(nights_table),
         hotel_column=Identifier(hotel_column),
         reservation_join=reservation_join,
         end_column=Identifier(end_column),

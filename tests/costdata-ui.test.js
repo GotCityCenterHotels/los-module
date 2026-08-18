@@ -451,23 +451,78 @@ test("an empty matching-rate list names the filters that produced it", () => {
     assert.match(script, /lookup\.agencyFilterApplied/);
 });
 
-test("the Cost Input page no longer triggers the cost data import", () => {
+// This page is the only place the import can be reached from: the Function App is
+// a Static Web Apps linked backend, so App Service Authentication rejects a direct
+// call before the function key is read, and only a request carrying this site's
+// own auth cookie gets through the proxy.
+test("Cost Input can trigger the import, one dataset or all of them", () => {
     const html = read("costdata-input.html");
     const script = read("costdata-input.js");
     const css = read("styles.css");
 
-    // A 35-minute cross-database rebuild of every hotel is not a
-    // property-settings task, and it sat one click above the safest controls on
-    // the page.
-    assert.doesNotMatch(html, /runImportButton/);
-    assert.doesNotMatch(html, /settings-maintenance/);
-    assert.doesNotMatch(css, /settings-maintenance/);
-    // The route itself still exists for an operator with the function key, so
-    // this looks for the call and the machinery around it, not the word.
-    assert.doesNotMatch(script, /fetchJson\("\/api\/costdata\/import"/);
-    assert.doesNotMatch(script, /IMPORT_POLL_TIMEOUT_MS/);
-    assert.doesNotMatch(script, /costdata-import-key/);
-    assert.doesNotMatch(script, /x-functions-key/);
+    assert.match(html, /id="runImportButton"/);
+    assert.match(html, /id="importDataset"/);
+    assert.match(css, /\.settings-maintenance \{/);
+    assert.match(css, /\.import-dataset select \{/);
+
+    assert.match(script, /fetchJson\("\/api\/costdata\/import"/);
+    assert.match(script, /JSON\.stringify\(\{dataset\}\)/);
+    assert.match(script, /IMPORT_POLL_TIMEOUT_MS/);
+    assert.match(script, /job\.status === "succeeded"/);
+    assert.match(script, /job\.status === "failed"/);
+    // A rejected key must not stay cached, or every later attempt fails without
+    // ever asking again.
+    assert.match(script, /forgetImportKey\(\)/);
+    assert.match(script, /costdata-import-key/);
+    // Reloading the property list pulls the server's copy over the form, which is
+    // where half an hour of unsaved work may be sitting.
+    assert.match(script, /if \(dirty\) \{/);
+});
+
+test("the dataset picker offers exactly the datasets the pipeline registers", () => {
+    const html = read("costdata-input.html");
+    const pipeline = fs.readFileSync(
+        path.join(__dirname, "..", "shared", "pipeline.py"), "utf8"
+    );
+
+    // Hand-written options against a hand-written registry drift, and a name that
+    // drifts is a 400 the operator cannot act on. The API validates too, but by
+    // then the button has already failed.
+    const registered = [...pipeline.matchAll(/^ {4}"([a-z_]+)": \{$/gm)]
+        .map(([, name]) => name);
+    assert.ok(registered.length >= 8, `parsed ${registered.length} datasets`);
+
+    // Scoped to this select. The page has three others - breakfast basis,
+    // franchise basis, franchise revenue base - and matching every <option> on it
+    // swept their values in too.
+    const picker = /<select id="importDataset">[\s\S]*?<\/select>/.exec(html)[0];
+    const offered = [...picker.matchAll(/<option value="([a-z_]+)"/g)]
+        .map(([, value]) => value)
+        .filter((value) => value !== "all");
+    assert.deepEqual(offered, registered);
+    // And "Everything", which is the API's own name for the whole run.
+    assert.match(picker, /<option value="all" selected>/);
+});
+
+// The two mixes resolve their source columns at run time and SKIP rather than fail
+// when they cannot, which counts as a success for the job as a whole. "Import
+// complete (8 datasets)" was therefore true of a run in which the dataset you came
+// here for imported nothing at all.
+test("the import result names datasets that skipped or failed", () => {
+    const script = read("costdata-input.js");
+
+    assert.match(script, /function describeImport\(job\)/);
+    assert.match(script, /entry\.skipped/);
+    assert.match(script, /entry\.status === "failed"/);
+    assert.match(script, /Skipped: /);
+    // The job result is stored verbatim from the pipeline, so the keys are
+    // snake_case - reading importRows or durationSeconds silently yields undefined.
+    assert.match(script, /entry\.import_rows/);
+    assert.match(script, /entry\.duration_seconds/);
+    assert.doesNotMatch(script, /result\?\.durationSeconds/);
+    // Only one cost job runs at a time, so a request during the nightly run joins
+    // it rather than starting another.
+    assert.match(script, /accepted\.deduplicated/);
 });
 
 test("the chart axis spans both sides of zero so a reversal is drawn to scale", () => {

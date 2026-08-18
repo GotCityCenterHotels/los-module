@@ -9,6 +9,8 @@
     const layout = document.getElementById("settingsLayout"), status = document.getElementById("settingsStatus");
     const errorPanel = document.getElementById("settingsError"), save = document.getElementById("saveSettings");
     const dirtyState = document.getElementById("dirtyState");
+    const importButton = document.getElementById("runImportButton");
+    const importDataset = document.getElementById("importDataset");
     let model = null, dirty = false, loadedEnterpriseId = "";
 
     if (typeof CostCleaning === "undefined") {
@@ -124,15 +126,19 @@
         });
     }
 
-    async function loadHotels() {
+    async function loadHotels(options) {
+        const fresh = Boolean(options && options.forceRefresh);
         status.textContent = "Loading hotels…";
         hotel.disabled = true;
         try {
-            // No cache directive: the route sends private, max-age=300 and the
-            // list only changes when the nightly import runs, so at worst a
-            // hotel imported in the last five minutes takes a second load to
-            // appear.
-            const payload = await LosApi.fetchJson(PROPERTIES_API);
+            // No cache directive on the ordinary path: the route sends private,
+            // max-age=300 and the list only changes when the import runs. An
+            // operator who has just imported a new hotel must see it at once, so
+            // that caller asks for a reload - the one thing that actually bypasses
+            // an HTTP cache. Clearing a storage key would not have.
+            const payload = await LosApi.fetchJson(
+                PROPERTIES_API, fresh ? {cache: "reload"} : undefined
+            );
             const properties = (payload.data || []).filter((property) =>
                 property && property.enterpriseId != null && String(property.enterpriseId).trim()
                 && property.hotelName && String(property.hotelName).trim()
@@ -2162,12 +2168,195 @@
         status.textContent = context ? `${context} failed.` : "Something went wrong.";
         console.error(context || "Cost Input error", error);
     }
-    // There is deliberately no import control on this page. Triggering a
-    // 35-minute cross-database rebuild of every hotel's cost facts is not a
-    // property-settings task, and putting it one click from the editor meant the
-    // page's most destructive action sat above its safest ones. CostDataTimer
-    // owns the schedule; /api/costdata/import is still there for an operator with
-    // the function key when a rebuild really is needed out of hours.
+    // ------------------------------------------------------------------
+    // Cost data import
+    //
+    // Reachable from here and effectively nowhere else. The Function App is a
+    // Static Web Apps linked backend, so App Service Authentication sits in front
+    // of it and rejects a direct call before the function key is even read; a
+    // request from this page carries the site's own auth cookie through the proxy
+    // and gets in. CostDataTimer still owns the nightly schedule - this is for
+    // when a dataset has to land now.
+    //
+    // One dataset at a time is the point of the picker. "Everything" re-reads all
+    // history for eight datasets and can run the full 35 minutes; the two
+    // reservation-level mixes on their own are a minute or two, and they are the
+    // ones anybody comes here to re-run.
+    // ------------------------------------------------------------------
+    const IMPORT_POLL_INTERVAL_MS = 2000;
+    const IMPORT_POLL_TIMEOUT_MS = 35 * 60 * 1000;
+    const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+    async function waitForImport(statusUrl) {
+        const deadline = Date.now() + IMPORT_POLL_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+            const payload = await LosApi.fetchJson(statusUrl, {cache: "no-store"});
+            const job = payload.job || {};
+            if (job.status === "succeeded") return job;
+            if (job.status === "failed") throw new Error(job.error || "Import failed.");
+            status.textContent = `Cost data import ${job.status || "queued"}`
+                + `${job.attemptCount ? ` (attempt ${job.attemptCount})` : ""}…`;
+            await delay(IMPORT_POLL_INTERVAL_MS);
+        }
+        throw new Error("The import is still running. Reload this page to check its status.");
+    }
+
+    // What the run actually did, per dataset.
+    //
+    // "Import complete (8 datasets)" was true of a run in which the dataset you
+    // came here for imported nothing: the two mixes resolve their source columns at
+    // run time and skip rather than fail when they cannot, which is a success as
+    // far as the job is concerned. A skip has to be said out loud or this button
+    // reports victory over the exact problem it was clicked to fix.
+    function describeImport(job) {
+        const results = (job.result && job.result.results) || [];
+        if (!results.length) return "Import complete.";
+        const failed = results.filter(entry => entry.status === "failed");
+        const skipped = results.filter(entry => entry.skipped);
+        const rows = results.reduce(
+            (total, entry) => total + (Number(entry.import_rows) || 0), 0
+        );
+        const seconds = results.reduce(
+            (total, entry) => total + (Number(entry.duration_seconds) || 0), 0
+        );
+        const imported = results.length - failed.length - skipped.length;
+        const parts = [
+            `Imported ${imported} of ${results.length} datasets`
+            + ` — ${integerLabel(rows)} rows in ${Math.round(seconds)}s.`
+        ];
+        if (skipped.length) {
+            parts.push(
+                `Skipped: ${skipped.map(entry => entry.dataset).join(", ")}`
+                + " — the source does not carry the columns those datasets need."
+            );
+        }
+        if (failed.length) {
+            parts.push(
+                `Failed: ${failed.map(
+                    entry => `${entry.dataset} (${entry.error || "unknown error"})`
+                ).join("; ")}`
+            );
+        }
+        return parts.join(" ");
+    }
+
+    // costdata/import is a FUNCTION-level route: it triggers a cross-database
+    // import and the Function App answers on its own hostname, so it cannot be
+    // left open. Static Web Apps does not attach the key for us, so the operator
+    // supplies it once per browser session.
+    //
+    // The key is in the Azure portal under los-functions > App keys. That belongs
+    // here rather than in the prompt: the person clicking this is a revenue
+    // manager who has been given a key, not someone with portal access, and a
+    // dialog naming a resource they cannot open only makes them stop.
+    const IMPORT_KEY_STORAGE = "costdata-import-key";
+    function importKey() {
+        let key = "";
+        try { key = sessionStorage.getItem(IMPORT_KEY_STORAGE) || ""; } catch { key = ""; }
+        if (!key) {
+            key = (prompt(
+                "Enter the import key.\n\n"
+                + "Ask IT if you do not have it. It is kept for this browser session only."
+            ) || "").trim();
+            if (!key) return "";
+            try { sessionStorage.setItem(IMPORT_KEY_STORAGE, key); } catch { /* session-only */ }
+        }
+        return key;
+    }
+    function forgetImportKey() {
+        try { sessionStorage.removeItem(IMPORT_KEY_STORAGE); } catch { /* nothing cached */ }
+    }
+
+    function importLabel() {
+        const chosen = importDataset.options[importDataset.selectedIndex];
+        return chosen ? chosen.textContent.toLowerCase() : "every dataset";
+    }
+
+    async function runImport() {
+        const dataset = importDataset.value;
+        if (!confirm(
+            `Import ${importLabel()} for every hotel now?`
+            + (dataset === "all" ? " This can take up to 35 minutes." : "")
+        )) return;
+        const key = importKey();
+        if (!key) { status.textContent = "Import cancelled — no key was entered."; return; }
+        importButton.disabled = true;
+        importDataset.disabled = true;
+        errorPanel.hidden = true;
+        const buttonLabel = importButton.textContent;
+        const startedAt = Date.now();
+        // The only sign an import was running used to be a greyed-out button still
+        // reading "Run import", and one line of status text that scrolls off the
+        // moment a section is opened. For a job that can run 35 minutes, the button
+        // itself has to be the progress surface.
+        const elapsed = setInterval(() => {
+            const seconds = Math.floor((Date.now() - startedAt) / 1000);
+            importButton.textContent =
+                `Importing… ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+        }, 1000);
+        try {
+            status.textContent = `Queueing ${importLabel()} import…`;
+            let accepted;
+            try {
+                accepted = await LosApi.fetchJson("/api/costdata/import", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json", "x-functions-key": key},
+                    body: JSON.stringify({dataset})
+                });
+            }
+            catch (error) {
+                // A rejected key must not stay cached, or every later attempt
+                // fails without ever asking again.
+                if (/\b401\b|\b403\b/.test(error.message || "")) {
+                    forgetImportKey();
+                    throw new Error("That key was not accepted. Click the button again to enter it.");
+                }
+                throw error;
+            }
+            // Only one cost job may be active at a time, so a request that arrives
+            // during the nightly run is answered with that job instead of a new
+            // one. Saying so beats watching "Everything" import when one dataset
+            // was asked for.
+            if (accepted.deduplicated) {
+                status.textContent =
+                    `A cost import (${accepted.job.operation}) was already running, so `
+                    + "this request joined it rather than starting another.";
+            }
+            const job = await waitForImport(accepted.statusUrl);
+            // Reloading pulls the server's copy over the form, and the form is
+            // where the operator may have half an hour of unsaved work. It used to
+            // do exactly that, silently, and then report "No unsaved changes" -
+            // losing the edits and lying about it.
+            if (dirty) {
+                status.textContent =
+                    `${describeImport(job)} Your unsaved changes are still here — `
+                    + "save them, then reload the page to see the new data.";
+                return;
+            }
+            status.textContent = describeImport(job);
+            await loadHotels({forceRefresh: true});
+        }
+        catch (error) { showError(error, "Cost data import"); }
+        finally {
+            clearInterval(elapsed);
+            importButton.disabled = false;
+            importDataset.disabled = false;
+            importButton.textContent = buttonLabel;
+        }
+    }
+    // Both halves or neither: runImport reads the picker, so wiring the button
+    // against a page serving a cached copy of the HTML without it would throw on
+    // the first click rather than warn.
+    if (importDataset) {
+        onClick("#runImportButton", runImport);
+    }
+    else {
+        console.warn(
+            "#importDataset is missing from this page - it is probably serving a "
+            + "cached copy of the HTML. Hard refresh; the rest still works."
+        );
+    }
+
     document.querySelectorAll(".settings-nav button").forEach(button => {
         button.onclick = () => {
             showSection(button.dataset.section);

@@ -55,18 +55,38 @@ class FakeCursor:
         return self._result
 
 
+# The room-nights view as the source actually defines it. Everything the departure
+# mix needs is already resolved here - both category ids, and a person_count that
+# is the summed PersonCounts list - which is why the expected plan joins nothing
+# but the category name.
+NIGHTS_VIEW = {
+    "reservation_id", "number", "state", "hotel_name", "start_utc", "end_utc",
+    "scheduled_start_utc", "actual_start_utc", "scheduled_end_utc",
+    "actual_end_utc", "created_utc", "person_count",
+    "requested_resource_category_id", "requested_space_name",
+    "assigned_resource_id", "assigned_room_name",
+    "assigned_resource_category_id", "assigned_space_name", "night_id",
+    "accounting_state", "amount_net_value", "night_start_utc", "consumed_utc",
+    "canceled_utc",
+}
+
+# The same view stripped to the departure columns alone, which forces the two
+# extra dimensions to come from reservation_current instead. Kept as a fixture
+# because that fallback is the path a mirror without the enriched view takes.
+NIGHTS_LEAN = {
+    "hotel_name", "reservation_id", "number", "start_utc", "end_utc",
+    "night_start_utc", "canceled_utc",
+}
+
 FULL_MIRROR = {
     # The relation sql/export/arr_dep_data.sql counts total_departures from. The
     # mix has to come from the same one, or it cannot be guaranteed to sum to the
     # total it apportions.
-    "staging.room_nights_source": {
-        "hotel_name", "reservation_id", "number", "start_utc", "end_utc",
-        "night_start_utc", "canceled_utc",
-    },
+    "staging.room_nights_source": set(NIGHTS_VIEW),
     "reservation_current": {
         "id", "number", "service_id", "start_utc", "end_utc", "canceled_utc",
         "origin", "travel_agency_id", "rate_id", "requested_category_id",
-        "adult_count", "child_count",
+        "person_counts",
     },
     "service_current": {"id", "name", "enterprise_id"},
     "resource_category_current": {
@@ -89,11 +109,28 @@ class DepartureMixExportTests(unittest.TestCase):
     def setUp(self):
         cost_source_service._reset_column_cache()
 
-    def build(self, columns):
+    # The types the source declares for the columns these tests touch.
+    TYPES = {
+        "person_count": "bigint", "person_counts": "jsonb",
+        "id": "uuid", "reservation_id": "uuid",
+    }
+
+    def build(self, columns, types=None):
         # Through build_mix_export, which is how the pipeline reaches it: a
         # missing TABLE raises out of the resolver rather than resolving to None,
         # and that has to skip the dataset too.
-        return mix.build_mix_export("departure_mix", FakeCursor(columns))
+        return mix.build_mix_export(
+            "departure_mix", FakeCursor(columns, types or self.TYPES)
+        )
+
+    def _lean_nights(self, **reservation_types):
+        """The mirror without the enriched view, so the fallback path is exercised."""
+        columns = dict(FULL_MIRROR)
+        columns["staging.room_nights_source"] = set(NIGHTS_LEAN)
+        cost_source_service._reset_column_cache()
+        return sql_of(
+            self.build(columns, {**self.TYPES, **reservation_types})
+        )
 
     def test_it_counts_departures_exactly_as_the_departure_total_does(self):
         query = sql_of(self.build(FULL_MIRROR))
@@ -120,13 +157,49 @@ class DepartureMixExportTests(unittest.TestCase):
         )
         self.assertNotIn("count(*)::int AS departures", query)
 
-        # And the two dimensions the rulebook needs, from the reservation.
+        # The category NAME still comes from resource_category_current, not from
+        # the view's own requested_space_name. The view reads it out of
+        # resource_category_history, which can hold a superseded spelling, and the
+        # cleaning rows the page matches against were saved with the name
+        # list_cleaning_categories showed - which is the current one.
         self.assertIn('trim(category."space_name")::text AS category_name', query)
+
+    def test_the_enriched_view_needs_no_join_to_the_reservation_at_all(self):
+        # The view already exposes both category ids and a person_count that is the
+        # summed PersonCounts list, so joining reservation_current across every
+        # departing reservation would only recompute what is already there.
+        query = sql_of(self.build(FULL_MIRROR))
+
+        self.assertNotIn("JOIN reservation_current", query)
+        self.assertNotIn("jsonb_array_elements", query)
+        self.assertIn('greatest(1, (coalesce("nights"."person_count", 0))::int)', query)
+
+    def test_the_room_actually_occupied_is_the_one_costed(self):
+        # An upgrade from a double to a suite is cleaned as a suite. Assigned is the
+        # room that was occupied; requested is what was booked, and is the fallback
+        # for a stay with no room assigned - assigned_resource_category_id comes
+        # from a LEFT JOIN in the view and is null in that case.
+        query = sql_of(self.build(FULL_MIRROR))
+
         self.assertIn(
-            'greatest(1, (coalesce("reservation"."adult_count", 0)'
-            ' + coalesce("reservation"."child_count", 0))::int)',
+            'coalesce("nights"."assigned_resource_category_id",'
+            ' "nights"."requested_resource_category_id") AS category_key',
             query,
         )
+
+    def test_either_name_for_the_room_nights_relation_resolves(self):
+        # arr_dep_data.sql reads staging.room_nights_source; the view behind it is
+        # staging.room_nights_current. A deployment may have either or both, and
+        # source is preferred because that is what the total is counted from.
+        only_current = {
+            key: value for key, value in FULL_MIRROR.items()
+            if key != "staging.room_nights_source"
+        }
+        only_current["staging.room_nights_current"] = set(NIGHTS_VIEW)
+        cost_source_service._reset_column_cache()
+        query = sql_of(self.build(only_current))
+
+        self.assertIn('FROM "staging"."room_nights_current" nights', query)
 
     def test_a_room_with_no_counts_recorded_is_still_one_guest(self):
         # Costing it at zero minutes would understate a day silently. A
@@ -134,24 +207,13 @@ class DepartureMixExportTests(unittest.TestCase):
         # lands on one guest through the same floor.
         self.assertIn("greatest(1,", sql_of(self.build(FULL_MIRROR)))
 
-    def _without_scalar_counts(self, **types):
-        columns = dict(FULL_MIRROR)
-        columns["reservation_current"] = (
-            FULL_MIRROR["reservation_current"]
-            - {"adult_count", "child_count"} | {"person_counts"}
-        )
-        cost_source_service._reset_column_cache()
-        return sql_of(
-            mix.build_mix_export(
-                "departure_mix", FakeCursor(columns, {"person_counts": types["as_type"]})
-            )
-        )
-
     def test_a_person_counts_list_is_summed_across_its_age_categories(self):
         # Mews PersonCounts is not a number: it is one entry per age category,
-        # [{"Count": 1, …}, {"Count": 3, …}], so four guests. Reading the column
-        # would have been a type error; ignoring it costed every room at one guest.
-        query = self._without_scalar_counts(as_type="jsonb")
+        # [{"Count": 1, …}, {"Count": 3, …}], so four guests. Reading the column as
+        # a number would have been a type error; not matching it at all - which is
+        # what a candidate list of `person_count` singular did - skipped the whole
+        # dataset and left cleaning on its flat average.
+        query = self._lean_nights()
 
         self.assertIn("jsonb_array_elements(", query)
         self.assertIn("sum(coalesce(", query)
@@ -167,7 +229,7 @@ class DepartureMixExportTests(unittest.TestCase):
         # Cast rather than assumed: json, jsonb and text holding the same document
         # all cast to jsonb the same way.
         for declared in ("jsonb", "json", "text", "character varying"):
-            query = self._without_scalar_counts(as_type=declared)
+            query = self._lean_nights(person_counts=declared)
             self.assertIn("jsonb_array_elements(", query, declared)
             self.assertIn('"person_counts"::jsonb', query, declared)
 
@@ -177,7 +239,7 @@ class DepartureMixExportTests(unittest.TestCase):
         # one guest - wrong, and silently so. The declared type decides, not the
         # name.
         for declared in ("integer", "smallint", "bigint", "numeric"):
-            query = self._without_scalar_counts(as_type=declared)
+            query = self._lean_nights(person_counts=declared)
             self.assertNotIn("jsonb_array_elements", query, declared)
             self.assertIn('coalesce("reservation"."person_counts", 0)', query, declared)
 
@@ -185,19 +247,33 @@ class DepartureMixExportTests(unittest.TestCase):
         # Adding a total that already includes children to a child count would
         # double the occupancy and cost every family room at the wrong row.
         columns = dict(FULL_MIRROR)
+        columns["staging.room_nights_source"] = set(NIGHTS_LEAN)
         columns["reservation_current"] = (
-            FULL_MIRROR["reservation_current"] | {"person_counts"}
+            FULL_MIRROR["reservation_current"] | {"adult_count", "child_count"}
         )
         cost_source_service._reset_column_cache()
-        query = sql_of(
-            mix.build_mix_export(
-                "departure_mix", FakeCursor(columns, {"person_counts": "jsonb"})
-            )
-        )
+        query = sql_of(self.build(columns))
 
         self.assertNotIn("person_counts", query)
         self.assertIn('coalesce("reservation"."adult_count", 0)', query)
         self.assertIn('coalesce("reservation"."child_count", 0)', query)
+
+    def test_matching_key_types_join_without_a_cast(self):
+        # The cast is correct either way but throws away the index on
+        # reservation_current's primary key, so it is kept only for the mirrors
+        # that type the two keys differently - where uuid = text is `operator does
+        # not exist`, a 500 rather than a wrong answer.
+        matching = self._lean_nights()
+        self.assertIn(
+            "JOIN reservation_current reservation "
+            "ON reservation.id = departing.reservation_key",
+            matching,
+        )
+
+        differing = self._lean_nights(reservation_id="text")
+        self.assertIn(
+            "ON reservation.id::text = departing.reservation_key::text", differing
+        )
 
     def test_the_guest_count_is_settled_before_the_rows_are_grouped(self):
         # Grouping by a scalar subquery would evaluate the PersonCounts sum again
@@ -213,53 +289,53 @@ class DepartureMixExportTests(unittest.TestCase):
             "the classified level must close before the grouping one",
         )
 
-    def test_the_reservation_join_is_skipped_when_the_nights_carry_both(self):
-        # Joining reservation_current across every room night is not free, so it
-        # is only paid for when the category or the counts are not on the nights.
-        columns = dict(FULL_MIRROR)
-        columns["staging.room_nights_source"] = (
-            FULL_MIRROR["staging.room_nights_source"]
-            | {"requested_category_id", "adult_count", "child_count"}
-        )
-        query = sql_of(self.build(columns))
-
-        self.assertNotIn("JOIN reservation_current", query)
-        # Both are carried out of the collapsing CTE instead, where they are
-        # per-reservation constants and so cannot split a reservation in two.
-        self.assertIn('coalesce("nights"."adult_count", 0)', query)
-        self.assertIn('nights."requested_category_id" AS category_key', query)
-        self.assertIn("category.id::text = departing.category_key::text", query)
-
-    def test_a_mirror_missing_any_required_column_skips_the_dataset(self):
+    def test_the_departure_columns_are_required_on_the_nights_relation(self):
         # Returning None is the whole safety property: an UndefinedColumn here
         # would fail the nightly import and take the five working datasets with
         # it, and the page has a documented fallback for a missing mix.
-        for table, missing in (
-            ("staging.room_nights_source", "end_utc"),
-            ("staging.room_nights_source", "hotel_name"),
-            ("staging.room_nights_source", "reservation_id"),
-            ("reservation_current", "requested_category_id"),
-        ):
+        for missing in ("end_utc", "hotel_name", "reservation_id"):
             columns = dict(FULL_MIRROR)
-            columns[table] = FULL_MIRROR[table] - {missing}
+            columns["staging.room_nights_source"] = NIGHTS_VIEW - {missing}
             cost_source_service._reset_column_cache()
-            self.assertIsNone(self.build(columns), f"{table}.{missing}")
+            self.assertIsNone(self.build(columns), missing)
 
-        # Guest counts have to be somewhere - on the nights or on the reservation.
-        cost_source_service._reset_column_cache()
-        columns = dict(FULL_MIRROR)
-        columns["reservation_current"] = (
-            FULL_MIRROR["reservation_current"] - {"adult_count", "child_count"}
+    def test_a_dimension_missing_from_both_relations_skips_the_dataset(self):
+        # Each of the two extra dimensions is looked for on the nights and then on
+        # the reservation, so a case only counts as missing when it is absent from
+        # both. Removing it from one just moves where it is read from.
+        every_category = set(mix.ASSIGNED_CATEGORY_COLUMNS) | set(
+            mix.REQUESTED_CATEGORY_COLUMNS
         )
-        self.assertIsNone(self.build(columns))
+        every_count = set(mix.RESERVATION_PERSON_COLUMNS) | set(
+            mix.RESERVATION_ADULT_COLUMNS
+        ) | set(mix.RESERVATION_CHILD_COLUMNS)
 
-        # A missing table raises out of the resolver rather than resolving to
-        # None, and has to skip the dataset just the same.
-        for table in ("staging.room_nights_source", "resource_category_current"):
+        for dropped in (every_category, every_count):
+            columns = dict(FULL_MIRROR)
+            columns["staging.room_nights_source"] = NIGHTS_VIEW - dropped
+            columns["reservation_current"] = (
+                FULL_MIRROR["reservation_current"] - dropped
+            )
+            cost_source_service._reset_column_cache()
+            self.assertIsNone(self.build(columns), sorted(dropped)[:2])
+
+    def test_a_missing_table_skips_the_dataset_rather_than_raising(self):
+        # A missing table raises out of the resolver instead of resolving to None,
+        # and has to reach the same outcome.
+        for table in ("resource_category_current",):
             cost_source_service._reset_column_cache()
             columns = dict(FULL_MIRROR)
             columns[table] = set()
             self.assertIsNone(self.build(columns), table)
+
+        # Neither name for the room nights: this is the relation the departure
+        # total itself is counted from, so there is nothing to apportion.
+        cost_source_service._reset_column_cache()
+        columns = {
+            key: value for key, value in FULL_MIRROR.items()
+            if key != "staging.room_nights_source"
+        }
+        self.assertIsNone(self.build(columns))
 
     def test_it_prunes_rows_this_run_did_not_re_import(self):
         prune = sql_of(self.build(FULL_MIRROR), "prune_sql")
