@@ -1,9 +1,10 @@
 import logging
 import os
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime
 from decimal import Decimal
+from threading import Lock
 from time import monotonic
 
 from psycopg.rows import dict_row
@@ -30,6 +31,25 @@ COST_DATA_QUERY_CONCURRENCY = max(
 _dataset_workers = ThreadPoolExecutor(
     max_workers=COST_DATA_QUERY_CONCURRENCY, thread_name_prefix="cost-data"
 )
+
+# This is the server-side half of the 60-second browser cache advertised by the
+# route. It does not widen the staleness window: it lets users and tabs inside
+# the window share the same seven-query build instead of each rebuilding it.
+# Four entries cover this year and last year for the two comparison bases while
+# keeping a worker from retaining every range it has ever served.
+COST_DATA_CACHE_TTL_SECONDS = float(
+    os.environ.get(
+        "COST_DATA_RESULT_CACHE_SECONDS",
+        os.environ.get("COST_DATA_MAX_AGE_SECONDS", "60"),
+    )
+)
+COST_DATA_CACHE_MAX_ENTRIES = max(
+    1,
+    int(os.environ.get("COST_DATA_RESULT_CACHE_MAX_ENTRIES", "4")),
+)
+_result_cache = {}
+_result_inflight = {}
+_result_cache_lock = Lock()
 
 
 def _json_value(value):
@@ -72,7 +92,7 @@ def _fetch_dataset(query, parameters):
             return _json_rows(cursor.fetchall())
 
 
-def fetch_cost_data(start_date, end_date):
+def _fetch_cost_data_uncached(start_date, end_date):
     # Two of these datasets read tables that migration 016 creates, and this runs
     # BEFORE fetch_all_cost_settings() in the facts route - which was the only
     # thing applying migrations on this path. On a Database A that had not yet
@@ -120,3 +140,57 @@ def fetch_cost_data(start_date, end_date):
     )
 
     return datasets, row_counts
+
+
+def fetch_cost_data(start_date, end_date):
+    """Fetch a date range, sharing fresh and in-progress identical results.
+
+    The returned mappings are treated as read-only by the HTTP layer. A cache
+    hit therefore needs no copy of what can be tens of thousands of rows.
+    """
+    key = (start_date, end_date)
+    now = monotonic()
+    with _result_cache_lock:
+        cached = _result_cache.get(key)
+        if cached is not None and cached[0] > now:
+            logging.info(
+                "Cost data cache hit start_date=%s end_date=%s",
+                start_date,
+                end_date,
+            )
+            return cached[1]
+
+        pending = _result_inflight.get(key)
+        if pending is None:
+            pending = Future()
+            _result_inflight[key] = pending
+            owns_query = True
+        else:
+            owns_query = False
+
+    if not owns_query:
+        return pending.result()
+
+    try:
+        result = _fetch_cost_data_uncached(start_date, end_date)
+    except BaseException as error:
+        pending.set_exception(error)
+        raise
+    else:
+        with _result_cache_lock:
+            _result_cache[key] = (
+                monotonic() + COST_DATA_CACHE_TTL_SECONDS,
+                result,
+            )
+            if len(_result_cache) > COST_DATA_CACHE_MAX_ENTRIES:
+                oldest = min(
+                    _result_cache,
+                    key=lambda entry: _result_cache[entry][0],
+                )
+                del _result_cache[oldest]
+        pending.set_result(result)
+        return result
+    finally:
+        with _result_cache_lock:
+            if _result_inflight.get(key) is pending:
+                del _result_inflight[key]

@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import unittest
 
 from datetime import date, datetime, timezone
@@ -84,6 +85,14 @@ class FakePool:
 
 
 class CostDataServiceTests(unittest.TestCase):
+    def setUp(self):
+        cost_data_service._result_cache.clear()
+        cost_data_service._result_inflight.clear()
+
+    def tearDown(self):
+        cost_data_service._result_cache.clear()
+        cost_data_service._result_inflight.clear()
+
     def test_all_datasets_are_date_bounded_and_json_safe(self):
         # Keyed by dataset rather than positional. The fake used to hand back
         # result sets in order, so adding a query to COST_DATA_QUERIES gave one
@@ -178,6 +187,87 @@ class CostDataServiceTests(unittest.TestCase):
             self.assertIn("stay_date BETWEEN", query)
             self.assertEqual(parameters["start_date"], date(2026, 1, 1))
             self.assertEqual(parameters["end_date"], date(2026, 1, 31))
+
+    def test_identical_requests_share_the_cached_result(self):
+        calls = []
+        result = ({"roomRevenue": [{"hotelName": "Hotel A"}]}, {"roomRevenue": 1})
+
+        original = cost_data_service._fetch_cost_data_uncached
+        cost_data_service._fetch_cost_data_uncached = lambda *arguments: (
+            calls.append(arguments) or result
+        )
+        try:
+            first = cost_data_service.fetch_cost_data(
+                date(2026, 1, 1), date(2026, 1, 31)
+            )
+            second = cost_data_service.fetch_cost_data(
+                date(2026, 1, 1), date(2026, 1, 31)
+            )
+        finally:
+            cost_data_service._fetch_cost_data_uncached = original
+
+        self.assertIs(first, result)
+        self.assertIs(second, result)
+        self.assertEqual(len(calls), 1)
+
+    def test_concurrent_identical_misses_run_the_queries_once(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        result = ({"payments": []}, {"payments": 0})
+
+        def build(*arguments):
+            calls.append(arguments)
+            started.set()
+            release.wait(timeout=2)
+            return result
+
+        original = cost_data_service._fetch_cost_data_uncached
+        cost_data_service._fetch_cost_data_uncached = build
+        answers = []
+        try:
+            arguments = (date(2026, 2, 1), date(2026, 2, 28))
+            first = threading.Thread(
+                target=lambda: answers.append(cost_data_service.fetch_cost_data(*arguments))
+            )
+            second = threading.Thread(
+                target=lambda: answers.append(cost_data_service.fetch_cost_data(*arguments))
+            )
+            first.start()
+            self.assertTrue(started.wait(timeout=1))
+            second.start()
+            time.sleep(0.05)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+        finally:
+            release.set()
+            cost_data_service._fetch_cost_data_uncached = original
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(answers, [result, result])
+
+    def test_a_failed_build_is_not_cached(self):
+        calls = []
+
+        def build(*arguments):
+            calls.append(arguments)
+            if len(calls) == 1:
+                raise RuntimeError("temporary database failure")
+            return ({"breakfast": []}, {"breakfast": 0})
+
+        original = cost_data_service._fetch_cost_data_uncached
+        cost_data_service._fetch_cost_data_uncached = build
+        arguments = (date(2026, 3, 1), date(2026, 3, 31))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "temporary database failure"):
+                cost_data_service.fetch_cost_data(*arguments)
+            recovered = cost_data_service.fetch_cost_data(*arguments)
+        finally:
+            cost_data_service._fetch_cost_data_uncached = original
+
+        self.assertEqual(recovered, ({"breakfast": []}, {"breakfast": 0}))
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

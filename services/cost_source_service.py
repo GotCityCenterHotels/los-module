@@ -30,6 +30,7 @@ from database import pool as export_pool
 from shared.db import HTTP_EXPORT_STATEMENT_TIMEOUT_MS
 from shared.mews_source import (
     CATEGORY_ORDERING_COLUMNS,
+    RATE_HISTORY_TABLE,
     UNORDERED_CATEGORY_RANK,
     agency_contains_text,
     rate_name_lateral,
@@ -97,6 +98,18 @@ AGENCY_NAME_COLUMNS = (
 # The agency's own key, whatever the ETL called it.
 AGENCY_ID_COLUMNS = ("id", "travel_agency_id", "agency_id", "company_id")
 
+# Every source relation whose shape the initial Cost Input payload may inspect.
+# Keeping this beside the table constants makes the cold-worker discovery query
+# exhaustive: a fallback agency table that does not exist is still remembered
+# as absent, rather than costing one information_schema round trip at a time.
+SOURCE_SCHEMA_TABLES = (
+    "rate_current",
+    RATE_HISTORY_TABLE,
+    "reservation_current",
+    "resource_category_current",
+    *AGENCY_TABLES,
+)
+
 
 # A reservation that has not been seen in two years is not a live picker
 # option, and an unbounded scan of reservation_current was what made the Cost
@@ -148,6 +161,71 @@ def table_identifier(table_name):
     """A composable identifier that keeps an explicit schema qualified."""
     schema, bare = _split_table(table_name)
     return Identifier(schema, bare) if schema else Identifier(bare)
+
+
+def _prime_table_columns(cursor, table_names=SOURCE_SCHEMA_TABLES):
+    """Resolve several source table shapes in one catalog round trip.
+
+    A cold Cost Input worker needs rate, reservation, room-category and agency
+    shapes before it can build the pickers. Asking information_schema for each
+    relation in turn made catalog latency additive, and a mirror without the
+    preferred agency table paid another round trip for every fallback. This
+    query preserves _table_columns' qualified/unqualified lookup rules while
+    filling the same TTL cache for every candidate at once.
+    """
+    now = monotonic()
+    requested = tuple(dict.fromkeys(str(name) for name in table_names))
+    with _column_lock:
+        missing = [
+            name for name in requested
+            if not (
+                (cached := _column_cache.get(name))
+                and cached[0] > now
+            )
+        ]
+        if not missing:
+            return
+
+        split_names = [_split_table(name) for name in missing]
+        cursor.execute(
+            """
+            WITH requested(schema_name, table_name) AS (
+                SELECT *
+                FROM unnest(
+                    %(schema_names)s::text[],
+                    %(table_names)s::text[]
+                )
+            )
+            SELECT requested.schema_name AS requested_schema,
+                   requested.table_name AS requested_table,
+                   source.column_name
+            FROM requested
+            LEFT JOIN information_schema.columns source
+              ON source.table_name = requested.table_name
+             AND (
+                    (
+                        requested.schema_name IS NULL
+                        AND source.table_schema = ANY(current_schemas(false))
+                    )
+                    OR source.table_schema = requested.schema_name
+                 )
+            """,
+            {
+                "schema_names": [schema for schema, _table in split_names],
+                "table_names": [table for _schema, table in split_names],
+            },
+        )
+        columns_by_table = {name: set() for name in missing}
+        for row in cursor.fetchall():
+            schema = row["requested_schema"]
+            table = row["requested_table"]
+            key = f"{schema}.{table}" if schema else table
+            if row["column_name"] is not None:
+                columns_by_table[key].add(row["column_name"])
+
+        expires_at = monotonic() + COLUMN_CACHE_TTL_SECONDS
+        for name, columns in columns_by_table.items():
+            _column_cache[name] = (expires_at, columns)
 
 
 def _table_columns(cursor, table_name):
@@ -923,6 +1001,10 @@ def _list_matching_rates_uncached(enterprise_id, origins, agencySearch, cursor):
 
 def _fetch_cost_sources_uncached(enterprise_id):
     with _Session() as source:
+        # The payload below needs several table shapes. Discover every candidate
+        # together so cold-worker catalog latency is paid once, including when
+        # the preferred travel-agency relation is absent.
+        _prime_table_columns(source)
         rates = list_rates(enterprise_id, cursor=source)
         categories = list_cleaning_categories(enterprise_id, cursor=source)
         origins = list_origins(enterprise_id, cursor=source)

@@ -46,6 +46,26 @@ class FakeCursor:
         self.executed.append(text)
         self.parameters.append(parameters)
         if "information_schema.columns" in text:
+            if isinstance(parameters, dict):
+                self._result = []
+                for schema, table in zip(
+                    parameters["schema_names"], parameters["table_names"]
+                ):
+                    key = f"{schema}.{table}" if schema else table
+                    columns = self.columns_by_table.get(key, set())
+                    if not columns:
+                        self._result.append({
+                            "requested_schema": schema,
+                            "requested_table": table,
+                            "column_name": None,
+                        })
+                    else:
+                        self._result.extend({
+                            "requested_schema": schema,
+                            "requested_table": table,
+                            "column_name": name,
+                        } for name in columns)
+                return
             # A qualified lookup passes (table, schema) and must only see that
             # schema's table; an unqualified one passes (table,).
             table = parameters[0]
@@ -664,6 +684,11 @@ class SourceCacheTests(unittest.TestCase):
         # four TLS handshakes. The second page load used to mean four more.
         pool.connection.assert_called_once()
         self.assertIs(first, second)
+        self.assertEqual(
+            sum("information_schema.columns" in sql for sql in cursor.executed),
+            1,
+            "cold source-table discovery should be one catalog round trip",
+        )
         self.assertIn("origins", first)
         self.assertTrue(first["capabilities"]["origin"])
         self.assertTrue(first["capabilities"]["rateFromReservations"])
