@@ -7,6 +7,10 @@ from time import perf_counter
 from psycopg.rows import dict_row
 
 from cost_database import apply_background_timeouts, cost_pool
+from services.cost_publication_service import (
+    advance_cost_publication,
+    remember_cost_publication,
+)
 from queries.supplement_source import (
     iter_booking_lifecycle_batches,
     iter_inventory_batches,
@@ -597,7 +601,12 @@ def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):
                         imported_rows = %s, finished_at = now(), published_at = now()
                     WHERE run_id = %s
                 """, (exported_rows, imported_rows, run_id))
+                cost_publication_version = advance_cost_publication(
+                    "hotels:supplement-sync",
+                    cursor=cursor,
+                )
                 app_connection.commit()
+                remember_cost_publication(cost_publication_version)
                 logging.info(
                     "Supplement lifecycle sync published run_id=%s mode=%s "
                     "snapshots=%s..%s booking_rows=%s inventory_rows=%s "

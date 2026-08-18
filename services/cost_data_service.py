@@ -31,6 +31,13 @@ COST_DATA_QUERY_CONCURRENCY = max(
 _dataset_workers = ThreadPoolExecutor(
     max_workers=COST_DATA_QUERY_CONCURRENCY, thread_name_prefix="cost-data"
 )
+# Coordinators only: the actual SQL still runs through _dataset_workers and its
+# global three-connection ceiling. Two threads let the selected and comparison
+# ranges feed that queue together from one HTTP invocation.
+_range_workers = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="cost-data-range",
+)
 
 # This is the server-side half of the 60-second browser cache advertised by the
 # route. It does not widen the staleness window: it lets users and tabs inside
@@ -142,22 +149,12 @@ def _fetch_cost_data_uncached(start_date, end_date):
     return datasets, row_counts
 
 
-def fetch_cost_data(start_date, end_date):
-    """Fetch a date range, sharing fresh and in-progress identical results.
-
-    The returned mappings are treated as read-only by the HTTP layer. A cache
-    hit therefore needs no copy of what can be tens of thousands of rows.
-    """
-    key = (start_date, end_date)
+def _cached_result(key, build):
+    """Share a fresh or in-progress immutable result for one cache key."""
     now = monotonic()
     with _result_cache_lock:
         cached = _result_cache.get(key)
         if cached is not None and cached[0] > now:
-            logging.info(
-                "Cost data cache hit start_date=%s end_date=%s",
-                start_date,
-                end_date,
-            )
             return cached[1]
 
         pending = _result_inflight.get(key)
@@ -172,7 +169,7 @@ def fetch_cost_data(start_date, end_date):
         return pending.result()
 
     try:
-        result = _fetch_cost_data_uncached(start_date, end_date)
+        result = build()
     except BaseException as error:
         pending.set_exception(error)
         raise
@@ -194,3 +191,48 @@ def fetch_cost_data(start_date, end_date):
         with _result_cache_lock:
             if _result_inflight.get(key) is pending:
                 del _result_inflight[key]
+
+
+def fetch_cost_data(start_date, end_date, publication_version=None):
+    """Fetch a date range, sharing fresh and in-progress identical results.
+
+    The returned mappings are treated as read-only by the HTTP layer. A cache
+    hit therefore needs no copy of what can be tens of thousands of rows.
+    """
+    key = ("single", publication_version, start_date, end_date)
+    return _cached_result(
+        key,
+        lambda: _fetch_cost_data_uncached(start_date, end_date),
+    )
+
+
+def fetch_cost_data_ranges(ranges, publication_version=None):
+    """Fetch named ranges together inside one API invocation.
+
+    ``ranges`` is an iterable of ``(label, start_date, end_date)`` triples.
+    Labels must be unique because they become response keys.
+    """
+    ranges = tuple(ranges)
+    labels = [label for label, _start, _end in ranges]
+    if not ranges:
+        raise ValueError("At least one Cost Data range is required")
+    if len(labels) != len(set(labels)):
+        raise ValueError("Cost Data range labels must be unique")
+
+    def build():
+        pending = {
+            label: _range_workers.submit(
+                fetch_cost_data,
+                start_date,
+                end_date,
+                publication_version,
+            )
+            for label, start_date, end_date in ranges
+        }
+        return {label: future.result() for label, future in pending.items()}
+
+    key = ("ranges", publication_version, ranges)
+    return _cached_result(
+        key,
+        build,
+    )

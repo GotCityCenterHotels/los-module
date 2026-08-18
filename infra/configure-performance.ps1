@@ -6,7 +6,9 @@ param(
     [ValidateRange(1, 1000)]
     [int]$HttpConcurrency = 4,
     [ValidateSet(512, 2048, 4096)]
-    [int]$InstanceMemoryMB = 2048
+    [int]$InstanceMemoryMB = 2048,
+    [ValidateRange(0, 20)]
+    [int]$AlwaysReadyHttpInstances = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,8 +35,22 @@ az functionapp config appsettings set `
         DB_POOL_MAX_IDLE_SECONDS=1800 `
         DB_POOL_MAX_LIFETIME_SECONDS=1800 `
         DB_CONNECT_TIMEOUT_SECONDS=10 `
+        COST_PUBLICATION_CACHE_SECONDS=5 `
+        COST_DATA_RESPONSE_CACHE_MAX_ENTRIES=8 `
         IMPORT_MAX_DEQUEUE_COUNT=3 `
     --output none
+
+# Always-ready is opt-in because it creates a standing Azure charge. When it is
+# enabled, the Function worker and the configured MIN_SIZE=1 database pools can
+# actually remain resident between visits instead of every cold page load paying
+# process startup plus TLS/SCRAM connection setup.
+if ($AlwaysReadyHttpInstances -gt 0) {
+    az functionapp scale config set `
+        --name $FunctionApp `
+        --resource-group $ResourceGroup `
+        --always-ready-instances "http=$AlwaysReadyHttpInstances" `
+        --output none
+}
 
 # Both MAX_SIZE values deliberately equal $HttpConcurrency. Each in-flight HTTP
 # request holds at most one connection per database, so matching the two means
@@ -49,8 +65,9 @@ az functionapp config appsettings set `
 # plan does not have here - without a resident worker there is no process to
 # hold the warm connection. Set one to collect the benefit:
 #
-#   az functionapp scale config set --name $FunctionApp `
-#       --resource-group $ResourceGroup --always-ready-instances http=1
+# Enable it through this script when the latency/cost tradeoff is approved:
+#
+#   ./infra/configure-performance.ps1 -AlwaysReadyHttpInstances 1
 
 az functionapp scale config show `
     --name $FunctionApp `

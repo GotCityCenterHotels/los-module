@@ -19,6 +19,24 @@ safe.
 Migration `005_import_jobs.sql` is applied lazily under a PostgreSQL advisory
 lock. It is safe to apply before deployment as well.
 
+## Cost Data publication and response cache
+
+Migration `017_cost_publication.sql` adds a singleton version in Database A.
+Every successful cost dataset import advances it after all batches and pruning
+have committed. Cost Input saves advance it in the same transaction as the
+rulebook. `integration_db` is unchanged and remains read-only.
+
+The facts endpoint keys its dataset, settings, ETag and pre-compressed response
+caches by that version. A repeat can therefore return cached gzip bytes, or a
+`304`, without rebuilding the body. The initial current/last-year view uses one
+HTTP request; both ranges still run concurrently under the existing global
+three-query database ceiling.
+
+Deploy the Function App before the stamped frontend so the extended endpoint is
+available when the browser starts sending `includeComparison=true`. Schema
+bootstrap applies migration 017 automatically; CI or controlled environments
+can instead run `python scripts/apply_migrations.py` before deployment.
+
 ## Flex Consumption and PostgreSQL limits
 
 Apply the checked-in configuration with:

@@ -48,6 +48,10 @@ MIGRATIONS = (
         "016_cost_reservation_mix",
         APP_ROOT / "sql" / "migrations" / "016_cost_reservation_mix.sql",
     ),
+    (
+        "017_cost_publication",
+        APP_ROOT / "sql" / "migrations" / "017_cost_publication.sql",
+    ),
 )
 
 _schema_ready = False

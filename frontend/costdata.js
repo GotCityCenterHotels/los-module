@@ -243,20 +243,6 @@
         await loadComparison(loadedRange, key);
     }
 
-    // The same request, started for a range the inputs hold but loadedRange does
-    // not yet. Returns a promise that always settles, so awaiting it later never
-    // turns a comparison failure into a failed load.
-    function startComparison(forRange) {
-        if (!elements.showLy || !elements.showLy.checked) {
-            comparison = null;
-            elements.comparisonNote.hidden = true;
-            return Promise.resolve();
-        }
-        const key = `${forRange.startDate}|${forRange.endDate}|${elements.lyBasis.value}`;
-        if (comparison && comparison.key === key) return Promise.resolve();
-        return loadComparison(forRange, key);
-    }
-
     async function loadData() {
         elements.error.hidden = true;
         try {
@@ -268,12 +254,34 @@
                 endDate: elements.endDate.value
             };
             const parameters = new URLSearchParams(range);
-            // The comparison is the same endpoint over a fixed offset from this
-            // range, and it used to be fetched only once this year's response had
-            // already arrived - two full requests, one after the other, for one
-            // view. It depends on nothing in that response, so it goes out now.
-            const comparisonRequest = startComparison(range);
-            const payload = await LosApi.fetchJson(`${API_URL}?${parameters}`);
+            const wantsComparison = Boolean(
+                elements.showLy && elements.showLy.checked
+            );
+            if (wantsComparison) {
+                parameters.set("includeComparison", "true");
+                parameters.set("lyComparisonBasis", elements.lyBasis.value);
+            }
+
+            let payload;
+            let comparisonFailure = null;
+            try {
+                // One Function invocation now owns the selected and comparison
+                // ranges. The server runs them concurrently under one global
+                // connection ceiling, returns the rulebook once and caches the
+                // complete compressed body against its Database A publication.
+                payload = await LosApi.fetchJson(`${API_URL}?${parameters}`);
+            }
+            catch (error) {
+                if (!wantsComparison) throw error;
+                // Preserve the established partial-failure contract: a problem
+                // building the optional comparison must not hide a valid current
+                // statement. Retry only the smaller current-only response.
+                console.error(error);
+                comparisonFailure = error;
+                payload = await LosApi.fetchJson(
+                    `${API_URL}?${new URLSearchParams(range)}`
+                );
+            }
             loadedData = payload.data || {};
             // The cost rulebook travels with the facts, so every figure below is
             // computed from what is currently saved in Cost Input.
@@ -281,9 +289,30 @@
             loadedRange = range;
             populateHotels(payload.hotels || []);
             updateFreshness();
-            // Still before the first render, so the chart is not drawn once
-            // without the comparison and again with it.
-            await comparisonRequest;
+
+            if (wantsComparison && payload.comparison && !comparisonFailure) {
+                comparison = {
+                    key: `${range.startDate}|${range.endDate}|${elements.lyBasis.value}`,
+                    data: payload.comparison.data || {}
+                };
+                elements.comparisonNote.hidden = true;
+            }
+            else if (wantsComparison) {
+                const previous = LosFormat.lastYearRange(
+                    range,
+                    elements.lyBasis.value
+                );
+                comparison = null;
+                elements.comparisonNote.textContent =
+                    `Last year (${previous.startDate} â€“ ${previous.endDate}) could not be loaded: `
+                    + `${comparisonFailure?.message || "the request failed"}. The chart shows this year only.`;
+                elements.comparisonNote.hidden = false;
+            }
+            else {
+                comparison = null;
+                elements.comparisonNote.hidden = true;
+            }
+
             render();
             const totalRows = Object.values(payload.rowCounts || {})
                 .reduce((total, count) => total + Number(count || 0), 0);

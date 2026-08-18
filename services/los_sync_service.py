@@ -7,6 +7,10 @@ from time import monotonic
 from psycopg.rows import dict_row
 
 from cost_database import apply_background_timeouts, cost_pool
+from services.cost_publication_service import (
+    advance_cost_publication,
+    remember_cost_publication,
+)
 from queries.los_sync import (
     AFFECTED_RESERVATIONS_SQL,
     FILTERED_FACT_SOURCE_SQL,
@@ -539,6 +543,15 @@ def sync_los(mode="delta"):
                             OFFSET 7
                         )
                     """, (run_id,))
+                    cost_publication_version = None
+                    if fact_rows_written:
+                        cost_publication_version = advance_cost_publication(
+                            "hotels:los-sync",
+                            cursor=cursor,
+                        )
+
+            if cost_publication_version is not None:
+                remember_cost_publication(cost_publication_version)
 
             result = {
                 "status": "success",

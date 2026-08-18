@@ -10,6 +10,10 @@ from time import monotonic
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
+from services.cost_publication_service import (
+    advance_cost_publication,
+    remember_cost_publication,
+)
 from services.cost_schema_service import ensure_cost_settings_schema
 from shared.db import get_export_connection
 
@@ -419,10 +423,11 @@ def _writable_connection(connection=None):
 
 def _upsert_mirrored_properties(properties, connection=None):
     if not properties:
-        return
+        return False
     properties, remember = _memo_unseen(_mirrored_memo, properties)
     if not properties:
-        return
+        return False
+    publication_version = None
     with _writable_connection(connection) as active:
         with active.cursor() as cursor:
             cursor.executemany(
@@ -448,14 +453,21 @@ def _upsert_mirrored_properties(properties, connection=None):
                     for property_row in properties
                 ],
             )
+            if connection is None:
+                publication_version = advance_cost_publication(
+                    "properties:bootstrap",
+                    cursor=cursor,
+                )
     if connection is None:
         # Ours to commit, and cost_pool.connection() has just done so. The
         # rulebook is keyed by hotel name and joins this table, so a property
         # arriving or being renamed changes it. A caller-supplied connection is
         # still mid-transaction here, so that case is invalidated by whoever
         # owns the commit - see fetch_cost_settings.
+        remember_cost_publication(publication_version)
         _invalidate_all_cost_settings()
     remember()
+    return True
 
 
 def _get_imported_property(enterprise_id):
@@ -492,13 +504,15 @@ def _get_preloaded_property(enterprise_id):
 
 def _preload_property_settings(properties, connection=None):
     if not properties:
-        return
+        return False
 
     properties, remember = _memo_unseen(_preloaded_memo, properties)
     if not properties:
-        return
+        return False
 
     ensure_cost_settings_schema()
+    publication_version = None
+    inserted = True
     with _writable_connection(connection) as active:
         with active.cursor() as cursor:
             cursor.executemany(
@@ -512,11 +526,22 @@ def _preload_property_settings(properties, connection=None):
                     for property_row in properties
                 ],
             )
+            # psycopg reports the total affected rows for executemany. Existing
+            # profiles hit DO NOTHING and do not change the Cost Data answer.
+            inserted = getattr(cursor, "rowcount", 1) > 0
+            if connection is None and inserted:
+                publication_version = advance_cost_publication(
+                    "settings:bootstrap",
+                    cursor=cursor,
+                )
     if connection is None:
         # A property with no profile row is absent from the rulebook entirely.
         # Caller-supplied connections: see _upsert_mirrored_properties.
-        _invalidate_all_cost_settings()
+        if inserted:
+            remember_cost_publication(publication_version)
+            _invalidate_all_cost_settings()
     remember()
+    return inserted
 
 
 def list_cost_settings_hotels():
@@ -738,24 +763,35 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
         hotel_name = bootstrap_property["hotelName"]
 
     with cost_pool.connection() as connection:
+        bootstrap_changed = False
+        bootstrap_publication_version = None
         if bootstrap_property is not None:
             # Both bootstrap writes run on the read's own connection. They used
             # to take a checkout each, and check=ConnectionPool.check_connection
             # spends a real round trip on every checkout - three per settings
             # load, for two writes that in steady state change nothing.
-            _upsert_mirrored_properties(
+            mirrored = _upsert_mirrored_properties(
                 [bootstrap_property], connection=connection
             )
-            _preload_property_settings(
+            preloaded = _preload_property_settings(
                 [bootstrap_property], connection=connection
             )
+            bootstrap_changed = mirrored or preloaded
+            if bootstrap_changed:
+                with connection.cursor() as cursor:
+                    bootstrap_publication_version = advance_cost_publication(
+                        "settings:bootstrap",
+                        cursor=cursor,
+                    )
         rows = _read_cost_settings(connection, enterprise_id)
 
     if bootstrap_property is not None:
         # The two bootstrap writes above ran on this connection, so this is the
         # first point at which they are committed and the cached rulebook can be
         # dropped without a concurrent reader refilling it from the old state.
-        _invalidate_all_cost_settings()
+        if bootstrap_changed:
+            remember_cost_publication(bootstrap_publication_version)
+            _invalidate_all_cost_settings()
 
     profile_row = rows["profile"]
     profile = dict(DEFAULT_PROFILE)
@@ -841,15 +877,18 @@ _ALL_SETTINGS_CACHE_SECONDS = float(
 )
 _all_settings_cache = {}
 _all_settings_lock = Lock()
+_all_settings_publication_version = None
 
 
 def _invalidate_all_cost_settings():
     """Drop the cached rulebook. Every writer in this module calls this."""
+    global _all_settings_publication_version
     with _all_settings_lock:
         _all_settings_cache.clear()
+        _all_settings_publication_version = None
 
 
-def fetch_all_cost_settings():
+def fetch_all_cost_settings(publication_version=None):
     """The whole rulebook, from cache when it is still inside its window.
 
     The mapping is shared with every caller for that window, so treat it as
@@ -857,10 +896,18 @@ def fetch_all_cost_settings():
     cannot add or drop a property from the cached copy - but the per-property
     dictionaries and their lists are the cached objects themselves.
     """
+    global _all_settings_publication_version
     now = monotonic()
     with _all_settings_lock:
         cached = _all_settings_cache.get("settings")
-        if cached is not None and now < cached[0]:
+        if (
+            cached is not None
+            and now < cached[0]
+            and (
+                publication_version is None
+                or publication_version == _all_settings_publication_version
+            )
+        ):
             return dict(cached[1])
 
     settings_by_hotel = _read_all_cost_settings()
@@ -870,6 +917,7 @@ def fetch_all_cost_settings():
             monotonic() + _ALL_SETTINGS_CACHE_SECONDS,
             settings_by_hotel,
         )
+        _all_settings_publication_version = publication_version
     return dict(settings_by_hotel)
 
 
@@ -1486,6 +1534,7 @@ def save_cost_settings(enterprise_id, payload):
         payload,
     )
     p = data["profile"]
+    publication_version = None
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(_PROFILE_UPSERT_SQL, (
@@ -1549,6 +1598,14 @@ def save_cost_settings(enterprise_id, payload):
                 )
             cursor.executemany("INSERT INTO functions.cost_arrival_staffing_tiers (enterprise_id, min_arrivals, max_arrivals, reception_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minArrivals"], r["maxArrivals"], r["receptionHours"], i) for i,r in enumerate(data["arrivalTiers"])])
             cursor.executemany("INSERT INTO functions.cost_breakfast_staffing_tiers (enterprise_id, min_guests, max_guests, staff_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minGuests"], r["maxGuests"], r["staffHours"], i) for i,r in enumerate(data["breakfastTiers"])])
+            # The version moves in the same transaction as the rulebook. A
+            # worker can therefore never observe a validator naming only half
+            # of this save.
+            publication_version = advance_cost_publication(
+                f"settings:{data['enterpriseId']}",
+                cursor=cursor,
+            )
+    remember_cost_publication(publication_version)
     # Saving is the only thing that moves the rulebook deliberately, so the
     # dashboard must not be served a window's worth of the previous one.
     _invalidate_all_cost_settings()

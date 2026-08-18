@@ -40,6 +40,8 @@ class FakeCursor:
             self.current = {"data_as_of": self.published} if self.published else None
         elif "INSERT INTO functions.supplement_sync_runs" in normalized:
             self.current = {"run_id": 41}
+        elif "INSERT INTO functions.cost_publication" in normalized:
+            self.current = {"version": 12}
         else:
             self.current = None
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Lock
 
 from cost_database import cost_pool
+from services.cost_schema_service import ensure_cost_settings_schema
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,10 @@ def ensure_supplement_schema():
         if _schema_ready:
             return
 
+        # Supplement publishes into the shared hotel dimension. Ensure the
+        # Cost Data publication pointer that names changes to that dimension is
+        # present before a sync can update it.
+        ensure_cost_settings_schema()
         with cost_pool.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(

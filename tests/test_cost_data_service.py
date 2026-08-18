@@ -75,10 +75,13 @@ class FakePool:
     def __init__(self, results_by_query):
         self.results_by_query = results_by_query
         self.executions = []
+        self.connection_count = 0
         self.lock = threading.Lock()
         self.max_size = 4
 
     def connection(self):
+        with self.lock:
+            self.connection_count += 1
         return FakeConnection(
             FakeCursor(self.results_by_query, self.executions, self.lock)
         )
@@ -233,6 +236,61 @@ class CostDataServiceTests(unittest.TestCase):
         self.assertIs(first, result)
         self.assertIs(second, result)
         self.assertEqual(len(calls), 1)
+
+    def test_publication_version_invalidates_a_range_cache_entry(self):
+        calls = []
+        original = cost_data_service._fetch_cost_data_uncached
+        cost_data_service._fetch_cost_data_uncached = lambda *arguments: (
+            calls.append(arguments)
+            or ({"roomRevenue": []}, {"roomRevenue": 0})
+        )
+        try:
+            arguments = (date(2026, 1, 1), date(2026, 1, 31))
+            cost_data_service.fetch_cost_data(*arguments, publication_version=4)
+            cost_data_service.fetch_cost_data(*arguments, publication_version=4)
+            cost_data_service.fetch_cost_data(*arguments, publication_version=5)
+        finally:
+            cost_data_service._fetch_cost_data_uncached = original
+
+        self.assertEqual(len(calls), 2)
+
+    def test_two_ranges_run_together_and_populate_the_single_range_cache(self):
+        calls = []
+        ranges = (
+            ("current", date(2026, 1, 1), date(2026, 1, 31)),
+            ("comparison", date(2025, 1, 1), date(2025, 1, 31)),
+        )
+
+        def build(start_date, end_date):
+            calls.append((start_date, end_date))
+            return (
+                {"roomRevenue": [{"startDate": start_date.isoformat()}]},
+                {"roomRevenue": 1},
+            )
+
+        original = cost_data_service._fetch_cost_data_uncached
+        cost_data_service._fetch_cost_data_uncached = build
+
+        try:
+            result = cost_data_service.fetch_cost_data_ranges(
+                ranges,
+                publication_version=8,
+            )
+            current_again = cost_data_service.fetch_cost_data(
+                date(2026, 1, 1),
+                date(2026, 1, 31),
+                publication_version=8,
+            )
+        finally:
+            cost_data_service._fetch_cost_data_uncached = original
+
+        self.assertEqual(set(result), {"current", "comparison"})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            {start for start, _end in calls},
+            {date(2026, 1, 1), date(2025, 1, 1)},
+        )
+        self.assertIs(current_again, result["current"])
 
     def test_concurrent_identical_misses_run_the_queries_once(self):
         started = threading.Event()

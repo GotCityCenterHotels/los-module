@@ -263,7 +263,16 @@ class CostSettingsValidationTests(unittest.TestCase):
         ):
             with patch.object(
                 cost_settings_service, "ensure_cost_settings_schema",
-            ), patch.object(cost_settings_service, "cost_pool", Pool()):
+            ), patch.object(
+                cost_settings_service, "cost_pool", Pool()
+            ), patch.object(
+                cost_settings_service,
+                "advance_cost_publication",
+                return_value=2,
+            ), patch.object(
+                cost_settings_service,
+                "remember_cost_publication",
+            ):
                 cost_settings_service._reset_property_memo()
                 prime()
                 writer(properties, connection=Connection())
@@ -318,6 +327,13 @@ class CostSettingsValidationTests(unittest.TestCase):
             cost_settings_service,
             "cost_pool",
             pool,
+        ), patch.object(
+            cost_settings_service,
+            "advance_cost_publication",
+            return_value=2,
+        ), patch.object(
+            cost_settings_service,
+            "remember_cost_publication",
         ):
             cost_settings_service._preload_property_settings(properties)
 
@@ -365,6 +381,8 @@ class CostSettingsValidationTests(unittest.TestCase):
             "cost_pool",
             Pool(),
         ):
+            mirror.return_value = False
+            preload.return_value = False
             result = cost_settings_service.fetch_cost_settings(
                 property_record["enterpriseId"],
                 property_record["hotelName"],
@@ -429,7 +447,14 @@ class CostSettingsValidationTests(unittest.TestCase):
             cost_settings_service,
             "cost_pool",
             pool,
-        ):
+        ), patch.object(
+            cost_settings_service,
+            "advance_cost_publication",
+            return_value=2,
+        ) as advance, patch.object(
+            cost_settings_service,
+            "remember_cost_publication",
+        ) as remember:
             result = cost_settings_service.fetch_cost_settings(
                 "property-77", "Hotel B"
             )
@@ -447,6 +472,8 @@ class CostSettingsValidationTests(unittest.TestCase):
             "INSERT INTO functions.cost_property_settings" in sql
             for sql in connection.statements
         ), "the settings preload did not run")
+        self.assertEqual(advance.call_args.args[0], "settings:bootstrap")
+        remember.assert_called_once_with(2)
 
     def test_defaults_include_two_percent_card_cost(self):
         result = cost_settings_service.validate_cost_settings(
@@ -662,9 +689,13 @@ class BulkCostSettingsTests(unittest.TestCase):
         with patch.object(
             cost_settings_service, "ensure_cost_settings_schema",
         ), patch.object(cost_settings_service, "cost_pool", Pool()):
-            first = cost_settings_service.fetch_all_cost_settings()
+            first = cost_settings_service.fetch_all_cost_settings(
+                publication_version=9
+            )
             queries_for_one_build = len(cursor.executed)
-            second = cost_settings_service.fetch_all_cost_settings()
+            second = cost_settings_service.fetch_all_cost_settings(
+                publication_version=9
+            )
 
             self.assertEqual(sorted(second), ["Hotel A"])
             self.assertEqual(second, first)
@@ -674,9 +705,14 @@ class BulkCostSettingsTests(unittest.TestCase):
             # saving something worth saving.
             self.assertGreater(queries_for_one_build, 1)
 
-            cost_settings_service._invalidate_all_cost_settings()
-            cost_settings_service.fetch_all_cost_settings()
+            # A save/import observed on another Function worker changes the
+            # publication key and must not reuse this worker's old rulebook.
+            cost_settings_service.fetch_all_cost_settings(publication_version=10)
             self.assertEqual(len(cursor.executed), queries_for_one_build * 2)
+
+            cost_settings_service._invalidate_all_cost_settings()
+            cost_settings_service.fetch_all_cost_settings(publication_version=10)
+            self.assertEqual(len(cursor.executed), queries_for_one_build * 3)
 
     def test_the_top_level_mapping_handed_out_is_not_the_cached_one(self):
         # Two callers must not be able to see each other's edits to the mapping.

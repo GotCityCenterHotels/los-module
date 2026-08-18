@@ -3,8 +3,11 @@ import json
 import logging
 import os
 
+from collections import OrderedDict
+from concurrent.futures import Future
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
+from threading import Lock
 from time import perf_counter
 from zoneinfo import ZoneInfo
 
@@ -18,7 +21,8 @@ from services.los_facts_service import (
 )
 from services.los_schema_service import LosSchemaError
 from services.los_sync_service import sync_los
-from services.cost_data_service import fetch_cost_data
+from services.cost_data_service import fetch_cost_data, fetch_cost_data_ranges
+from services.cost_publication_service import fetch_cost_publication_version
 from services.cost_settings_service import (
     fetch_all_cost_settings,
     fetch_cost_settings,
@@ -72,6 +76,17 @@ MAX_RANGE_DAYS = int(os.environ.get("MAX_QUERY_RANGE_DAYS", "400"))
 # repeats within a single sitting without holding a stale answer past the point
 # anyone would notice. The sibling cost routes already sit at 120-300.
 COST_DATA_MAX_AGE_SECONDS = int(os.environ.get("COST_DATA_MAX_AGE_SECONDS", "60"))
+COST_DATA_RESPONSE_CACHE_MAX_ENTRIES = max(
+    1,
+    int(os.environ.get("COST_DATA_RESPONSE_CACHE_MAX_ENTRIES", "8")),
+)
+# Part of the validator because a deployment can change response semantics
+# without importing facts or saving settings. Increment this when the Cost Data
+# response contract or calculation changes.
+COST_DATA_RESPONSE_SCHEMA_VERSION = 2
+_cost_response_cache = OrderedDict()
+_cost_response_inflight = {}
+_cost_response_lock = Lock()
 # Matches the server-side TTL in services/hotels_service.py and the browser-side
 # one in frontend/los-api.js, so all three agree on how long a hotel list stands.
 HOTEL_LIST_MAX_AGE_SECONDS = int(
@@ -283,6 +298,94 @@ def content_hash_response(req, payload, prefix, max_age):
         mimetype="application/json",
         headers=headers,
     )
+
+
+def _cost_response(req, entry, etag):
+    headers = {
+        "ETag": etag,
+        "Cache-Control": f"private, max-age={COST_DATA_MAX_AGE_SECONDS}",
+        "Vary": "Accept-Encoding",
+    }
+    accepts_gzip = "gzip" in (
+        req.headers.get("Accept-Encoding") or ""
+    ).lower()
+    body = entry[1] if accepts_gzip else entry[0]
+    if accepts_gzip:
+        headers["Content-Encoding"] = "gzip"
+    return func.HttpResponse(
+        body=body,
+        status_code=200,
+        mimetype="application/json",
+        headers=headers,
+    )
+
+
+def versioned_cost_response(req, cache_key, etag, payload_factory):
+    """Build and cache complete Cost Data response bytes once per publication.
+
+    The ETag is derived from the Database A publication and request parameters,
+    so a matching validator can answer before any fact query or JSON encoding.
+    Concurrent cold requests share the same complete build.
+    """
+    if req.headers.get("If-None-Match") == etag:
+        return func.HttpResponse(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": (
+                    f"private, max-age={COST_DATA_MAX_AGE_SECONDS}"
+                ),
+                "Vary": "Accept-Encoding",
+            },
+        )
+
+    with _cost_response_lock:
+        entry = _cost_response_cache.pop(cache_key, None)
+        if entry is not None:
+            _cost_response_cache[cache_key] = entry
+            return _cost_response(req, entry, etag)
+
+        pending = _cost_response_inflight.get(cache_key)
+        if pending is None:
+            pending = Future()
+            _cost_response_inflight[cache_key] = pending
+            owns_build = True
+        else:
+            owns_build = False
+
+    if not owns_build:
+        return _cost_response(req, pending.result(), etag)
+
+    try:
+        payload, cacheable = payload_factory()
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        entry = (body, gzip.compress(body, compresslevel=5))
+    except BaseException as error:
+        pending.set_exception(error)
+        raise
+    else:
+        if cacheable:
+            with _cost_response_lock:
+                _cost_response_cache[cache_key] = entry
+                while len(_cost_response_cache) > COST_DATA_RESPONSE_CACHE_MAX_ENTRIES:
+                    _cost_response_cache.popitem(last=False)
+        pending.set_result(entry)
+        return _cost_response(req, entry, etag)
+    finally:
+        with _cost_response_lock:
+            if _cost_response_inflight.get(cache_key) is pending:
+                del _cost_response_inflight[cache_key]
+
+
+def shift_cost_comparison_date(value, basis):
+    if basis == "sameWeekday":
+        return value - timedelta(days=364)
+    try:
+        return value.replace(year=value.year - 1)
+    except ValueError:
+        # 29 February compares with the last valid day of February, matching
+        # LosFormat.lastYearDate in the browser.
+        return value.replace(year=value.year - 1, day=28)
 
 
 def validate_facts_parameters(req):
@@ -513,50 +616,139 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
     if span_error is not None:
         return span_error
 
+    include_raw = (req.params.get("includeComparison") or "false").lower()
+    if include_raw not in {"true", "false", "1", "0"}:
+        return json_response(
+            {"error": "includeComparison must be true or false"},
+            400,
+        )
+    include_comparison = include_raw in {"true", "1"}
+    comparison_basis = req.params.get("lyComparisonBasis") or "sameDate"
+    if comparison_basis not in VALID_LY_COMPARISONS:
+        return json_response(
+            {
+                "error": "Invalid lyComparisonBasis",
+                "allowedValues": ["sameDate", "sameWeekday"],
+            },
+            400,
+        )
+
+    comparison_start = comparison_end = None
+    if include_comparison:
+        comparison_start = shift_cost_comparison_date(
+            start_date,
+            comparison_basis,
+        )
+        comparison_end = shift_cost_comparison_date(
+            end_date,
+            comparison_basis,
+        )
+
     try:
-        datasets, row_counts = fetch_cost_data(start_date, end_date)
+        publication_version = fetch_cost_publication_version()
     except Exception:
-        logging.exception("Cost data endpoint failed")
+        logging.exception("Cost publication lookup failed")
         return json_response({"error": "Unable to retrieve cost data"}, 500)
 
-    # The GOP statement on this page is computed entirely from the saved Cost
-    # Input rulebook, so it travels with the facts. A failure here must not take
-    # the facts down with it: the page still shows the datasets, and says which
-    # properties it could not cost.
-    try:
-        cost_settings = fetch_all_cost_settings()
-    except Exception:
-        logging.exception("Cost settings lookup failed for the cost data endpoint")
-        cost_settings = {}
-
-    hotels = sorted(
-        {
-            row["hotelName"]
-            for rows in datasets.values()
-            for row in rows
-            if row.get("hotelName")
-        }
+    identity = "|".join([
+        str(COST_DATA_RESPONSE_SCHEMA_VERSION),
+        str(publication_version),
+        start_date.isoformat(),
+        end_date.isoformat(),
+        comparison_basis if include_comparison else "none",
+        comparison_start.isoformat() if comparison_start else "none",
+        comparison_end.isoformat() if comparison_end else "none",
+    ])
+    etag = content_etag("costdata", identity)
+    cache_key = (
+        COST_DATA_RESPONSE_SCHEMA_VERSION,
+        publication_version,
+        start_date,
+        end_date,
+        comparison_basis if include_comparison else None,
+        comparison_start,
+        comparison_end,
     )
 
-    # The Cost Data page asks this endpoint twice for one view - the selected
-    # range and the same range a year back - and re-asks whenever the comparison
-    # is toggled or its basis changed. Those repeats were full rebuilds of a
-    # payload that had not moved.
-    return content_hash_response(
-        req,
-        {
+    def build_payload():
+        if include_comparison:
+            range_results = fetch_cost_data_ranges(
+                (
+                    ("current", start_date, end_date),
+                    ("comparison", comparison_start, comparison_end),
+                ),
+                publication_version=publication_version,
+            )
+            datasets, row_counts = range_results["current"]
+            comparison_datasets, comparison_row_counts = (
+                range_results["comparison"]
+            )
+        else:
+            datasets, row_counts = fetch_cost_data(
+                start_date,
+                end_date,
+                publication_version=publication_version,
+            )
+            comparison_datasets = comparison_row_counts = None
+
+        # The GOP statement is computed entirely from the saved Cost Input
+        # rulebook. Preserve the existing partial-failure behaviour: facts can
+        # still be shown when that lookup is temporarily unavailable, but do not
+        # retain that degraded body in the server response cache.
+        cacheable = True
+        try:
+            cost_settings = fetch_all_cost_settings(
+                publication_version=publication_version,
+            )
+        except Exception:
+            logging.exception(
+                "Cost settings lookup failed for the cost data endpoint"
+            )
+            cost_settings = {}
+            cacheable = False
+
+        hotels = sorted(
+            {
+                row["hotelName"]
+                for rows in datasets.values()
+                for row in rows
+                if row.get("hotelName")
+            }
+        )
+
+        payload = {
             "parameters": {
                 "startDate": start_date.isoformat(),
                 "endDate": end_date.isoformat(),
             },
+            "publicationVersion": publication_version,
             "rowCounts": row_counts,
             "hotels": hotels,
             "data": datasets,
             "costSettings": cost_settings,
-        },
-        "costdata",
-        COST_DATA_MAX_AGE_SECONDS,
-    )
+        }
+        if include_comparison:
+            payload["comparison"] = {
+                "parameters": {
+                    "startDate": comparison_start.isoformat(),
+                    "endDate": comparison_end.isoformat(),
+                    "lyComparisonBasis": comparison_basis,
+                },
+                "rowCounts": comparison_row_counts,
+                "data": comparison_datasets,
+            }
+        return payload, cacheable
+
+    try:
+        return versioned_cost_response(
+            req,
+            cache_key,
+            etag,
+            build_payload,
+        )
+    except Exception:
+        logging.exception("Cost data endpoint failed")
+        return json_response({"error": "Unable to retrieve cost data"}, 500)
 
 
 @app.route(

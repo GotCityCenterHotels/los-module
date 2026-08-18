@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from .sql_runner import transfer_dataset
+from services.cost_publication_service import advance_cost_publication
 
 
 def utc_now():
@@ -112,6 +113,13 @@ def run_dataset(dataset_name):
                 "Properties were exported but are not visible in the unified hotel dimension in Database A"
             )
         result["verified_rows"] = verified_rows
+
+    # transfer_dataset has committed every batch and, for mixes, the stale-row
+    # prune before it returns. Move the Database A publication only after that
+    # complete dataset is visible. A skipped source capability writes nothing
+    # and therefore keeps the previous version.
+    if result.get("import_rows", 0) or result.get("pruned_rows", 0):
+        advance_cost_publication(f"import:{dataset_name}")
 
     return {
         "dataset": dataset_name,

@@ -96,7 +96,10 @@ class CostDataTriggerTests(unittest.TestCase):
             return_value=expected,
         ) as transfer, patch(
             "cost_database.cost_pool.connection",
-        ) as pool_connection:
+        ) as pool_connection, patch.object(
+            pipeline,
+            "advance_cost_publication",
+        ) as publish:
             cursor = pool_connection.return_value.__enter__.return_value.cursor
             cursor = cursor.return_value.__enter__.return_value
             cursor.fetchone.return_value = (8,)
@@ -113,6 +116,7 @@ class CostDataTriggerTests(unittest.TestCase):
             **expected,
             "verified_rows": 8,
         })
+        publish.assert_called_once_with("import:properties")
 
     def test_property_sync_rejects_an_empty_source_result(self):
         with patch(

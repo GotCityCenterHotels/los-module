@@ -858,24 +858,17 @@ test("a comparison that fails to load leaves this year's statement standing", ()
     assert.match(read("styles.css"), /\.gop-chart-warning \{/);
 });
 
-test("the comparison request does not wait for this year's response", () => {
+test("the initial comparison travels with this year's response", () => {
     const script = read("costdata.js");
 
-    // Both are the same endpoint over ranges the date inputs already hold, so
-    // fetching them one after the other put two full round trips in front of
-    // one view. The comparison is started before this year's is awaited, and
-    // awaited only just before the first render - so the chart is still never
-    // drawn once without it and again with it.
+    // One Function invocation owns both known ranges, one rulebook and one
+    // compressed body. Toggling or changing the basis later can still use the
+    // smaller comparison-only request in loadComparison.
     const load = /async function loadData\(\)[\s\S]*?\n {4}\}/.exec(script)[0];
-    const started = load.indexOf("startComparison(range)");
-    const awaitedMain = load.indexOf("await LosApi.fetchJson");
-    const awaitedComparison = load.indexOf("await comparisonRequest");
-    const rendered = load.indexOf("render();");
-
-    assert.ok(started !== -1, "the comparison should be started inside loadData");
-    assert.ok(started < awaitedMain, "it should be started before this year's is awaited");
-    assert.ok(awaitedMain < awaitedComparison, "and awaited afterwards");
-    assert.ok(awaitedComparison < rendered, "but before the first render");
+    assert.match(load, /parameters\.set\("includeComparison", "true"\)/);
+    assert.match(load, /parameters\.set\("lyComparisonBasis", elements\.lyBasis\.value\)/);
+    assert.match(load, /payload\.comparison\.data/);
+    assert.doesNotMatch(load, /startComparison\(/);
 });
 
 test("a missing control warns instead of killing the page bootstrap", () => {
