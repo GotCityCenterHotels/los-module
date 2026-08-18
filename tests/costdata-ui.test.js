@@ -474,6 +474,31 @@ test("Cost Input can trigger the import, one dataset or all of them", () => {
     // ever asking again.
     assert.match(script, /forgetImportKey\(\)/);
     assert.match(script, /costdata-import-key/);
+});
+
+// The Function App is a Static Web Apps linked backend, so App Service
+// Authentication guards it and the platform authenticates the proxied request. A
+// request from this page therefore usually needs no key at all - and a WRONG one is
+// worse than none, because the Functions host key check then turns down a request
+// EasyAuth had already let through.
+test("the import tries without a key first and only asks if refused", () => {
+    const script = read("costdata-input.js");
+
+    assert.match(script, /async function queueImport\(dataset\)/);
+    assert.match(script, /return await postImport\(dataset, ""\)/);
+    // The key is only attached when there is one, so the unauthenticated attempt
+    // sends no header at all rather than an empty one.
+    assert.match(script, /if \(key\) headers\["x-functions-key"\] = key;/);
+    // Asked for after the refusal, not before it.
+    assert.ok(
+        script.indexOf('postImport(dataset, "")') < script.indexOf("const key = importKey()"),
+        "the keyless attempt must come before the prompt"
+    );
+    // And when both attempts are refused, the key is only half the candidates:
+    // this page sits behind the site's own login and an expired session refuses
+    // the proxied request identically. Blaming the key was wrong twice over.
+    assert.match(script, /session has expired/);
+    assert.doesNotMatch(script, /That key was not accepted/);
     // Reloading the property list pulls the server's copy over the form, which is
     // where half an hour of unsaved work may be sitting.
     assert.match(script, /if \(dirty\) \{/);

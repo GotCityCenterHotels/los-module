@@ -2240,23 +2240,30 @@
         return parts.join(" ");
     }
 
-    // costdata/import is a FUNCTION-level route: it triggers a cross-database
-    // import and the Function App answers on its own hostname, so it cannot be
-    // left open. Static Web Apps does not attach the key for us, so the operator
-    // supplies it once per browser session.
+    // costdata/import is a FUNCTION-level route, so it cannot be left open. What
+    // actually guards it, though, is not the key.
     //
-    // The key is in the Azure portal under los-functions > App keys. That belongs
-    // here rather than in the prompt: the person clicking this is a revenue
-    // manager who has been given a key, not someone with portal access, and a
-    // dialog naming a resource they cannot open only makes them stop.
+    // The Function App is a Static Web Apps linked backend, which puts App Service
+    // Authentication in front of it: a direct call to the Function App's own
+    // hostname is rejected before the key is ever read, and a call proxied from
+    // this page is authenticated by the platform. So a request from here usually
+    // needs no key at all - and sending a WRONG one is strictly worse than sending
+    // none, because the Functions host key check then turns down a request EasyAuth
+    // had already let through.
+    //
+    // Hence: try without a key, and only ask for one if the server actually says
+    // no. An earlier version asked first and reported every 401 as "that key was
+    // not accepted", which was wrong twice over - the key was not needed, and the
+    // 401 it was blaming could equally have been an expired page session.
     const IMPORT_KEY_STORAGE = "costdata-import-key";
     function importKey() {
         let key = "";
         try { key = sessionStorage.getItem(IMPORT_KEY_STORAGE) || ""; } catch { key = ""; }
         if (!key) {
             key = (prompt(
-                "Enter the import key.\n\n"
-                + "Ask IT if you do not have it. It is kept for this browser session only."
+                "This import needs a function key.\n\n"
+                + "Azure portal > los-functions > App keys > default. Ask IT if you "
+                + "do not have access. It is kept for this browser tab only."
             ) || "").trim();
             if (!key) return "";
             try { sessionStorage.setItem(IMPORT_KEY_STORAGE, key); } catch { /* session-only */ }
@@ -2265,6 +2272,52 @@
     }
     function forgetImportKey() {
         try { sessionStorage.removeItem(IMPORT_KEY_STORAGE); } catch { /* nothing cached */ }
+    }
+
+    function isAuthFailure(error) {
+        return /\b401\b|\b403\b/.test((error && error.message) || "");
+    }
+
+    function postImport(dataset, key) {
+        const headers = {"Content-Type": "application/json"};
+        if (key) headers["x-functions-key"] = key;
+        return LosApi.fetchJson("/api/costdata/import", {
+            method: "POST", headers, body: JSON.stringify({dataset})
+        });
+    }
+
+    // Unauthenticated first, then once more with a key if that is refused.
+    async function queueImport(dataset) {
+        try {
+            return await postImport(dataset, "");
+        }
+        catch (error) {
+            if (!isAuthFailure(error)) throw error;
+            // A key already cached in this tab is reused silently; only a tab that
+            // has never needed one gets the prompt.
+            const key = importKey();
+            if (!key) {
+                throw new Error(
+                    "The server asked for a function key and none was entered."
+                );
+            }
+            try {
+                return await postImport(dataset, key);
+            }
+            catch (retry) {
+                if (!isAuthFailure(retry)) throw retry;
+                forgetImportKey();
+                // Both attempts refused, so the key is only half the candidates.
+                // This page sits behind the site's own login, and an expired
+                // session refuses the proxied request exactly the same way.
+                throw new Error(
+                    "The server refused this request both without a key and with the "
+                    + "one entered. Either that key is wrong, or this page's own "
+                    + "session has expired - reload the page and try again before "
+                    + "re-entering a key."
+                );
+            }
+        }
     }
 
     function importLabel() {
@@ -2278,8 +2331,6 @@
             `Import ${importLabel()} for every hotel now?`
             + (dataset === "all" ? " This can take up to 35 minutes." : "")
         )) return;
-        const key = importKey();
-        if (!key) { status.textContent = "Import cancelled — no key was entered."; return; }
         importButton.disabled = true;
         importDataset.disabled = true;
         errorPanel.hidden = true;
@@ -2296,23 +2347,7 @@
         }, 1000);
         try {
             status.textContent = `Queueing ${importLabel()} import…`;
-            let accepted;
-            try {
-                accepted = await LosApi.fetchJson("/api/costdata/import", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json", "x-functions-key": key},
-                    body: JSON.stringify({dataset})
-                });
-            }
-            catch (error) {
-                // A rejected key must not stay cached, or every later attempt
-                // fails without ever asking again.
-                if (/\b401\b|\b403\b/.test(error.message || "")) {
-                    forgetImportKey();
-                    throw new Error("That key was not accepted. Click the button again to enter it.");
-                }
-                throw error;
-            }
+            const accepted = await queueImport(dataset);
             // Only one cost job may be active at a time, so a request that arrives
             // during the nightly run is answered with that job instead of a new
             // one. Saying so beats watching "Everything" import when one dataset
