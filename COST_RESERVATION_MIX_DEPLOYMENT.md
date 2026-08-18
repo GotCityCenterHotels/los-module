@@ -50,11 +50,65 @@ it tried and returns `None`. The dataset then imports nothing, and the page keep
 its previous figure and its flag. Candidate lists live at the top of
 `services/cost_mix_export_service.py`; adding a synonym there is the fix.
 
-Required for the departure mix: a reservation end column, a room category
-foreign key, a category name column, and either adult/child counts or a single
-person count. Required for the distribution mix: a reservation origin column.
-Travel agency and rate are optional there - without them the rulebook still
-applies at its origin level, which is the level that decides most of it.
+Required for the departure mix, on `staging.room_nights_source`: `end_utc`,
+`hotel_name`, and a reservation key. Plus a room category foreign key and guest
+counts - taken from the nights when they are there and from
+`reservation_current` when they are not - and a name column on
+`resource_category_current`.
+
+### Guests in the room
+
+Mews publishes `Reservation.PersonCounts`, which is not a number:
+
+```json
+[{"Count": 1, "AgeCategoryId": "2d7a…"}, {"Count": 3, "AgeCategoryId": "2df…"}]
+```
+
+The occupancy is the **sum of its Counts** - four in that example - so the export
+sums the list rather than reading a column. Every age category counts: a child in
+the room is still a bed made up, and the occupancies the Cost Input editor offers
+come from a category's capacity plus its extra beds, which is a head count too.
+
+Two readings are supported and the **declared type decides which**, not the name.
+A `json`, `jsonb` or text column is summed as a list; an integer column is read as
+a number. A mirror that flattened PersonCounts into an integer but kept the plural
+name would otherwise be parsed as an empty list and every room costed at one
+guest - wrong, and silently so. A mirror that flattened it into `adult_count` and
+`child_count` is preferred over either, because adding a total that already
+includes children to a child count would double the occupancy.
+
+The sum is guarded by `jsonb_typeof`, since `jsonb_array_elements` raises on
+anything that is not an array: one malformed row must not fail the import. An
+absent, empty or malformed list floors at one guest.
+
+The export also collapses room nights to one row per reservation per departure
+date *before* joining or counting - `room_nights_source` holds a row per room
+night, so without that the sum would be evaluated once per night of every stay,
+and again as a grouping key.
+
+Required for the distribution mix: a reservation origin column. Travel agency and
+rate are optional there; without them the rulebook still applies at its origin
+level, which is the level that decides most of it.
+
+## Why the departure mix reads room_nights_source
+
+`total_departures` in `functions.arr_dep_data` is
+`count(distinct reservation_id)` over `staging.room_nights_source`, filtered on
+`canceled_utc IS NULL`, with the departure date taken from `end_utc` in Stockholm
+time. The mix is that same count, over that same relation, with that same filter
+and the same `enterprise_current` name join - only partitioned by room category
+and guest count as well.
+
+That is deliberate and load-bearing. The cleaning line charges the authoritative
+departure count at the rate the mix implies, so the mix has to sum to that count;
+deriving it from `reservation_current` instead - which an earlier version did -
+made the two independently computed and left no reason they should agree.
+
+The only thing that does not come from the nights is the pair of extra
+dimensions. The category and the guest counts are read from the nights when the
+view carries them, and through a join to `reservation_current` when it does not.
+A reservation whose category cannot be resolved drops out of the weighting rather
+than being counted at zero; the total it is applied to is unaffected.
 
 ## Import duration
 

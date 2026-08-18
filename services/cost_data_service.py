@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 
 from cost_database import cost_pool
 from queries.cost_data import COST_DATA_QUERIES
+from services.cost_schema_service import ensure_cost_settings_schema
 
 
 # The datasets are independent reads, so they are fetched together rather than
@@ -72,6 +73,18 @@ def _fetch_dataset(query, parameters):
 
 
 def fetch_cost_data(start_date, end_date):
+    # Two of these datasets read tables that migration 016 creates, and this runs
+    # BEFORE fetch_all_cost_settings() in the facts route - which was the only
+    # thing applying migrations on this path. On a Database A that had not yet
+    # taken 016, the first Cost Data request therefore failed with UndefinedTable
+    # and the route answered "Unable to retrieve cost data" for the whole page,
+    # taking down the five datasets that were fine along with the two that were
+    # not. Every other cost read already opens this way; this one was missed.
+    #
+    # Not a real cost: the check short-circuits on a flag after the first call in
+    # a worker, and is one round trip before that.
+    ensure_cost_settings_schema()
+
     parameters = {"start_date": start_date, "end_date": end_date}
     started_at = monotonic()
 

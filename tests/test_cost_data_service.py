@@ -128,8 +128,16 @@ class CostDataServiceTests(unittest.TestCase):
             for dataset, query in cost_data_service.COST_DATA_QUERIES.items()
         }
         original_pool = cost_data_service.cost_pool
+        original_ensure = cost_data_service.ensure_cost_settings_schema
         fake_pool = FakePool(results_by_query)
         cost_data_service.cost_pool = fake_pool
+        # Recorded, not merely stubbed: two of these datasets read tables that
+        # migration 016 creates, and this read runs before the one that used to be
+        # the only thing applying migrations on this route.
+        ensured = []
+        cost_data_service.ensure_cost_settings_schema = lambda: ensured.append(
+            len(fake_pool.executions)
+        )
 
         try:
             datasets, row_counts = cost_data_service.fetch_cost_data(
@@ -138,6 +146,12 @@ class CostDataServiceTests(unittest.TestCase):
             )
         finally:
             cost_data_service.cost_pool = original_pool
+            cost_data_service.ensure_cost_settings_schema = original_ensure
+
+        # Once, and before a single dataset query ran - otherwise a Database A
+        # without 016 answers UndefinedTable for the whole page, taking down the
+        # five datasets that were fine with the two that were not.
+        self.assertEqual(ensured, [0])
 
         self.assertEqual(set(datasets), {
             "arrivalsDepartures", "breakfast", "parking", "roomRevenue", "payments",
