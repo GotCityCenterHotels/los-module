@@ -72,6 +72,11 @@ MAX_RANGE_DAYS = int(os.environ.get("MAX_QUERY_RANGE_DAYS", "400"))
 # repeats within a single sitting without holding a stale answer past the point
 # anyone would notice. The sibling cost routes already sit at 120-300.
 COST_DATA_MAX_AGE_SECONDS = int(os.environ.get("COST_DATA_MAX_AGE_SECONDS", "60"))
+# Matches the server-side TTL in services/hotels_service.py and the browser-side
+# one in frontend/los-api.js, so all three agree on how long a hotel list stands.
+HOTEL_LIST_MAX_AGE_SECONDS = int(
+    os.environ.get("HOTEL_LIST_MAX_AGE_SECONDS", "300")
+)
 
 
 def validate_range_span(start_date: date, end_date: date):
@@ -360,7 +365,15 @@ def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
     try:
         hotels = fetch_hotels(start_date, end_date, ly_comparison_basis)
 
-        return compressed_json_response(
+        # Both pages ask for this the moment they load, and the answer is already
+        # held for five minutes on the server and another five in the browser's
+        # own store - but without a validator or a max-age the request itself was
+        # still made every time, and answered with the full body. There is no
+        # publication to name here (the raw-source path has none, and the read
+        # model path does not surface its run_id through fetch_hotels), so the
+        # body is its own validator: a repeat inside the window costs nothing,
+        # and a repeat after it costs a 304.
+        return content_hash_response(
             req,
             {
                 "parameters": {
@@ -370,6 +383,8 @@ def los_hotels(req: func.HttpRequest) -> func.HttpResponse:
                 },
                 "data": hotels,
             },
+            "los-hotels",
+            HOTEL_LIST_MAX_AGE_SECONDS,
         )
     except (LosReadModelUnavailableError, LosSchemaError) as error:
         return json_response({"error": str(error)}, 503)

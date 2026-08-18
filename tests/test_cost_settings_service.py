@@ -231,6 +231,60 @@ class CostSettingsValidationTests(unittest.TestCase):
         local_lookup.assert_called_once_with(preloaded["enterpriseId"])
         source_lookup.assert_not_called()
 
+    def test_the_bootstrap_writes_only_drop_the_rulebook_once_committed(self):
+        # A caller-supplied connection is still mid-transaction inside the
+        # bootstrap writers, so dropping the cached rulebook there would let a
+        # concurrent reader refill it from the pre-write state and hold that for
+        # the whole window. Only the owner of the commit may invalidate.
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def executemany(self, sql, parameters): pass
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self): return Cursor()
+
+        class Pool:
+            def connection(self): return Connection()
+
+        properties = [{"enterpriseId": "property-99", "hotelName": "Hotel Z"}]
+        sentinel = ("never-expires", {"Hotel Z": "cached"})
+
+        def prime():
+            cost_settings_service._all_settings_cache["settings"] = (
+                float("inf"), sentinel[1]
+            )
+
+        for writer in (
+            cost_settings_service._upsert_mirrored_properties,
+            cost_settings_service._preload_property_settings,
+        ):
+            with patch.object(
+                cost_settings_service, "ensure_cost_settings_schema",
+            ), patch.object(cost_settings_service, "cost_pool", Pool()):
+                cost_settings_service._reset_property_memo()
+                prime()
+                writer(properties, connection=Connection())
+                self.assertIn(
+                    "settings",
+                    cost_settings_service._all_settings_cache,
+                    f"{writer.__name__} invalidated before its caller committed",
+                )
+
+                cost_settings_service._reset_property_memo()
+                prime()
+                writer(properties)
+                self.assertNotIn(
+                    "settings",
+                    cost_settings_service._all_settings_cache,
+                    f"{writer.__name__} owned the commit but kept a stale rulebook",
+                )
+
+        cost_settings_service._invalidate_all_cost_settings()
+        cost_settings_service._reset_property_memo()
+
     def test_property_preload_inserts_defaults_without_overwriting_settings(self):
         class Cursor:
             def __enter__(self): return self
@@ -522,6 +576,13 @@ class MoneyRoundingTests(unittest.TestCase):
 class BulkCostSettingsTests(unittest.TestCase):
     """The dashboard costs every property in one round trip."""
 
+    def setUp(self):
+        # The rulebook is cached per worker for a window, so one test's mocked
+        # result would otherwise be served to the next one.
+        cost_settings_service._invalidate_all_cost_settings()
+
+    tearDown = setUp
+
     class Cursor:
         def __init__(self, results):
             self.results = results
@@ -585,6 +646,55 @@ class BulkCostSettingsTests(unittest.TestCase):
         self.assertEqual(result["Hotel A"]["breakfastTiers"][0]["maxGuests"], 30)
         # enterprise_id is the join key, not part of the payload.
         self.assertNotIn("enterpriseId", result["Hotel A"]["profile"])
+
+    def test_the_rulebook_is_reused_inside_its_window_and_dropped_on_a_write(self):
+        # The dashboard asks for this on every facts request, twice per view. The
+        # rulebook only moves when somebody saves it, so the repeat must not cost
+        # another seven round trips - and a save must not be able to leave the
+        # dashboard costing facts with the previous rulebook.
+        cursor = self.Cursor([
+            [{"enterprise_id": "p-1", "hotel_name": "Hotel A", "currency": "SEK"}],
+        ])
+
+        class Pool:
+            def connection(inner): return BulkCostSettingsTests.Connection(cursor)
+
+        with patch.object(
+            cost_settings_service, "ensure_cost_settings_schema",
+        ), patch.object(cost_settings_service, "cost_pool", Pool()):
+            first = cost_settings_service.fetch_all_cost_settings()
+            queries_for_one_build = len(cursor.executed)
+            second = cost_settings_service.fetch_all_cost_settings()
+
+            self.assertEqual(sorted(second), ["Hotel A"])
+            self.assertEqual(second, first)
+            self.assertEqual(len(cursor.executed), queries_for_one_build)
+
+            # A rebuild is one round trip per collection, so the window is
+            # saving something worth saving.
+            self.assertGreater(queries_for_one_build, 1)
+
+            cost_settings_service._invalidate_all_cost_settings()
+            cost_settings_service.fetch_all_cost_settings()
+            self.assertEqual(len(cursor.executed), queries_for_one_build * 2)
+
+    def test_the_top_level_mapping_handed_out_is_not_the_cached_one(self):
+        # Two callers must not be able to see each other's edits to the mapping.
+        cursor = self.Cursor([
+            [{"enterprise_id": "p-1", "hotel_name": "Hotel A", "currency": "SEK"}],
+        ])
+
+        class Pool:
+            def connection(inner): return BulkCostSettingsTests.Connection(cursor)
+
+        with patch.object(
+            cost_settings_service, "ensure_cost_settings_schema",
+        ), patch.object(cost_settings_service, "cost_pool", Pool()):
+            first = cost_settings_service.fetch_all_cost_settings()
+            del first["Hotel A"]
+            self.assertEqual(
+                sorted(cost_settings_service.fetch_all_cost_settings()), ["Hotel A"]
+            )
 
     def test_every_collection_is_read_in_the_mews_category_ordering(self):
         cursor = self.Cursor([[], [], [], [], []])

@@ -448,6 +448,13 @@ def _upsert_mirrored_properties(properties, connection=None):
                     for property_row in properties
                 ],
             )
+    if connection is None:
+        # Ours to commit, and cost_pool.connection() has just done so. The
+        # rulebook is keyed by hotel name and joins this table, so a property
+        # arriving or being renamed changes it. A caller-supplied connection is
+        # still mid-transaction here, so that case is invalidated by whoever
+        # owns the commit - see fetch_cost_settings.
+        _invalidate_all_cost_settings()
     remember()
 
 
@@ -505,6 +512,10 @@ def _preload_property_settings(properties, connection=None):
                     for property_row in properties
                 ],
             )
+    if connection is None:
+        # A property with no profile row is absent from the rulebook entirely.
+        # Caller-supplied connections: see _upsert_mirrored_properties.
+        _invalidate_all_cost_settings()
     remember()
 
 
@@ -740,6 +751,12 @@ def fetch_cost_settings(enterprise_id, hotel_name=None):
             )
         rows = _read_cost_settings(connection, enterprise_id)
 
+    if bootstrap_property is not None:
+        # The two bootstrap writes above ran on this connection, so this is the
+        # first point at which they are committed and the cached rulebook can be
+        # dropped without a concurrent reader refilling it from the old state.
+        _invalidate_all_cost_settings()
+
     profile_row = rows["profile"]
     profile = dict(DEFAULT_PROFILE)
     if profile_row:
@@ -806,7 +823,57 @@ COLLECTION_QUERIES = {
 }
 
 
+# The Cost Data dashboard asks for the whole rulebook on every facts request, and
+# the page makes two of those for one view - the selected range and the same
+# range a year back - plus another pair whenever the comparison is toggled or its
+# basis changed. Rebuilding it each time cost seven sequential round trips to
+# answer a question whose answer had not moved: the rulebook only changes when
+# somebody saves it in the editor.
+#
+# The window is deliberately the one the facts route already advertises to the
+# browser (Cache-Control: max-age on /api/costdata/facts), so a rulebook served
+# from here is never staler than the response that route already allowed the
+# browser to reuse. A save on THIS worker drops the entry outright, which is what
+# keeps the edit-then-reload path exact; the window is what bounds a save made on
+# another instance, and a rename arriving from the hotel dimension sync.
+_ALL_SETTINGS_CACHE_SECONDS = float(
+    os.environ.get("COST_SETTINGS_CACHE_SECONDS", "60")
+)
+_all_settings_cache = {}
+_all_settings_lock = Lock()
+
+
+def _invalidate_all_cost_settings():
+    """Drop the cached rulebook. Every writer in this module calls this."""
+    with _all_settings_lock:
+        _all_settings_cache.clear()
+
+
 def fetch_all_cost_settings():
+    """The whole rulebook, from cache when it is still inside its window.
+
+    The mapping is shared with every caller for that window, so treat it as
+    read-only. The top level is copied on the way out - enough that a caller
+    cannot add or drop a property from the cached copy - but the per-property
+    dictionaries and their lists are the cached objects themselves.
+    """
+    now = monotonic()
+    with _all_settings_lock:
+        cached = _all_settings_cache.get("settings")
+        if cached is not None and now < cached[0]:
+            return dict(cached[1])
+
+    settings_by_hotel = _read_all_cost_settings()
+
+    with _all_settings_lock:
+        _all_settings_cache["settings"] = (
+            monotonic() + _ALL_SETTINGS_CACHE_SECONDS,
+            settings_by_hotel,
+        )
+    return dict(settings_by_hotel)
+
+
+def _read_all_cost_settings():
     """Every property's saved cost rulebook, keyed by hotel name.
 
     The Cost Data dashboard costs facts that are keyed by hotel name, across
@@ -1482,4 +1549,7 @@ def save_cost_settings(enterprise_id, payload):
                 )
             cursor.executemany("INSERT INTO functions.cost_arrival_staffing_tiers (enterprise_id, min_arrivals, max_arrivals, reception_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minArrivals"], r["maxArrivals"], r["receptionHours"], i) for i,r in enumerate(data["arrivalTiers"])])
             cursor.executemany("INSERT INTO functions.cost_breakfast_staffing_tiers (enterprise_id, min_guests, max_guests, staff_hours, sort_order) VALUES (%s,%s,%s,%s,%s)", [(data["enterpriseId"], r["minGuests"], r["maxGuests"], r["staffHours"], i) for i,r in enumerate(data["breakfastTiers"])])
+    # Saving is the only thing that moves the rulebook deliberately, so the
+    # dashboard must not be served a window's worth of the previous one.
+    _invalidate_all_cost_settings()
     return fetch_cost_settings(data["enterpriseId"], data["hotelName"])
