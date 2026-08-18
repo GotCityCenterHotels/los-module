@@ -216,6 +216,20 @@ test("cleaning is weighted by the rooms actually vacated, not by row count", () 
         false,
         "the mix removes the caveat rather than sitting beside it"
     );
+
+    // The API pre-aggregates this mix over the selected period. Dropping the
+    // unused day dimension must produce the exact same weighted rate.
+    const periodMix = {
+        ...data,
+        cleaningDepartures: [
+            { hotelName: "A", categoryName: "Double", occupancy: 1, departures: 45 },
+            { hotelName: "A", categoryName: "Double", occupancy: 2, departures: 5 }
+        ]
+    };
+    assert.equal(
+        lineFor(CostData.calculateGop(periodMix, { settingsByHotel: settings }), "cleaningCost"),
+        lineFor(statement, "cleaningCost")
+    );
 });
 
 test("a guest count above every configured row takes the nearest one below it", () => {

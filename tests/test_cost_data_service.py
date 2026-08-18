@@ -117,7 +117,6 @@ class CostDataServiceTests(unittest.TestCase):
             }],
             "cleaningDepartures": [{
                 "hotel_name": "Hotel A",
-                "stay_date": date(2026, 1, 2),
                 "category_name": "Double",
                 "occupancy": 2,
                 "departures": 4,
@@ -177,6 +176,7 @@ class CostDataServiceTests(unittest.TestCase):
         # round differently there than the statement rounds here.
         self.assertEqual(datasets["cleaningDepartures"][0]["categoryName"], "Double")
         self.assertEqual(datasets["cleaningDepartures"][0]["occupancy"], 2)
+        self.assertNotIn("stayDate", datasets["cleaningDepartures"][0])
         self.assertEqual(datasets["distributionRates"][0]["matchedPercent"], "12.5000")
         self.assertEqual(datasets["distributionRates"][0]["mixRevenue"], "500.00")
 
@@ -187,6 +187,30 @@ class CostDataServiceTests(unittest.TestCase):
             self.assertIn("stay_date BETWEEN", query)
             self.assertEqual(parameters["start_date"], date(2026, 1, 1))
             self.assertEqual(parameters["end_date"], date(2026, 1, 31))
+
+        distribution_query = cost_data_service.COST_DATA_QUERIES[
+            "distributionRates"
+        ]
+        self.assertIn("priced AS MATERIALIZED", distribution_query)
+        self.assertNotIn("IS NOT DISTINCT FROM mix", distribution_query)
+        for field in ("origin", "travel_agency", "rate_name"):
+            self.assertIn(
+                f"coalesce(priced.{field}, '') = coalesce(mix.{field}, '')",
+                distribution_query,
+            )
+            self.assertIn(
+                f"(priced.{field} IS NULL) = (mix.{field} IS NULL)",
+                distribution_query,
+            )
+
+        cleaning_query = cost_data_service.COST_DATA_QUERIES[
+            "cleaningDepartures"
+        ]
+        self.assertIn(
+            "GROUP BY hotel.hotel_name, fact.category_name, fact.occupancy",
+            cleaning_query,
+        )
+        self.assertNotIn("GROUP BY hotel.hotel_name, stay_date", cleaning_query)
 
     def test_identical_requests_share_the_cached_result(self):
         calls = []

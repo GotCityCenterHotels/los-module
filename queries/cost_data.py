@@ -84,15 +84,17 @@ COST_DATA_QUERIES = {
             coalesce(nullif(trim(amount_currency), ''), 'Unspecified')
         ORDER BY stay_date, hotel.hotel_name, amount_currency
     """,
-    # How a day's departures split across room category and guest count, which is
-    # exactly the pair the cleaning rulebook is written per. The page multiplies
-    # the authoritative departure count from arr_dep_data by the cost per
-    # departure this mix implies, so the split can be slightly out without moving
-    # the number of departures being charged for.
+    # How the selected period's departures split across room category and guest
+    # count, which is exactly the pair the cleaning rulebook is written per. The
+    # page uses these rows only to calculate one weighted rate for the period; it
+    # never reads their dates. Aggregating here avoids returning the same
+    # category/occupancy pair once per day (16,959 rows for a production year)
+    # and gives the browser the identical weights in a few dozen rows instead.
+    # The authoritative departure count still comes from arr_dep_data, so the
+    # mix can be slightly out without moving the number of rooms being charged.
     "cleaningDepartures": f"""
         SELECT
             hotel.hotel_name,
-            stay_date,
             fact.category_name,
             fact.occupancy,
             sum(fact.departures)::bigint AS departures,
@@ -100,8 +102,8 @@ COST_DATA_QUERIES = {
         FROM functions.departure_mix_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
         WHERE {DATE_PREDICATE}
-        GROUP BY hotel.hotel_name, stay_date, fact.category_name, fact.occupancy
-        ORDER BY stay_date, hotel.hotel_name, fact.category_name, fact.occupancy
+        GROUP BY hotel.hotel_name, fact.category_name, fact.occupancy
+        ORDER BY hotel.hotel_name, fact.category_name, fact.occupancy
     """,
     # The revenue-weighted distribution percentage for each hotel and day.
     #
@@ -140,7 +142,11 @@ COST_DATA_QUERIES = {
             SELECT DISTINCT enterprise_id, origin, travel_agency, rate_name
             FROM mix
         ),
-        priced AS (
+        -- MATERIALIZED is load-bearing. Without it PostgreSQL inlines this CTE
+        -- under the final daily-row join and executes the lateral rule lookup
+        -- once per hotel/day/combination row. A production-year plan priced
+        -- 28,848 rows instead of the 989 distinct combinations above.
+        priced AS MATERIALIZED (
             SELECT
                 combination.enterprise_id,
                 combination.origin,
@@ -224,9 +230,17 @@ COST_DATA_QUERIES = {
         FROM mix
         JOIN priced
           ON priced.enterprise_id = mix.enterprise_id
-         AND priced.origin IS NOT DISTINCT FROM mix.origin
-         AND priced.travel_agency IS NOT DISTINCT FROM mix.travel_agency
-         AND priced.rate_name IS NOT DISTINCT FROM mix.rate_name
+         -- IS NOT DISTINCT FROM has the right null semantics here but cannot
+         -- drive a hash join. Pairing coalesce equality with an explicit null
+         -- flag is exactly equivalent (including null versus empty text) and
+         -- lets PostgreSQL hash the 989 priced combinations against the daily
+         -- rows instead of testing millions of pairs.
+         AND coalesce(priced.origin, '') = coalesce(mix.origin, '')
+         AND (priced.origin IS NULL) = (mix.origin IS NULL)
+         AND coalesce(priced.travel_agency, '') = coalesce(mix.travel_agency, '')
+         AND (priced.travel_agency IS NULL) = (mix.travel_agency IS NULL)
+         AND coalesce(priced.rate_name, '') = coalesce(mix.rate_name, '')
+         AND (priced.rate_name IS NULL) = (mix.rate_name IS NULL)
         GROUP BY mix.hotel_name, mix.stay_date
         ORDER BY mix.stay_date, mix.hotel_name
     """,
