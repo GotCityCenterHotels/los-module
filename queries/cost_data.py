@@ -84,26 +84,25 @@ COST_DATA_QUERIES = {
             coalesce(nullif(trim(amount_currency), ''), 'Unspecified')
         ORDER BY stay_date, hotel.hotel_name, amount_currency
     """,
-    # How the selected period's departures split across room category and guest
-    # count, which is exactly the pair the cleaning rulebook is written per. The
-    # page uses these rows only to calculate one weighted rate for the period; it
-    # never reads their dates. Aggregating here avoids returning the same
-    # category/occupancy pair once per day (16,959 rows for a production year)
-    # and gives the browser the identical weights in a few dozen rows instead.
-    # The authoritative departure count still comes from arr_dep_data, so the
-    # mix can be slightly out without moving the number of rooms being charged.
-    "cleaningDepartures": f"""
+    # One reservation cleaning allocated evenly across all of its occupied
+    # nights.  The date is deliberately retained: dropping it was what made the
+    # chart charge a multi-night stay entirely to its departure bucket.
+    "cleaningAllocations": f"""
         SELECT
             hotel.hotel_name,
+            fact.stay_date,
             fact.category_name,
             fact.occupancy,
-            sum(fact.departures)::bigint AS departures,
+            sum(fact.allocated_cleanings) AS allocated_cleanings,
             max(fact.last_updated_at) AS last_updated_at
         FROM functions.departure_mix_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
         WHERE {DATE_PREDICATE}
-        GROUP BY hotel.hotel_name, fact.category_name, fact.occupancy
-        ORDER BY hotel.hotel_name, fact.category_name, fact.occupancy
+          AND fact.allocated_cleanings IS NOT NULL
+        GROUP BY hotel.hotel_name, fact.stay_date,
+                 fact.category_name, fact.occupancy
+        ORDER BY fact.stay_date, hotel.hotel_name,
+                 fact.category_name, fact.occupancy
     """,
     # The revenue-weighted distribution percentage for each hotel and day.
     #

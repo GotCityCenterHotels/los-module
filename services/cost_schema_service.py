@@ -52,6 +52,10 @@ MIGRATIONS = (
         "017_cost_publication",
         APP_ROOT / "sql" / "migrations" / "017_cost_publication.sql",
     ),
+    (
+        "018_cleaning_night_allocation",
+        APP_ROOT / "sql" / "migrations" / "018_cleaning_night_allocation.sql",
+    ),
 )
 
 _schema_ready = False

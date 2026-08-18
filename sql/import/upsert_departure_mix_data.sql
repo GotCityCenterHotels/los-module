@@ -6,7 +6,7 @@ INSERT INTO functions.departure_mix_data (
     resource_category_id,
     category_name,
     occupancy,
-    departures,
+    allocated_cleanings,
     first_inserted_at,
     last_seen_at,
     last_updated_at
@@ -19,7 +19,7 @@ VALUES (
     %(resource_category_id)s,
     %(category_name)s,
     %(occupancy)s,
-    %(departures)s,
+    %(allocated_cleanings)s,
     now(),
     now(),
     now()
@@ -31,7 +31,7 @@ ON CONFLICT (departure_mix_data_key) DO UPDATE SET
     resource_category_id = EXCLUDED.resource_category_id,
     category_name = EXCLUDED.category_name,
     occupancy = EXCLUDED.occupancy,
-    departures = EXCLUDED.departures,
+    allocated_cleanings = EXCLUDED.allocated_cleanings,
     -- Stamped on every touch, seen or unseen. The importer prunes on it: a
     -- (category, occupancy) that no longer has departures on a day has no row
     -- here to overwrite, so it would otherwise keep its old count for good and
@@ -46,7 +46,7 @@ ON CONFLICT (departure_mix_data_key) DO UPDATE SET
                 functions.departure_mix_data.resource_category_id,
                 functions.departure_mix_data.category_name,
                 functions.departure_mix_data.occupancy,
-                functions.departure_mix_data.departures
+                functions.departure_mix_data.allocated_cleanings
             ) IS DISTINCT FROM (
                 EXCLUDED.enterprise_id,
                 EXCLUDED.hotel_name,
@@ -54,7 +54,7 @@ ON CONFLICT (departure_mix_data_key) DO UPDATE SET
                 EXCLUDED.resource_category_id,
                 EXCLUDED.category_name,
                 EXCLUDED.occupancy,
-                EXCLUDED.departures
+                EXCLUDED.allocated_cleanings
             )
             THEN now()
             ELSE functions.departure_mix_data.last_updated_at

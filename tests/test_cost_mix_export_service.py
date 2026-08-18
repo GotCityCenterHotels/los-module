@@ -132,30 +132,23 @@ class DepartureMixExportTests(unittest.TestCase):
             self.build(columns, {**self.TYPES, **reservation_types})
         )
 
-    def test_it_counts_departures_exactly_as_the_departure_total_does(self):
+    def test_it_splits_one_cleaning_evenly_across_occupied_nights(self):
         query = sql_of(self.build(FULL_MIRROR))
 
-        # Same relation, same filter, same distinct-reservation count, same
-        # enterprise join as sql/export/arr_dep_data.sql - only partitioned by two
-        # more dimensions. That is what makes this mix sum to total_departures by
-        # construction rather than by coincidence. It was built from
-        # reservation_current first, which could not promise that.
+        # The room-night relation provides both the occupied date and the stay
+        # length. Every reservation contributes 1 / nights on every night.
         self.assertIn('FROM "staging"."room_nights_source" nights', query)
-        # The distinct-reservation count is split across the collapsing CTE and
-        # the count over it: SELECT DISTINCT reduces the room nights to one row per
-        # reservation per departure date - which is the grouping arr_dep_data.sql
-        # counts distinct reservations within - and this counts them.
         self.assertIn('nights."reservation_id" AS reservation_key', query)
-        self.assertIn("count(DISTINCT reservation_key)::int AS departures", query)
-        self.assertIn("trim(enterprise.name) = departing.hotel_name", query)
+        self.assertIn("count(*)::numeric AS stay_nights", query)
+        self.assertIn("sum(1::numeric / stay_nights) AS allocated_cleanings", query)
+        self.assertIn("trim(enterprise.name) = occupied.hotel_name", query)
         self.assertIn('trim(nights."hotel_name") AS hotel_name', query)
         self.assertIn('AND nights."canceled_utc" IS NULL', query)
-        # Departure date, not arrival: cleaning is charged when the room is
-        # vacated, and end_utc in Stockholm time is what arr_dep_data uses.
         self.assertIn(
-            "(nights.\"end_utc\" AT TIME ZONE 'Europe/Stockholm')::date", query
+            "(nights.\"night_start_utc\" AT TIME ZONE 'Europe/Stockholm')::date",
+            query,
         )
-        self.assertNotIn("count(*)::int AS departures", query)
+        self.assertNotIn("AS departures", query)
 
         # The category NAME still comes from resource_category_current, not from
         # the view's own requested_space_name. The view reads it out of
@@ -266,13 +259,13 @@ class DepartureMixExportTests(unittest.TestCase):
         matching = self._lean_nights()
         self.assertIn(
             "JOIN reservation_current reservation "
-            "ON reservation.id = departing.reservation_key",
+            "ON reservation.id = occupied.reservation_key",
             matching,
         )
 
         differing = self._lean_nights(reservation_id="text")
         self.assertIn(
-            "ON reservation.id::text = departing.reservation_key::text", differing
+            "ON reservation.id::text = occupied.reservation_key::text", differing
         )
 
     def test_the_guest_count_is_settled_before_the_rows_are_grouped(self):
@@ -281,7 +274,8 @@ class DepartureMixExportTests(unittest.TestCase):
         # were not there. Classify, then group.
         query = sql_of(self.build(FULL_MIRROR))
 
-        self.assertIn("WITH departing AS (", query)
+        self.assertIn("WITH occupied_nights AS (", query)
+        self.assertIn("stay_lengths AS (", query)
         self.assertIn("SELECT DISTINCT", query)
         self.assertIn(") classified", query)
         self.assertTrue(
@@ -293,7 +287,7 @@ class DepartureMixExportTests(unittest.TestCase):
         # Returning None is the whole safety property: an UndefinedColumn here
         # would fail the nightly import and take the five working datasets with
         # it, and the page has a documented fallback for a missing mix.
-        for missing in ("end_utc", "hotel_name", "reservation_id"):
+        for missing in ("night_start_utc", "hotel_name", "reservation_id"):
             columns = dict(FULL_MIRROR)
             columns["staging.room_nights_source"] = NIGHTS_VIEW - {missing}
             cost_source_service._reset_column_cache()

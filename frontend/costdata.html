@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data</title>
-    <link rel="stylesheet" href="styles.css?v=8de8db331c">
+    <link rel="stylesheet" href="styles.css?v=ea6c764e47">
 </head>
 <body>
     <main class="container cost-workspace">
@@ -103,17 +103,20 @@
                 <div>
                     <h2 id="gopChartTitle">Cost against revenue</h2>
                 </div>
+                <button type="button" id="gopChartReset" class="chart-reset" hidden>
+                    Reset view
+                </button>
                 <div class="gop-heading-actions">
-                    <!-- Last year is fetched only when this is switched on: the
-                         page's default range is a year to date, so loading it with
-                         every update would double the cost of a query most
-                         readings never compare. -->
-                    <label class="chart-toggle">
-                        <input type="checkbox" id="gopChartShowLy">
-                        <span>Show last year</span>
-                    </label>
+                    <div class="chart-comparison-buttons" role="group" aria-label="Comparison view">
+                        <button type="button" id="gopChartShowLyFinal" aria-pressed="false">
+                            Show LY Final
+                        </button>
+                        <button type="button" id="gopChartShowSpit" aria-pressed="false">
+                            Show SPIT
+                        </button>
+                    </div>
                     <div class="chart-grain">
-                        <label for="gopChartLyBasis">Compare</label>
+                        <label for="gopChartLyBasis">Align</label>
                         <select id="gopChartLyBasis" disabled>
                             <option value="sameDate" selected>Same date</option>
                             <option value="sameWeekday">Same weekday</option>
@@ -139,13 +142,16 @@
                         <span role="listitem"><i class="legend-swatch gop-legend-profit"></i>Profit</span>
                         <span role="listitem"><i class="legend-swatch gop-legend-loss"></i>Loss</span>
                         <span role="listitem"><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
-                        <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-base"></i>Last year cost</span>
-                        <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-revenue"></i>Last year revenue</span>
+                        <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-base"></i><span id="gopComparisonCostLabel">LY Final cost</span></span>
+                        <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-revenue"></i><span id="gopComparisonRevenueLabel">LY Final revenue</span></span>
                     </div>
                 </div>
             </div>
 
-            <div id="gopChart" class="los-chart gop-chart"></div>
+            <div class="gop-chart-viewport">
+                <div id="gopChart" class="los-chart gop-chart"></div>
+                <div id="gopChartTimeline" class="gop-chart-timeline" aria-label="Zoom chart by week or month"></div>
+            </div>
             <p class="gop-chart-note" id="gopChartNote">
                 One bar per <strong>Group by</strong> period. Bar height is what the
                 period cost to run; the marker is the revenue it earned.
@@ -181,7 +187,7 @@
 
     <script src="los-api.js?v=9b170a3022"></script>
     <script src="los-format.js?v=15781a9639"></script>
-    <script src="costdata-data.js?v=4e421788db"></script>
-    <script src="costdata.js?v=4c93b6a326"></script>
+    <script src="costdata-data.js?v=361a52d16b"></script>
+    <script src="costdata.js?v=e2511c9699"></script>
 </body>
 </html>

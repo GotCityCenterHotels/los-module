@@ -1,20 +1,22 @@
 """Export statements for the two reservation-level cost mixes.
 
-The Cost Data page charges cleaning per departure and distribution as a
-percentage of room revenue. Until these two datasets existed it had only
+The Cost Data page charges one cleaning per reservation, allocated evenly over
+its occupied nights, and distribution as a percentage of room revenue. Until
+these two datasets existed it had only
 hotel-per-day totals, so it blended every configured cleaning row into a single
 mean per departure and could apply nothing but the fallback distribution
 percentage - and said so, in two flags on the statement that nobody could act on.
 
 Both datasets are a MIX, not a level:
 
-  * departure_mix_data splits a day's departures across (room category, guests);
+  * departure_mix_data allocates reservation cleanings across occupied nights,
+    room category, and guests;
   * distribution_mix_data splits a day's room revenue across (origin, travel
     agency, rate).
 
-The authoritative totals stay in functions.arr_dep_data and
-functions.room_revenue_night_data, and the statement keeps reading them, so a mix
-that is slightly out cannot move a total - only how that total is apportioned.
+The revenue total stays in functions.room_revenue_night_data. Cleaning is read
+directly from its allocation because its date is part of the requested result:
+using the departure total would put the entire cost back on checkout day.
 
 Every source column here is resolved from information_schema rather than
 assumed, the same way services/cost_source_service.py resolves the picker
@@ -55,22 +57,13 @@ from shared.mews_source import rate_name_lateral
 # period older than this falls back to the previous behaviour and says so.
 MIX_WINDOW_DAYS = int(os.environ.get("COST_MIX_WINDOW_DAYS", "730"))
 
-# The departure mix is derived from the same relation as the departure TOTAL it
-# apportions: staging.room_nights_source, filtered on canceled_utc, with the
-# departure date taken from end_utc in Stockholm time and one departure counted
-# per distinct reservation. That is sql/export/arr_dep_data.sql exactly, only
-# partitioned further - so the mix sums to total_departures by construction
-# instead of by coincidence.
-#
-# It was built from reservation_current first, which was wrong: a mix drawn from
-# a different relation than the total can disagree with it, and a weighting that
-# disagrees with the thing it weights is not a weighting.
-# Two names for the same shape. sql/export/arr_dep_data.sql reads
-# staging.room_nights_source and this mix has to agree with it, so that one is
-# tried first; staging.room_nights_current is the view behind it and carries the
-# same columns. Resolved rather than picked, because a deployment may have only one.
+# The cleaning allocation is derived from the room-night relation itself. One
+# reservation contributes 1 / occupied-night-count to every occupied date, so
+# its shares always add back to exactly one cleaning. Two names expose the same
+# shape; source is preferred because that is also the relation behind the other
+# Cost Data movement facts.
 NIGHTS_TABLES = ("staging.room_nights_source", "staging.room_nights_current")
-NIGHTS_END_COLUMNS = ("end_utc",)
+NIGHTS_NIGHT_COLUMNS = ("night_start_utc", "stay_date")
 NIGHTS_CANCELED_COLUMNS = ("canceled_utc", "cancelled_utc")
 NIGHTS_HOTEL_COLUMNS = ("hotel_name",)
 # staging.room_nights_source.reservation_id is the foreign key to
@@ -347,30 +340,27 @@ def _departure_dimensions(source, nights_table):
 
 
 def build_departure_mix_export(source):
-    """Departures per hotel, day, room category and guest count.
+    """Allocated reservation cleanings by occupied night, category and guests.
 
-    Derived from staging.room_nights_source with exactly the filter and the
-    distinct-reservation count that sql/export/arr_dep_data.sql uses for
-    total_departures, so this mix sums to that total rather than to something
-    close to it. Only the two extra dimensions - room category and guest count -
-    come from anywhere else.
+    A reservation contributes one cleaning in total.  A three-night stay writes
+    one third to each of its three dates, which keeps the total unchanged while
+    making daily, weekly and monthly chart buckets honest.
 
     Returns {"export_sql", "prune_sql"}, or None when this mirror cannot answer
-    the question - in which case the Cost Data page keeps its blended
-    per-departure rate and the flag that explains it.
+    the question - in which case the Cost Data page keeps its departure-date
+    fallback and explains it.
     """
     nights_table = _resolve_table(source, NIGHTS_TABLES)
     if nights_table is None:
         logging.warning(
-            "Departure mix unavailable: none of %s exists, and it is the relation "
-            "arr_dep_data.sql counts total_departures from. Cleaning cost keeps "
-            "its flat average per departure.",
+            "Cleaning allocation unavailable: none of %s exists. Cleaning cost "
+            "keeps its departure-date fallback.",
             list(NIGHTS_TABLES),
         )
         return None
 
-    end_column = _resolve_column(
-        source, nights_table, NIGHTS_END_COLUMNS, required=False
+    night_column = _resolve_column(
+        source, nights_table, NIGHTS_NIGHT_COLUMNS, required=False
     )
     hotel_column = _resolve_column(
         source, nights_table, NIGHTS_HOTEL_COLUMNS, required=False
@@ -384,24 +374,27 @@ def build_departure_mix_export(source):
     category, category_label, occupancy, needs_reservation = _departure_dimensions(
         source, nights_table
     )
-    if not (end_column and hotel_column and reservation_key and category_name
+    if not (night_column and hotel_column and reservation_key and category_name
             and category and occupancy):
         logging.warning(
-            "Departure mix unavailable: table=%s end=%s hotel=%s "
+            "Cleaning allocation unavailable: table=%s night=%s hotel=%s "
             "reservation_key=%s category_name=%s category=%s occupancy=%s. "
-            "Cleaning cost keeps its flat average per departure.",
-            nights_table, end_column, hotel_column, reservation_key,
+            "Cleaning cost keeps its departure-date fallback.",
+            nights_table, night_column, hotel_column, reservation_key,
             category_name, category_label, bool(occupancy),
         )
         return None
     logging.info(
-        "Departure mix reads %s, category from %s, joining reservation_current: %s",
+        "Cleaning allocation reads %s, category from %s, joining reservation_current: %s",
         nights_table, category_label, needs_reservation,
     )
 
-    departure_date = SQL("(nights.{} {})::date").format(
-        Identifier(end_column), STOCKHOLM
-    )
+    if night_column == "stay_date":
+        occupied_date = SQL("nights.{}::date").format(Identifier(night_column))
+    else:
+        occupied_date = SQL("(nights.{} {})::date").format(
+            Identifier(night_column), STOCKHOLM
+        )
 
     # Where the two extra dimensions are read, which decides both what the
     # collapsing CTE has to carry out of the room nights and whether the join into
@@ -412,7 +405,7 @@ def build_departure_mix_export(source):
             _key_comparison(
                 source,
                 SQL("reservation.id"), "reservation_current", "id",
-                SQL("departing.reservation_key"), nights_table, reservation_key,
+                SQL("occupied.reservation_key"), nights_table, reservation_key,
             )
         )
         category_reference = category
@@ -424,34 +417,30 @@ def build_departure_mix_export(source):
             ", {category} AS category_key, {occupancy} AS occupancy"
         ).format(category=category, occupancy=occupancy)
         reservation_join = SQL("")
-        category_reference = SQL("departing.category_key")
-        occupancy_reference = SQL("departing.occupancy")
+        category_reference = SQL("occupied.category_key")
+        occupancy_reference = SQL("occupied.occupancy")
     canceled = _resolve_column(
         source, nights_table, NIGHTS_CANCELED_COLUMNS, required=False
     )
 
     export_sql = SQL("""
-        WITH departing AS (
-            -- One row per reservation per date it departs on, before anything is
-            -- joined or counted. room_nights_source holds a row per room NIGHT,
-            -- so without this the guest-count expression below - which can be a
-            -- sum over a PersonCounts list - would be evaluated once per night of
-            -- every stay instead of once per departure.
-            --
-            -- DISTINCT rather than one row per reservation: arr_dep_data.sql
-            -- groups on each row's own end_utc date and counts the reservation in
-            -- every date group it appears in, so a stay whose rows carry more than
-            -- one end_utc is counted on each. Collapsing to max(end_utc) here
-            -- would quietly stop this mix summing to that total.
+        WITH occupied_nights AS (
+            -- Exactly one row per reservation and occupied date. Duplicate item
+            -- rows must not make a three-night stay look like four nights.
             SELECT DISTINCT
                 nights.{reservation_key} AS reservation_key,
                 trim(nights.{hotel_column}) AS hotel_name,
-                {departure_date} AS stay_date
+                {occupied_date} AS stay_date
                 {nights_extra}
             FROM {nights_table} nights
-            WHERE nights.{end_column} IS NOT NULL
+            WHERE nights.{night_column} IS NOT NULL
               {canceled}
-              AND {departure_date} >= {window}
+              AND {occupied_date} >= {window}
+        ),
+        stay_lengths AS (
+            SELECT reservation_key, hotel_name, count(*)::numeric AS stay_nights
+            FROM occupied_nights
+            GROUP BY reservation_key, hotel_name
         )
         SELECT
             md5(concat_ws(
@@ -467,7 +456,7 @@ def build_departure_mix_export(source):
             mix.resource_category_id,
             mix.category_name,
             mix.occupancy,
-            mix.departures
+            mix.allocated_cleanings
         FROM (
             SELECT
                 enterprise_id,
@@ -476,24 +465,29 @@ def build_departure_mix_export(source):
                 resource_category_id,
                 category_name,
                 occupancy,
-                -- One departure per reservation, however many room nights it had.
-                count(DISTINCT reservation_key)::int AS departures
+                -- Every reservation contributes one cleaning in total. Splitting
+                -- that unit across its occupied nights makes the cost visible on
+                -- every date without changing the reservation total.
+                sum(1::numeric / stay_nights) AS allocated_cleanings
             FROM (
-                -- Classified before grouped, so the guest count - which for a
-                -- PersonCounts list is a scalar subquery - is evaluated once per
-                -- departure and not again as a grouping key.
+                -- Classified before grouped, so the guest-count expression is
+                -- evaluated once per occupied night and not again as a key.
                 SELECT
                     enterprise.id::text AS enterprise_id,
                     trim(enterprise.name)::text AS hotel_name,
-                    departing.stay_date AS stay_date,
-                    departing.reservation_key AS reservation_key,
+                    occupied.stay_date AS stay_date,
+                    occupied.reservation_key AS reservation_key,
+                    stay_lengths.stay_nights AS stay_nights,
                     category.id::text AS resource_category_id,
                     trim(category.{category_name})::text AS category_name,
                     {occupancy_reference} AS occupancy
-                FROM departing
+                FROM occupied_nights occupied
+                JOIN stay_lengths
+                  ON stay_lengths.reservation_key = occupied.reservation_key
+                 AND stay_lengths.hotel_name = occupied.hotel_name
                 JOIN enterprise_current enterprise
                   ON enterprise.tenant_key = 'GCCH'
-                 AND trim(enterprise.name) = departing.hotel_name
+                 AND trim(enterprise.name) = occupied.hotel_name
                 {reservation_join}
                 JOIN resource_category_current category
                   ON category.id::text = {category_reference}::text
@@ -503,7 +497,7 @@ def build_departure_mix_export(source):
         ) mix
         ORDER BY mix.hotel_name, mix.stay_date, mix.category_name, mix.occupancy
     """).format(
-        departure_date=departure_date,
+        occupied_date=occupied_date,
         category_name=Identifier(category_name),
         category_reference=category_reference,
         occupancy_reference=occupancy_reference,
@@ -512,7 +506,7 @@ def build_departure_mix_export(source):
         nights_table=table_identifier(nights_table),
         hotel_column=Identifier(hotel_column),
         reservation_join=reservation_join,
-        end_column=Identifier(end_column),
+        night_column=Identifier(night_column),
         canceled=(
             SQL("AND nights.{} IS NULL").format(Identifier(canceled))
             if canceled else SQL("")

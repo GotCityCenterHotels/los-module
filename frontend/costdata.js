@@ -68,11 +68,16 @@
         hotel: document.getElementById("costHotel"),
         grain: document.getElementById("costGrain"),
         chartGrain: document.getElementById("gopChartGrain"),
-        showLy: document.getElementById("gopChartShowLy"),
+        showLyFinal: document.getElementById("gopChartShowLyFinal"),
+        showSpit: document.getElementById("gopChartShowSpit"),
         lyBasis: document.getElementById("gopChartLyBasis"),
         chartNote: document.getElementById("gopChartNote"),
         comparisonNote: document.getElementById("gopComparisonNote"),
         lyLegend: document.querySelectorAll(".gop-legend-ly-entry"),
+        comparisonCostLabel: document.getElementById("gopComparisonCostLabel"),
+        comparisonRevenueLabel: document.getElementById("gopComparisonRevenueLabel"),
+        chartReset: document.getElementById("gopChartReset"),
+        chartTimeline: document.getElementById("gopChartTimeline"),
         loadButton: document.getElementById("costLoadButton"),
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
@@ -129,6 +134,8 @@
     // Last year's facts, as {key, data}. Fetched only when the comparison is
     // switched on, and re-fetched when the range or the basis changes.
     let comparison = null;
+    let comparisonMode = null;
+    let chartZoom = null;
     let activeDataset = "roomRevenue";
     // Every group counts until it is switched off in Query settings. Clearing
     // one takes it out of the statement, out of GOP and out of the chart, so
@@ -162,10 +169,10 @@
         elements.endDate.disabled = value;
         // The comparison controls can each start a request of their own, so they
         // are held while one is already in flight.
-        if (elements.showLy) elements.showLy.disabled = value;
+        if (elements.showLyFinal) elements.showLyFinal.disabled = value;
+        if (elements.showSpit) elements.showSpit.disabled = value;
         if (elements.lyBasis) {
-            elements.lyBasis.disabled = value
-                || !(elements.showLy && elements.showLy.checked);
+            elements.lyBasis.disabled = value || !comparisonMode;
         }
         document.querySelector(".cost-workspace").setAttribute("aria-busy", String(value));
     }
@@ -181,14 +188,22 @@
 
     function comparisonKey() {
         if (!loadedRange) return "";
-        return `${loadedRange.startDate}|${loadedRange.endDate}|${elements.lyBasis.value}`;
+        return `${loadedRange.startDate}|${loadedRange.endDate}|${elements.lyBasis.value}|${comparisonMode}`;
     }
 
     function syncComparisonControls() {
         // A basis that changes nothing while the comparison is off is a control
         // that lies about having an effect.
-        if (elements.lyBasis) {
-            elements.lyBasis.disabled = !(elements.showLy && elements.showLy.checked);
+        if (elements.lyBasis) elements.lyBasis.disabled = !comparisonMode;
+        if (elements.showLyFinal) {
+            elements.showLyFinal.setAttribute(
+                "aria-pressed", String(comparisonMode === "final")
+            );
+        }
+        if (elements.showSpit) {
+            elements.showSpit.setAttribute(
+                "aria-pressed", String(comparisonMode === "spit")
+            );
         }
     }
 
@@ -197,6 +212,17 @@
     // not on the chart is worse than no legend entry at all.
     function syncComparisonLegend(drawn) {
         for (const entry of elements.lyLegend) entry.hidden = !drawn;
+        const label = comparisonMode === "spit" ? "SPIT" : "LY Final";
+        if (elements.comparisonCostLabel) {
+            elements.comparisonCostLabel.textContent = `${label} cost`;
+        }
+        if (elements.comparisonRevenueLabel) {
+            elements.comparisonRevenueLabel.textContent = `${label} revenue`;
+        }
+    }
+
+    function comparisonName() {
+        return comparisonMode === "spit" ? "SPIT" : "LY Final";
     }
 
     /**
@@ -210,10 +236,25 @@
         const range = LosFormat.lastYearRange(forRange, elements.lyBasis.value);
         elements.comparisonNote.hidden = true;
         try {
+            const parameters = new URLSearchParams({
+                ...forRange,
+                includeComparison: "true",
+                lyComparisonBasis: elements.lyBasis.value,
+                comparisonMode
+            });
             const payload = await LosApi.fetchJson(
-                `${API_URL}?${new URLSearchParams(range)}`
+                `${API_URL}?${parameters}`
             );
-            comparison = {key, data: payload.data || {}};
+            const candidate = payload.comparison || {};
+            if (comparisonMode === "spit" && !candidate.spit?.available) {
+                throw new Error("the historical lifecycle snapshot is not available");
+            }
+            comparison = {
+                key,
+                mode: comparisonMode,
+                data: candidate.data || {},
+                spit: candidate.spit || null
+            };
         }
         catch (error) {
             console.error(error);
@@ -222,8 +263,9 @@
             // clearing the statement: this year's figures are still complete and
             // correct, and hiding them over a comparison that is an extra reading
             // would be the larger loss.
+            const label = comparisonMode === "spit" ? "SPIT" : "LY Final";
             elements.comparisonNote.textContent =
-                `Last year (${range.startDate} – ${range.endDate}) could not be loaded: `
+                `${label} (${range.startDate} – ${range.endDate}) could not be loaded: `
                 + `${error.message || "the request failed"}. The chart shows this year only.`;
             elements.comparisonNote.hidden = false;
         }
@@ -233,7 +275,7 @@
     // through setLoading, and doing it here as well released them halfway
     // through a load that was still running.
     async function ensureComparison() {
-        if (!elements.showLy || !elements.showLy.checked || !loadedRange) {
+        if (!comparisonMode || !loadedRange) {
             comparison = null;
             elements.comparisonNote.hidden = true;
             return;
@@ -254,12 +296,11 @@
                 endDate: elements.endDate.value
             };
             const parameters = new URLSearchParams(range);
-            const wantsComparison = Boolean(
-                elements.showLy && elements.showLy.checked
-            );
+            const wantsComparison = Boolean(comparisonMode);
             if (wantsComparison) {
                 parameters.set("includeComparison", "true");
                 parameters.set("lyComparisonBasis", elements.lyBasis.value);
+                parameters.set("comparisonMode", comparisonMode);
             }
 
             let payload;
@@ -287,13 +328,26 @@
             // computed from what is currently saved in Cost Input.
             loadedSettings = payload.costSettings || {};
             loadedRange = range;
+            chartZoom = null;
+            if (elements.chartGrain) {
+                elements.chartGrain.disabled = false;
+                elements.chartGrain.value = elements.grain.value;
+            }
             populateHotels(payload.hotels || []);
             updateFreshness();
 
+            if (wantsComparison && comparisonMode === "spit"
+                && payload.comparison && !payload.comparison.spit?.available) {
+                comparisonFailure = new Error(
+                    "the historical lifecycle snapshot is not available"
+                );
+            }
             if (wantsComparison && payload.comparison && !comparisonFailure) {
                 comparison = {
-                    key: `${range.startDate}|${range.endDate}|${elements.lyBasis.value}`,
-                    data: payload.comparison.data || {}
+                    key: `${range.startDate}|${range.endDate}|${elements.lyBasis.value}|${comparisonMode}`,
+                    mode: comparisonMode,
+                    data: payload.comparison.data || {},
+                    spit: payload.comparison.spit || null
                 };
                 elements.comparisonNote.hidden = true;
             }
@@ -303,8 +357,9 @@
                     elements.lyBasis.value
                 );
                 comparison = null;
+                const label = comparisonMode === "spit" ? "SPIT" : "LY Final";
                 elements.comparisonNote.textContent =
-                    `Last year (${previous.startDate} â€“ ${previous.endDate}) could not be loaded: `
+                    `${label} (${previous.startDate} â€“ ${previous.endDate}) could not be loaded: `
                     + `${comparisonFailure?.message || "the request failed"}. The chart shows this year only.`;
                 elements.comparisonNote.hidden = false;
             }
@@ -429,6 +484,17 @@
             : `−${LosFormat.formatSek(rounded)}`;
     }
 
+    function dataInRange(source, startDate, endDate) {
+        const result = {};
+        for (const [dataset, rows] of Object.entries(source || {})) {
+            result[dataset] = (rows || []).filter(
+                (row) => !row?.stayDate
+                    || (row.stayDate >= startDate && row.stayDate <= endDate)
+            );
+        }
+        return result;
+    }
+
     // The GOP statement is net of VAT throughout: every figure is a net revenue
     // stream or a cost derived from Cost Input. No gross figure appears here.
     function renderGop() {
@@ -471,21 +537,50 @@
         // versioned, so the comparison answers "what would last year's volumes
         // cost to run now" rather than "what did it cost then". Its flags are
         // dropped - they would repeat this year's, about the same configuration.
-        const lastYear = comparison
+        let comparisonData = null;
+        if (comparison) {
+            const source = comparison.mode === "spit"
+                ? CostData.applySpitAdjustments(
+                    comparison.data,
+                    comparison.spit?.adjustments || [],
+                    comparison.spit?.cutoffDate || ""
+                )
+                : comparison.data;
+            comparisonData = CostData.alignToComparison(
+                source, elements.lyBasis.value, statement.hotels
+            );
+        }
+
+        const chartGrain = chartZoom ? "day" : elements.grain.value;
+        const chartData = chartZoom
+            ? dataInRange(loadedData, chartZoom.startDate, chartZoom.endDate)
+            : loadedData;
+        const chartStatement = chartZoom
+            ? CostData.calculateGop(chartData, {
+                hotelName: elements.hotel.value,
+                settingsByHotel: loadedSettings,
+                grain: chartGrain,
+                activeLines: Array.from(activeLines)
+            })
+            : statement;
+        const compared = comparisonData
             ? CostData.calculateGop(
-                CostData.alignToComparison(
-                    comparison.data, elements.lyBasis.value, statement.hotels
-                ),
+                chartZoom
+                    ? dataInRange(
+                        comparisonData, chartZoom.startDate, chartZoom.endDate
+                    )
+                    : comparisonData,
                 {
                     hotelName: elements.hotel.value,
                     settingsByHotel: loadedSettings,
-                    grain: elements.grain.value,
+                    grain: chartGrain,
                     activeLines: Array.from(activeLines)
                 }
             )
             : null;
 
-        renderGopChart(statement, lastYear);
+        renderGopChart(chartStatement, compared, chartGrain);
+        renderChartTimeline();
     }
 
     // ---------------------------------------------------------------------
@@ -532,7 +627,7 @@
         notation: "compact", maximumFractionDigits: 1
     });
 
-    function renderGopChart(statement, lastYear) {
+    function renderGopChart(statement, lastYear, grain) {
         const periods = statement.periods || [];
         // Matched on the period key, not on position: alignToThisYear restamped
         // last year's dates onto this year's, so the keys are the same buckets.
@@ -551,7 +646,6 @@
             return;
         }
 
-        const grain = elements.grain.value;
         const width = 1100;
         const height = 380;
         const margin = { top: 20, right: 24, bottom: 74, left: 76 };
@@ -762,9 +856,12 @@
         function comparisonLabel(periodKey) {
             const basis = elements.lyBasis.value === "sameWeekday"
                 ? "same weekday" : "same date";
-            return `${LosFormat.periodLabel(
+            const cutoff = comparisonMode === "spit" && comparison?.spit?.cutoffDate
+                ? ` · cutoff ${comparison.spit.cutoffDate}`
+                : "";
+            return `${comparisonName()} · ${LosFormat.periodLabel(
                 LosFormat.lastYearDate(periodKey, elements.lyBasis.value), grain
-            )} · ${basis} LY`;
+            )} · ${basis}${cutoff}`;
         }
 
         periods.forEach((period, index) => {
@@ -783,11 +880,11 @@
                     // only drawn - it is half the marks in the band.
                     + (showComparison
                         ? previous
-                            ? `. Last year: revenue ${LosFormat.formatSek(previous.revenue)}, `
+                            ? `. ${comparisonName()}: revenue ${LosFormat.formatSek(previous.revenue)}, `
                                 + `base cost ${LosFormat.formatSek(previous.cost)}, `
                                 + `${previous.gop < 0 ? "loss" : "profit"} `
                                 + `${LosFormat.formatSek(Math.abs(previous.gop))}`
-                            : ". No matching period last year"
+                            : `. No matching ${comparisonName()} period`
                         : "")
             });
             hit.addEventListener("mouseenter", () => showPeriod(index));
@@ -798,6 +895,140 @@
         });
 
         elements.gopChartCanvas.replaceChildren(svg, tooltip);
+    }
+
+    const monthFormatter = new Intl.DateTimeFormat("en-SE", {
+        month: "short", year: "numeric", timeZone: "UTC"
+    });
+
+    function parseIsoDate(value) {
+        const [year, month, day] = value.split("-").map(Number);
+        return new Date(Date.UTC(year, month - 1, day));
+    }
+
+    function utcIsoDate(value) {
+        return value.toISOString().slice(0, 10);
+    }
+
+    function daysInRange(start, end) {
+        return Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
+    }
+
+    function isoWeekNumber(value) {
+        const thursday = new Date(value);
+        const weekday = (thursday.getUTCDay() + 6) % 7;
+        thursday.setUTCDate(thursday.getUTCDate() + 3 - weekday);
+        const firstThursday = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 4));
+        const firstWeekday = (firstThursday.getUTCDay() + 6) % 7;
+        firstThursday.setUTCDate(firstThursday.getUTCDate() + 3 - firstWeekday);
+        return 1 + Math.round(
+            (thursday.getTime() - firstThursday.getTime()) / (7 * 86400000)
+        );
+    }
+
+    function timelineSegments(kind, rangeStart, rangeEnd) {
+        const segments = [];
+        let cursor;
+        if (kind === "month") {
+            cursor = new Date(Date.UTC(
+                rangeStart.getUTCFullYear(), rangeStart.getUTCMonth(), 1
+            ));
+        }
+        else {
+            cursor = new Date(rangeStart);
+            cursor.setUTCDate(
+                cursor.getUTCDate() - ((cursor.getUTCDay() + 6) % 7)
+            );
+        }
+
+        while (cursor <= rangeEnd) {
+            const naturalStart = new Date(cursor);
+            let naturalEnd;
+            let next;
+            if (kind === "month") {
+                next = new Date(Date.UTC(
+                    cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1
+                ));
+                naturalEnd = new Date(next.getTime() - 86400000);
+            }
+            else {
+                next = new Date(cursor.getTime() + 7 * 86400000);
+                naturalEnd = new Date(cursor.getTime() + 6 * 86400000);
+            }
+            const start = naturalStart < rangeStart ? rangeStart : naturalStart;
+            const end = naturalEnd > rangeEnd ? rangeEnd : naturalEnd;
+            segments.push({
+                kind,
+                key: utcIsoDate(naturalStart),
+                startDate: utcIsoDate(start),
+                endDate: utcIsoDate(end),
+                days: daysInRange(start, end),
+                label: kind === "month"
+                    ? monthFormatter.format(naturalStart)
+                    : `W${isoWeekNumber(naturalStart)}`,
+                title: kind === "month"
+                    ? `Zoom to ${monthFormatter.format(naturalStart)}`
+                    : `Zoom to week ${isoWeekNumber(naturalStart)}, ${naturalStart.getUTCFullYear()}`
+            });
+            cursor = next;
+        }
+        return segments;
+    }
+
+    function setChartZoom(segment) {
+        chartZoom = {
+            type: segment.kind,
+            key: segment.key,
+            startDate: segment.startDate,
+            endDate: segment.endDate
+        };
+        if (elements.chartGrain) {
+            elements.chartGrain.value = "day";
+            elements.chartGrain.disabled = true;
+        }
+        render();
+    }
+
+    function resetChartView() {
+        chartZoom = null;
+        if (elements.chartGrain) {
+            elements.chartGrain.disabled = false;
+            elements.chartGrain.value = elements.grain.value;
+        }
+        render();
+    }
+
+    function renderChartTimeline() {
+        if (!elements.chartTimeline || !loadedRange) return;
+        const start = parseIsoDate(loadedRange.startDate);
+        const end = parseIsoDate(loadedRange.endDate);
+        const rows = [
+            ["week", "Weeks"],
+            ["month", "Months"]
+        ].map(([kind, label]) => {
+            const row = document.createElement("div");
+            row.className = `chart-time-row is-${kind}`;
+            row.setAttribute("role", "group");
+            row.setAttribute("aria-label", label);
+            for (const segment of timelineSegments(kind, start, end)) {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "chart-time-button";
+                button.textContent = segment.label;
+                button.title = segment.title;
+                button.style.flexGrow = String(segment.days);
+                button.setAttribute("aria-pressed", String(Boolean(
+                    chartZoom
+                    && chartZoom.type === segment.kind
+                    && chartZoom.key === segment.key
+                )));
+                button.addEventListener("click", () => setChartZoom(segment));
+                row.append(button);
+            }
+            return row;
+        });
+        elements.chartTimeline.replaceChildren(...rows);
+        if (elements.chartReset) elements.chartReset.hidden = !chartZoom;
     }
 
     // Rebuilt rather than retyped as textContent, so the control's name keeps the
@@ -813,7 +1044,7 @@
             control,
             document.createTextNode(
                 showComparison
-                    ? " period: this year on the left, last year on the right. "
+                    ? ` period: this year on the left, ${comparisonName()} on the right. `
                         + "Bar height is what the period cost to run; the marker is "
                         + "the revenue it earned."
                     : " period. Bar height is what the period cost to run; the "
@@ -852,10 +1083,10 @@
     // "+0 kr (+0.0%)" reads as a change nobody can find.
     function varianceNote(current, previous) {
         if (previous === null || previous === undefined) {
-            return "No matching period last year";
+            return `No matching ${comparisonName()} period`;
         }
         const delta = LosFormat.roundSek(current - previous) || 0;
-        if (delta === 0) return "Level with last year";
+        if (delta === 0) return `Level with ${comparisonName()}`;
         const sign = delta > 0 ? "+" : "−";
         const size = `${sign}${LosFormat.formatSekAmount(Math.abs(delta))}`;
         // A previous figure of zero has no percentage: everything is an infinite
@@ -863,9 +1094,9 @@
         // same goes for a sign change, where a percentage of a negative base
         // points the wrong way.
         const base = LosFormat.roundSek(previous) || 0;
-        if (base <= 0) return `${size} vs last year`;
+        if (base <= 0) return `${size} vs ${comparisonName()}`;
         const share = Math.abs(delta / base) * 100;
-        return `${size} (${sign}${share.toFixed(share < 10 ? 1 : 0)}%) vs last year`;
+        return `${size} (${sign}${share.toFixed(share < 10 ? 1 : 0)}%) vs ${comparisonName()}`;
     }
 
     function renderTable() {
@@ -947,6 +1178,8 @@
     // rest of the file reads; the copy beside the chart mirrors it in both
     // directions, so neither can be left showing a grain that is not in force.
     function setGrain(value) {
+        chartZoom = null;
+        if (elements.chartGrain) elements.chartGrain.disabled = false;
         if (elements.grain.value !== value) elements.grain.value = value;
         if (elements.chartGrain && elements.chartGrain.value !== value) {
             elements.chartGrain.value = value;
@@ -968,10 +1201,23 @@
         finally { setLoading(false); }
     }
 
+    async function toggleComparison(mode) {
+        comparisonMode = comparisonMode === mode ? null : mode;
+        comparison = null;
+        await refreshComparison();
+    }
+
     elements.loadButton.addEventListener("click", loadData);
     elements.hotel.addEventListener("change", render);
-    if (elements.showLy) {
-        elements.showLy.addEventListener("change", refreshComparison);
+    if (elements.showLyFinal) {
+        elements.showLyFinal.addEventListener(
+            "click", () => toggleComparison("final")
+        );
+    }
+    if (elements.showSpit) {
+        elements.showSpit.addEventListener(
+            "click", () => toggleComparison("spit")
+        );
     }
     if (elements.lyBasis) {
         // A different basis is a different range, so this re-fetches rather than
@@ -987,6 +1233,9 @@
         );
     }
     elements.lineReset.addEventListener("click", showEveryLine);
+    if (elements.chartReset) {
+        elements.chartReset.addEventListener("click", resetChartView);
+    }
     for (const tab of document.querySelectorAll("[data-dataset]")) {
         tab.addEventListener("click", () => selectDataset(tab));
         tab.addEventListener("keydown", (event) => {

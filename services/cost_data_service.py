@@ -59,6 +59,50 @@ _result_inflight = {}
 _result_cache_lock = Lock()
 
 
+COST_SPIT_ADJUSTMENTS_SQL = """
+    WITH chosen_stays AS (
+        SELECT stay_date, hotel_code, max(snapshot_date) AS snapshot_date
+        FROM functions.supplement_snapshot_inventory
+        WHERE stay_date BETWEEN %(start_date)s AND %(end_date)s
+          AND snapshot_date <= %(cutoff_date)s
+        GROUP BY stay_date, hotel_code
+    ),
+    spit AS (
+        SELECT
+            chosen.stay_date,
+            chosen.hotel_code,
+            coalesce(sum(category.assigned_rooms), 0) AS spit_assigned_rooms,
+            coalesce(sum(category.room_revenue), 0) AS spit_room_revenue
+        FROM chosen_stays chosen
+        LEFT JOIN functions.supplement_snapshot_category category
+          USING (stay_date, hotel_code, snapshot_date)
+        GROUP BY chosen.stay_date, chosen.hotel_code
+    ),
+    final AS (
+        SELECT
+            stay_date,
+            hotel_code,
+            sum(assigned_rooms) AS final_assigned_rooms,
+            sum(room_revenue) AS final_room_revenue
+        FROM functions.supplement_latest_category
+        WHERE stay_date BETWEEN %(start_date)s AND %(end_date)s
+        GROUP BY stay_date, hotel_code
+    )
+    SELECT
+        hotel.hotel_name,
+        spit.stay_date,
+        spit.spit_assigned_rooms,
+        spit.spit_room_revenue,
+        coalesce(final.final_assigned_rooms, 0) AS final_assigned_rooms,
+        coalesce(final.final_room_revenue, 0) AS final_room_revenue
+    FROM spit
+    JOIN functions.hotels hotel
+      ON hotel.enterprise_id = spit.hotel_code
+    LEFT JOIN final USING (stay_date, hotel_code)
+    ORDER BY spit.stay_date, hotel.hotel_name
+"""
+
+
 def _json_value(value):
     if isinstance(value, (date, datetime)):
         return value.isoformat()
@@ -236,3 +280,46 @@ def fetch_cost_data_ranges(ranges, publication_version=None):
         key,
         build,
     )
+
+
+def fetch_cost_spit_adjustments(start_date, end_date, cutoff_date):
+    """Return lifecycle-snapshot ratios for a Cost Data SPIT comparison.
+
+    Supplement snapshots are built by filtering reservation and item created
+    dates at ``snapshot_date``. Reusing them here makes SPIT mean the same thing
+    on both pages and avoids reconstructing historical reservations from final
+    daily aggregates, which no longer carry their creation dates.
+    """
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT to_regclass('functions.supplement_snapshot_inventory') "
+                "AS inventory, "
+                "to_regclass('functions.supplement_snapshot_category') AS category, "
+                "to_regclass('functions.supplement_latest_category') AS latest"
+            )
+            tables = cursor.fetchone()
+            if not all(tables.values()):
+                logging.warning(
+                    "Cost SPIT unavailable: supplement lifecycle tables are missing"
+                )
+                return {"available": False, "rows": []}
+
+            cursor.execute(
+                COST_SPIT_ADJUSTMENTS_SQL,
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "cutoff_date": cutoff_date,
+                },
+            )
+            rows = _json_rows(cursor.fetchall())
+            logging.info(
+                "Cost SPIT adjustments completed start_date=%s end_date=%s "
+                "cutoff_date=%s rows=%d",
+                start_date,
+                end_date,
+                cutoff_date,
+                len(rows),
+            )
+            return {"available": bool(rows), "rows": rows}

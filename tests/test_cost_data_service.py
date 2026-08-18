@@ -118,11 +118,12 @@ class CostDataServiceTests(unittest.TestCase):
                 "product_revenue_1_net": Decimal("23.45"),
                 "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
             }],
-            "cleaningDepartures": [{
+            "cleaningAllocations": [{
                 "hotel_name": "Hotel A",
+                "stay_date": date(2026, 1, 2),
                 "category_name": "Double",
                 "occupancy": 2,
-                "departures": 4,
+                "allocated_cleanings": Decimal("1.33333333"),
                 "last_updated_at": datetime(2026, 1, 3, tzinfo=timezone.utc),
             }],
             "distributionRates": [{
@@ -166,7 +167,7 @@ class CostDataServiceTests(unittest.TestCase):
 
         self.assertEqual(set(datasets), {
             "arrivalsDepartures", "breakfast", "parking", "roomRevenue", "payments",
-            "cleaningDepartures", "distributionRates",
+            "cleaningAllocations", "distributionRates",
         })
         self.assertEqual(row_counts["arrivalsDepartures"], 1)
         self.assertEqual(datasets["arrivalsDepartures"][0]["stayDate"], "2026-01-02")
@@ -177,9 +178,13 @@ class CostDataServiceTests(unittest.TestCase):
         # The mixes travel in the same envelope and through the same JSON
         # coercion: a Decimal percentage reaching the browser as a float would
         # round differently there than the statement rounds here.
-        self.assertEqual(datasets["cleaningDepartures"][0]["categoryName"], "Double")
-        self.assertEqual(datasets["cleaningDepartures"][0]["occupancy"], 2)
-        self.assertNotIn("stayDate", datasets["cleaningDepartures"][0])
+        self.assertEqual(datasets["cleaningAllocations"][0]["categoryName"], "Double")
+        self.assertEqual(datasets["cleaningAllocations"][0]["occupancy"], 2)
+        self.assertEqual(datasets["cleaningAllocations"][0]["stayDate"], "2026-01-02")
+        self.assertEqual(
+            datasets["cleaningAllocations"][0]["allocatedCleanings"],
+            "1.33333333",
+        )
         self.assertEqual(datasets["distributionRates"][0]["matchedPercent"], "12.5000")
         self.assertEqual(datasets["distributionRates"][0]["mixRevenue"], "500.00")
 
@@ -207,13 +212,13 @@ class CostDataServiceTests(unittest.TestCase):
             )
 
         cleaning_query = cost_data_service.COST_DATA_QUERIES[
-            "cleaningDepartures"
+            "cleaningAllocations"
         ]
         self.assertIn(
-            "GROUP BY hotel.hotel_name, fact.category_name, fact.occupancy",
+            "GROUP BY hotel.hotel_name, fact.stay_date,",
             cleaning_query,
         )
-        self.assertNotIn("GROUP BY hotel.hotel_name, stay_date", cleaning_query)
+        self.assertIn("fact.allocated_cleanings IS NOT NULL", cleaning_query)
 
     def test_identical_requests_share_the_cached_result(self):
         calls = []

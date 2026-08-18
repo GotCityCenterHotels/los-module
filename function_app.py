@@ -23,7 +23,11 @@ from services.los_facts_service import (
 )
 from services.los_schema_service import LosSchemaError
 from services.los_sync_service import sync_los
-from services.cost_data_service import fetch_cost_data, fetch_cost_data_ranges
+from services.cost_data_service import (
+    fetch_cost_data,
+    fetch_cost_data_ranges,
+    fetch_cost_spit_adjustments,
+)
 from services.cost_publication_service import fetch_cost_publication_version
 from services.cost_settings_service import (
     fetch_all_cost_settings,
@@ -85,7 +89,7 @@ COST_DATA_RESPONSE_CACHE_MAX_ENTRIES = max(
 # Part of the validator because a deployment can change response semantics
 # without importing facts or saving settings. Increment this when the Cost Data
 # response contract or calculation changes.
-COST_DATA_RESPONSE_SCHEMA_VERSION = 2
+COST_DATA_RESPONSE_SCHEMA_VERSION = 3
 
 # LOS facts is the largest response the app produces - a year of per-hotel,
 # per-LOS rows - and it had no server-side byte cache at all, only a validator.
@@ -728,7 +732,18 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             400,
         )
 
+    comparison_mode = req.params.get("comparisonMode") or "final"
+    if comparison_mode not in {"final", "spit"}:
+        return json_response(
+            {
+                "error": "Invalid comparisonMode",
+                "allowedValues": ["final", "spit"],
+            },
+            400,
+        )
+
     comparison_start = comparison_end = None
+    comparison_cutoff = None
     if include_comparison:
         comparison_start = shift_cost_comparison_date(
             start_date,
@@ -738,6 +753,11 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             end_date,
             comparison_basis,
         )
+        if comparison_mode == "spit":
+            comparison_cutoff = shift_cost_comparison_date(
+                datetime.now(ZoneInfo("Europe/Stockholm")).date(),
+                comparison_basis,
+            )
 
     try:
         publication_version = fetch_cost_publication_version()
@@ -745,12 +765,25 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("Cost publication lookup failed")
         return json_response({"error": "Unable to retrieve cost data"}, 500)
 
+    spit_publication = None
+    if include_comparison and comparison_mode == "spit":
+        try:
+            spit_publication = fetch_supplement_status().get("runId")
+        except Exception:
+            # The adjustment lookup below will report SPIT as unavailable. Keep
+            # LY Final/current facts usable instead of turning a comparison-only
+            # dependency into a page-level failure.
+            logging.exception("Cost SPIT publication lookup failed")
+
     identity = "|".join([
         str(COST_DATA_RESPONSE_SCHEMA_VERSION),
         str(publication_version),
         start_date.isoformat(),
         end_date.isoformat(),
         comparison_basis if include_comparison else "none",
+        comparison_mode if include_comparison else "none",
+        comparison_cutoff.isoformat() if comparison_cutoff else "none",
+        str(spit_publication) if spit_publication is not None else "none",
         comparison_start.isoformat() if comparison_start else "none",
         comparison_end.isoformat() if comparison_end else "none",
     ])
@@ -761,6 +794,9 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         start_date,
         end_date,
         comparison_basis if include_comparison else None,
+        comparison_mode if include_comparison else None,
+        comparison_cutoff,
+        spit_publication,
         comparison_start,
         comparison_end,
     )
@@ -778,6 +814,15 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             comparison_datasets, comparison_row_counts = (
                 range_results["comparison"]
             )
+            spit_adjustments = (
+                fetch_cost_spit_adjustments(
+                    comparison_start,
+                    comparison_end,
+                    comparison_cutoff,
+                )
+                if comparison_mode == "spit"
+                else None
+            )
         else:
             datasets, row_counts = fetch_cost_data(
                 start_date,
@@ -785,6 +830,7 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                 publication_version=publication_version,
             )
             comparison_datasets = comparison_row_counts = None
+            spit_adjustments = None
 
         # The GOP statement is computed entirely from the saved Cost Input
         # rulebook. Preserve the existing partial-failure behaviour: facts can
@@ -828,10 +874,17 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                     "startDate": comparison_start.isoformat(),
                     "endDate": comparison_end.isoformat(),
                     "lyComparisonBasis": comparison_basis,
+                    "mode": comparison_mode,
                 },
                 "rowCounts": comparison_row_counts,
                 "data": comparison_datasets,
             }
+            if comparison_mode == "spit":
+                payload["comparison"]["spit"] = {
+                    "available": spit_adjustments["available"],
+                    "cutoffDate": comparison_cutoff.isoformat(),
+                    "adjustments": spit_adjustments["rows"],
+                }
         return payload, cacheable
 
     try:

@@ -787,13 +787,16 @@ test("Group by sits beside the chart as well as in Query settings, on one value"
 // Last year on the chart
 // ---------------------------------------------------------------------------
 
-test("the chart offers last year as a paired bar, with both comparison bases", () => {
+test("the chart offers LY Final and SPIT as paired-bar comparisons", () => {
     const html = read("costdata.html");
     const script = read("costdata.js");
     const css = read("styles.css");
 
     const panel = /id="gopChartPanel"[\s\S]*?<\/section>/.exec(html)[0];
-    assert.match(panel, /id="gopChartShowLy"/);
+    assert.match(panel, /id="gopChartShowLyFinal"/);
+    assert.match(panel, />\s*Show LY Final\s*</);
+    assert.match(panel, /id="gopChartShowSpit"/);
+    assert.match(panel, />\s*Show SPIT\s*</);
     assert.match(panel, /id="gopChartLyBasis"/);
     // The same two values the LOS API accepts, so one vocabulary covers the
     // whole application.
@@ -806,6 +809,8 @@ test("the chart offers last year as a paired bar, with both comparison bases", (
     assert.match(script, /drawStack\(period, barLeft\(index, false\), CHART_COLOURS, false\)/);
     assert.match(script, /drawStack\(previous, barLeft\(index, true\), LY_COLOURS, true\)/);
     assert.match(css, /\.gop-bar-revenue\.is-comparison \{/);
+    assert.match(script, /comparisonMode === "spit"/);
+    assert.match(script, /CostData\.applySpitAdjustments\(/);
 });
 
 test("last year is fetched only when it is switched on, and cached per range", () => {
@@ -817,8 +822,23 @@ test("last year is fetched only when it is switched on, and cached per range", (
     assert.match(script, /if \(comparison && comparison\.key === key\) return;/);
     // Keyed on the range the facts on screen cover, not on what the date inputs
     // currently say - and on the basis, because a different basis is a different
-    // range.
-    assert.match(script, /\$\{loadedRange\.startDate\}\|\$\{loadedRange\.endDate\}\|\$\{elements\.lyBasis\.value\}/);
+    // range and mode.
+    assert.match(script, /\$\{loadedRange\.startDate\}\|\$\{loadedRange\.endDate\}\|\$\{elements\.lyBasis\.value\}\|\$\{comparisonMode\}/);
+});
+
+test("the chart has reset, week, and month zoom controls", () => {
+    const html = read("costdata.html");
+    const script = read("costdata.js");
+    const css = read("styles.css");
+
+    assert.match(html, /id="gopChartReset"[^>]*>\s*Reset view/);
+    assert.match(html, /id="gopChartTimeline"/);
+    assert.match(script, /function timelineSegments\(kind, rangeStart, rangeEnd\)/);
+    assert.match(script, /`W\$\{isoWeekNumber\(naturalStart\)\}`/);
+    assert.match(script, /function setChartZoom\(segment\)/);
+    assert.match(script, /const chartGrain = chartZoom \? "day"/);
+    assert.match(css, /\.chart-time-button:hover,/);
+    assert.match(css, /\.chart-time-button\[aria-pressed="true"\]/);
 });
 
 test("the two years are paired by period key, never by bar position", () => {

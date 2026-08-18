@@ -3,8 +3,9 @@ import json
 import os
 import unittest
 
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 
 os.environ.setdefault("DB_HOST", "localhost")
@@ -100,6 +101,42 @@ class CostDataResponseCacheTests(unittest.TestCase):
         self.assertEqual(payload["publicationVersion"], 7)
         self.assertEqual(payload["comparison"]["parameters"]["startDate"], "2023-02-28")
         self.assertEqual(payload["comparison"]["data"]["roomRevenue"][0]["stayDate"], "2023-02-28")
+
+    def test_spit_comparison_carries_the_same_point_in_time_adjustments(self):
+        spit_request = request()
+        spit_request.params["comparisonMode"] = "spit"
+        adjustments = {
+            "available": True,
+            "rows": [{
+                "hotelName": "Hotel A",
+                "stayDate": "2023-02-28",
+                "spitAssignedRooms": "4",
+                "finalAssignedRooms": "10",
+            }],
+        }
+        with patch.object(
+            function_app, "fetch_cost_publication_version", return_value=7
+        ), patch.object(
+            function_app, "fetch_cost_data_ranges", return_value=range_results()
+        ), patch.object(
+            function_app, "fetch_cost_spit_adjustments", return_value=adjustments
+        ) as fetch_spit, patch.object(
+            function_app, "fetch_supplement_status", return_value={"runId": 42}
+        ), patch.object(
+            function_app, "fetch_all_cost_settings", return_value={}
+        ):
+            response = function_app.cost_data_facts(spit_request)
+
+        cutoff = function_app.shift_cost_comparison_date(
+            datetime.now(ZoneInfo("Europe/Stockholm")).date(), "sameDate"
+        )
+        fetch_spit.assert_called_once_with(
+            date(2023, 2, 28), date(2023, 2, 28), cutoff
+        )
+        payload = decode(response)
+        self.assertEqual(payload["comparison"]["parameters"]["mode"], "spit")
+        self.assertEqual(payload["comparison"]["spit"]["cutoffDate"], cutoff.isoformat())
+        self.assertEqual(payload["comparison"]["spit"]["adjustments"], adjustments["rows"])
 
     def test_complete_encoded_response_is_reused_for_one_publication(self):
         with patch.object(

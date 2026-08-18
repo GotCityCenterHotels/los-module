@@ -33,7 +33,8 @@ DATASETS = {
         "export_sql": "export/breakfast_data.sql",
         "import_sql": "import/upsert_breakfast_data.sql",
     },
-    # The two reservation-level mixes, last because they are the two most
+    # The cleaning night allocation and distribution mix, last because they are
+    # the two most
     # expensive statements here and because everything above them is what the
     # statement's totals come from. Their export SQL is built at run time from
     # information_schema rather than read from a file - the Mews mirror's naming

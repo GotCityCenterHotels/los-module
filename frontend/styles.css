@@ -1305,6 +1305,8 @@ tbody tr.total-row:hover {
 }
 
 .gop-chart-panel .gop-heading {
+    display: grid;
+    grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr);
     align-items: center;
     margin-bottom: 2px;
 }
@@ -1315,6 +1317,65 @@ tbody tr.total-row:hover {
     gap: 8px 16px;
     align-items: center;
     justify-content: flex-end;
+    justify-self: end;
+}
+
+.chart-reset {
+    width: auto;
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid #d8d2ea;
+    border-radius: 6px;
+    background: #fff;
+    color: #6941c6;
+    font-size: 12px;
+    font-weight: 700;
+    transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
+}
+
+.chart-reset:hover {
+    border-color: #7f56d9;
+    background: #f4f0ff;
+    color: #53389e;
+}
+
+.chart-comparison-buttons {
+    display: inline-flex;
+    gap: 3px;
+    padding: 3px;
+    border: 1px solid #e4e7ec;
+    border-radius: 7px;
+    background: #f9fafb;
+}
+
+.chart-comparison-buttons button {
+    width: auto;
+    height: 26px;
+    padding: 0 9px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: #667085;
+    font-size: 11.5px;
+    font-weight: 700;
+    transition: background 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.chart-comparison-buttons button:hover,
+.chart-comparison-buttons button[aria-pressed="true"] {
+    background: #ede9fe;
+    color: #6941c6;
+}
+
+.chart-comparison-buttons button[aria-pressed="true"] {
+    box-shadow: 0 0 0 1px #c4b5fd inset;
+}
+
+.chart-comparison-buttons button:focus-visible,
+.chart-reset:focus-visible,
+.chart-time-button:focus-visible {
+    outline: 2px solid #8b5cf6;
+    outline-offset: 2px;
 }
 
 .gop-chart-legend {
@@ -1416,6 +1477,16 @@ tbody tr.total-row:hover {
     );
 }
 
+.gop-chart-viewport {
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+}
+
+.gop-chart,
+.gop-chart-timeline {
+    min-width: 760px;
+}
+
 .gop-chart {
     min-height: 300px;
     padding: 10px 0 0;
@@ -1423,6 +1494,64 @@ tbody tr.total-row:hover {
 
 .gop-chart svg {
     min-height: 300px;
+}
+
+.gop-chart-timeline {
+    padding: 0 2.2% 2px 6.9%;
+}
+
+.chart-time-row {
+    display: flex;
+    min-height: 25px;
+}
+
+.chart-time-row + .chart-time-row {
+    margin-top: 3px;
+}
+
+.chart-time-button {
+    flex-basis: 0;
+    min-width: 0;
+    height: 24px;
+    overflow: hidden;
+    padding: 0 2px;
+    border: 0;
+    border-right: 1px solid #eaecf0;
+    border-radius: 0;
+    background: transparent;
+    color: #667085;
+    font-size: 10px;
+    font-weight: 650;
+    line-height: 1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: background 120ms ease, color 120ms ease;
+}
+
+.chart-time-row .chart-time-button:first-child {
+    border-radius: 5px 0 0 5px;
+}
+
+.chart-time-row .chart-time-button:last-child {
+    border-right: 0;
+    border-radius: 0 5px 5px 0;
+}
+
+.chart-time-row.is-month .chart-time-button {
+    height: 27px;
+    border-top: 1px solid #eaecf0;
+    background: #f9fafb;
+    font-size: 11px;
+}
+
+.chart-time-button:hover,
+.chart-time-button[aria-pressed="true"] {
+    background: #ede9fe;
+    color: #6941c6;
+}
+
+.chart-time-button[aria-pressed="true"] {
+    box-shadow: 0 0 0 1px #c4b5fd inset;
 }
 
 /* Every bar is a rectangle in the same family; only the fill distinguishes
@@ -1672,6 +1801,19 @@ tbody tr.total-row:hover {
 
     .gop-statement {
         padding: 16px 14px 14px;
+    }
+
+    .gop-chart-panel .gop-heading {
+        display: flex;
+        align-items: flex-start;
+    }
+
+    .gop-heading-actions {
+        justify-content: flex-start;
+    }
+
+    .chart-reset {
+        order: 3;
     }
 }
 

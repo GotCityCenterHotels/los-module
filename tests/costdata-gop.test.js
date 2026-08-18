@@ -277,6 +277,83 @@ test("the mix decides the rate and never the number of departures charged", () =
     assert.equal(lineFor(statement, "cleaningCost"), 50 * 150);
 });
 
+test("one reservation cleaning is split evenly across every occupied night", () => {
+    const allocated = {
+        ...data,
+        cleaningAllocations: [
+            { stayDate: "2026-01-02", hotelName: "A", categoryName: "Double", occupancy: 1, allocatedCleanings: 1 / 3 },
+            { stayDate: "2026-01-03", hotelName: "A", categoryName: "Double", occupancy: 1, allocatedCleanings: 1 / 3 },
+            { stayDate: "2026-01-04", hotelName: "A", categoryName: "Double", occupancy: 1, allocatedCleanings: 1 / 3 }
+        ]
+    };
+    const statement = CostData.calculateGop(allocated, {
+        settingsByHotel: settings,
+        grain: "day"
+    });
+
+    // Double/1 costs 20 x 5 + 50 = 150. The reservation still costs 150 in
+    // total, but every occupied date carries exactly one third (50).
+    assert.equal(lineFor(statement, "cleaningCost"), 150);
+    assert.deepEqual(
+        statement.periods
+            .filter((period) => period.amounts.cleaningCost)
+            .map((period) => [period.periodKey, period.amounts.cleaningCost]),
+        [
+            ["2026-01-02", 50],
+            ["2026-01-03", 50],
+            ["2026-01-04", 50]
+        ]
+    );
+});
+
+test("rent uses each revenue category on the night that earned it", () => {
+    const nightly = {
+        A: {
+            ...settings.A,
+            profile: {
+                ...settings.A.profile,
+                roomRentPercent: "10",
+                breakfastRentPercent: "20",
+                parkingRentPercent: "30"
+            }
+        }
+    };
+    const statement = CostData.calculateGop(data, {
+        settingsByHotel: nightly,
+        grain: "day"
+    });
+
+    assert.equal(lineFor(statement, "rentCost"),
+        (10000 * 0.10 + 4000 * 0.20 + 1500 * 0.30)
+        + (6000 * 0.10 + 1500 * 0.20 + 500 * 0.30));
+    assert.equal(statement.periods[0].amounts.rentCost, 2250);
+    assert.equal(statement.periods[1].amounts.rentCost, 1050);
+});
+
+test("SPIT removes future bookings using the lifecycle snapshot ratios", () => {
+    const final = {
+        roomRevenue: [{
+            stayDate: "2025-10-10", hotelName: "A", amountCurrency: "SEK",
+            roomRevenueExclProducts1Net: 8000,
+            productRevenue1Net: 2000,
+            roomRevenueInclProducts1Net: 10000
+        }],
+        cleaningAllocations: [{
+            stayDate: "2025-10-10", hotelName: "A", categoryName: "Double",
+            occupancy: 1, allocatedCleanings: 10
+        }]
+    };
+    const spit = CostData.applySpitAdjustments(final, [{
+        stayDate: "2025-10-10", hotelName: "A",
+        finalAssignedRooms: 10, spitAssignedRooms: 4,
+        finalRoomRevenue: 10000, spitRoomRevenue: 3000
+    }], "2025-08-19");
+
+    assert.equal(spit.roomRevenue[0].roomRevenueInclProducts1Net, 3000);
+    assert.equal(spit.roomRevenue[0].roomRevenueExclProducts1Net, 2400);
+    assert.equal(spit.cleaningAllocations[0].allocatedCleanings, 4);
+});
+
 test("distribution charges each day at its own matched percentage", () => {
     const tree = {
         A: {

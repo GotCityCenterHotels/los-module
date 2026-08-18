@@ -447,6 +447,54 @@
         };
     }
 
+    // The nightly form of the same category/occupancy calculation. Each row is
+    // a fraction of one reservation cleaning (1 / nights in the stay), so its
+    // cost is added directly instead of being multiplied by the checkout count.
+    // This is what lets a three-night reservation place one third of its cleaning
+    // cost on each of the three chart dates.
+    function allocatedCleaningCost(
+        allocationRows, cleaningCategories, costPerMinute
+    ) {
+        const rows = allocationRows || [];
+        if (!rows.length) return null;
+        const costs = cleaningCostIndex(cleaningCategories, costPerMinute);
+        if (!costs.size) return null;
+        const occupancies = occupancyIndex(cleaningCategories);
+        const blended = averageCleaningCost(cleaningCategories, costPerMinute) || 0;
+        const unconfigured = new Set();
+        let allocatedCleanings = 0;
+        let totalCost = 0;
+
+        for (const row of rows) {
+            const share = numberOf(row.allocatedCleanings);
+            if (share <= 0) continue;
+            allocatedCleanings += share;
+            const exact = costs.get(cleaningKey(row.categoryName, row.occupancy));
+            if (exact !== undefined) {
+                totalCost += share * exact;
+                continue;
+            }
+            const nearest = nearestOccupancy(
+                occupancies, row.categoryName, numberOf(row.occupancy)
+            );
+            const nearestCost = nearest === null
+                ? undefined
+                : costs.get(cleaningKey(row.categoryName, nearest));
+            if (nearestCost !== undefined) {
+                totalCost += share * nearestCost;
+                continue;
+            }
+            unconfigured.add(String(row.categoryName ?? "").trim() || "(unnamed)");
+            totalCost += share * blended;
+        }
+        if (!(allocatedCleanings > 0)) return null;
+        return {
+            allocatedCleanings,
+            totalCost,
+            unconfigured: Array.from(unconfigured).sort()
+        };
+    }
+
     // The distribution percentage for one hotel-day, blending the share of
     // revenue the rulebook matched with the property's fallback for the rest.
     //
@@ -502,6 +550,71 @@
                 }));
         }
         return aligned;
+    }
+
+    // SPIT (same point in time) uses the supplement lifecycle snapshot from the
+    // matching date last year. The snapshot supplies exact room-night revenue
+    // and occupied-room ratios; applying those ratios to the remaining
+    // reservation-derived facts removes bookings that did not yet exist at the
+    // cutoff while preserving each fact's own daily/category shape.
+    function applySpitAdjustments(source, adjustments, cutoff) {
+        const index = new Map();
+        for (const row of adjustments || []) {
+            if (!row || !row.hotelName || !row.stayDate) continue;
+            index.set(`${row.hotelName}|${row.stayDate}`, row);
+        }
+        const occupancyFields = Object.freeze({
+            payments: ["totalPaymentAmountGrossValue"],
+            breakfast: ["breakfastTotal", "breakfastNetCost"],
+            parking: ["totalReservationsUsingParking", "totalParkingAmountNetValue"],
+            arrivalsDepartures: ["totalArrivals", "totalDepartures"],
+            cleaningAllocations: ["allocatedCleanings"],
+            distributionRates: ["mixRevenue", "matchedRevenue"]
+        });
+        const result = {};
+
+        for (const [dataset, rows] of Object.entries(source || {})) {
+            const adjusted = [];
+            for (const row of rows || []) {
+                if (!row || !row.stayDate || row.stayDate <= cutoff) {
+                    adjusted.push(row);
+                    continue;
+                }
+                const point = index.get(`${row.hotelName}|${row.stayDate}`);
+                // A covered future night with no reservations at the cutoff is
+                // intentionally absent from SPIT, not a zero-valued final row.
+                if (!point) continue;
+                const finalRooms = numberOf(point.finalAssignedRooms);
+                const spitRooms = numberOf(point.spitAssignedRooms);
+                const occupancyRatio = finalRooms > 0
+                    ? Math.max(0, spitRooms / finalRooms)
+                    : (spitRooms > 0 ? 1 : 0);
+                const finalRevenue = numberOf(point.finalRoomRevenue);
+                const spitRevenue = numberOf(point.spitRoomRevenue);
+                const revenueRatio = finalRevenue !== 0
+                    ? Math.max(0, spitRevenue / finalRevenue)
+                    : occupancyRatio;
+                const copy = {...row};
+
+                if (dataset === "roomRevenue") {
+                    for (const field of [
+                        "roomRevenueExclProducts1Net",
+                        "productRevenue1Net",
+                        "roomRevenueInclProducts1Net"
+                    ]) {
+                        copy[field] = numberOf(row[field]) * revenueRatio;
+                    }
+                }
+                else {
+                    for (const field of occupancyFields[dataset] || []) {
+                        copy[field] = numberOf(row[field]) * occupancyRatio;
+                    }
+                }
+                adjusted.push(copy);
+            }
+            result[dataset] = adjusted;
+        }
+        return result;
     }
 
     function zeroTotals() {
@@ -731,14 +844,33 @@
                 + percentOf(paymentsGross, profile.cardCostPercent);
 
             // --- Rent ------------------------------------------------------------
-            // The three rent percentages, each on its matching net revenue
-            // stream. Rent is its own line rather than part of franchise & card:
-            // it is a different agreement, it is usually the larger of the two,
-            // and folding it in left the statement with no rent on it at all.
-            totals.rentCost +=
-                percentOf(roomRevenue, profile.roomRentPercent)
-                + percentOf(breakfastRevenue, profile.breakfastRentPercent)
-                + percentOf(parkingRevenue, profile.parkingRentPercent);
+            // Apply every percentage to its matching category on that night's
+            // revenue. Summing the daily charges gives the same whole-period
+            // total for a flat percentage, but this explicit nightly path is
+            // load-bearing for chart zoom and SPIT: neither can borrow another
+            // category's revenue or move revenue between dates.
+            const roomRevenueByDay = currencyDailyTotals(
+                roomRevenueRows, "roomRevenueInclProducts1Net", currency
+            );
+            const breakfastRevenueByDay = dailyTotals(
+                breakfastRows, "breakfastNetCost"
+            );
+            const parkingRevenueByDay = dailyTotals(
+                parkingRows, "totalParkingAmountNetValue"
+            );
+            const rentDates = new Set([
+                ...roomRevenueByDay.keys(),
+                ...breakfastRevenueByDay.keys(),
+                ...parkingRevenueByDay.keys()
+            ]);
+            for (const day of rentDates) {
+                totals.rentCost +=
+                    percentOf(roomRevenueByDay.get(day), profile.roomRentPercent)
+                    + percentOf(
+                        breakfastRevenueByDay.get(day), profile.breakfastRentPercent
+                    )
+                    + percentOf(parkingRevenueByDay.get(day), profile.parkingRentPercent);
+            }
             if (numberOf(profile.breakfastRentPercent) > 0) {
                 flag(
                     `${hotel}: breakfast rent % was applied to the breakfast net figure. `
@@ -749,20 +881,28 @@
             }
 
             // --- Cleaning --------------------------------------------------------
-            // Departures come from the movement facts, which are authoritative;
-            // the departure mix says how they split across room category and
-            // guest count, which is the pair the rulebook is configured per. The
-            // count being charged for therefore never depends on the mix - only
-            // the rate does.
+            // New imports carry one cleaning split over every occupied night.
+            // Older/temporarily unavailable imports fall back to the historical
+            // checkout-date departure count, and say so.
             const departures = sum(movementRows, "totalDepartures");
             const perDeparture = averageCleaningCost(
                 settings.cleaningCategories, profile.cleaningCostPerMinute
             );
-            const mixed = mixedCleaningCost(
-                filterRows(source.cleaningDepartures, hotel),
+            const allocated = allocatedCleaningCost(
+                filterRows(source.cleaningAllocations, hotel),
                 settings.cleaningCategories,
                 profile.cleaningCostPerMinute
             );
+            // Rolling-deploy compatibility for a response cached before the
+            // nightly-allocation contract was published. It keeps the old total
+            // correct, but only cleaningAllocations can place it across nights.
+            const legacyMixed = allocated === null
+                ? mixedCleaningCost(
+                    filterRows(source.cleaningDepartures, hotel),
+                    settings.cleaningCategories,
+                    profile.cleaningCostPerMinute
+                )
+                : null;
             if (perDeparture === null) {
                 if (departures > 0) {
                     flag(
@@ -772,28 +912,38 @@
                     );
                 }
             }
-            else if (mixed === null) {
-                totals.cleaningCost += departures * perDeparture;
-                flag(
-                    `${hotel}: cleaning cost is the flat average of its configured category and `
-                    + "occupancy rows, multiplied by departures. The departure mix that would "
-                    + "weight it by the rooms actually vacated has not been imported for this "
-                    + "period.",
-                    "cleaningCost"
-                );
-            }
-            else {
-                totals.cleaningCost += departures * mixed.costPerDeparture;
-                if (mixed.unconfigured.length) {
+            else if (allocated) {
+                totals.cleaningCost += allocated.totalCost;
+                if (allocated.unconfigured.length) {
                     flag(
-                        `${hotel}: departures from ${mixed.unconfigured.join(", ")} were costed at `
+                        `${hotel}: stays in ${allocated.unconfigured.join(", ")} were costed at `
                         + "this property's average, because that room category has no cleaning "
                         + "rows. Set its beds and minutes in Cost Input.",
                         "cleaningCost"
                     );
                 }
             }
-
+            else if (legacyMixed) {
+                totals.cleaningCost += departures * legacyMixed.costPerDeparture;
+                if (legacyMixed.unconfigured.length) {
+                    flag(
+                        `${hotel}: departures from ${legacyMixed.unconfigured.join(", ")} were costed at `
+                        + "this property's average, because that room category has no cleaning "
+                        + "rows. Set its beds and minutes in Cost Input.",
+                        "cleaningCost"
+                    );
+                }
+            }
+            else {
+                totals.cleaningCost += departures * perDeparture;
+                flag(
+                    `${hotel}: cleaning cost is the flat average of its configured category and `
+                    + "occupancy rows, charged on departure dates. The nightly allocation that "
+                    + "would split each reservation across its occupied dates has not been "
+                    + "imported for this period.",
+                    "cleaningCost"
+                );
+            }
             // --- Arrivals ---------------------------------------------------------
             // A property that does not staff reception by arrival volume turns
             // this off. That is a decision, so it produces neither a cost nor a
@@ -938,6 +1088,7 @@
         summarize,
         calculateGop,
         alignToComparison,
+        applySpitAdjustments,
         // Exported for the tests: the nearest-band fallback and the checkbox
         // coercion are both easy to get subtly wrong and neither is reachable
         // through calculateGop without building a whole fixture.
@@ -947,6 +1098,7 @@
         // figure with a fallback, which is the part that is easy to get wrong in
         // a way no total would reveal.
         mixedCleaningCost,
+        allocatedCleaningCost,
         effectiveDistributionPercent
     };
     if (typeof module === "object" && module.exports) module.exports = api;
