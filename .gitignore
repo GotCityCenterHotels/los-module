@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Azure Functions local development settings. This is the file the Functions
+# tooling expects real connection strings and keys to be pasted into, and it was
+# tracked - so the first developer to point it at a real database would have
+# committed those credentials. local.settings.json.example carries the shape.
+local.settings.json

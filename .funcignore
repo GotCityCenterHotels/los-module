@@ -1,0 +1,78 @@
+# Files excluded from the Function App deployment package.
+#
+# The runtime needs function_app.py, host.json, requirements.txt, the four
+# first-party packages (services/, queries/, shared/, plus cost_database.py and
+# database.py) and - load-bearing, easy to miss - the whole of sql/.
+#
+# sql/ is NOT build-time-only. The schema services read migrations off disk on
+# each worker's first request (services/cost_schema_service.py:14,
+# los_schema_service.py:15, supplement_schema_service.py:14,
+# import_job_schema_service.py) and shared/sql_runner.py reads sql/export/ and
+# sql/import/ for every dataset in shared/pipeline.py. It stays, all 161KB of it.
+#
+# Everything below is either the browser app, the test suite, operator scripts,
+# or documentation. None of it is imported or read by a running function, and on
+# Flex Consumption the package is mounted read-only at cold start, so shipping
+# it buys nothing and lengthens the mount.
+
+# Version control and CI
+.git*
+.github/
+.vscode/
+
+# Bytecode is deliberately NOT excluded here.
+#
+# A read-only package mount cannot have .pyc WRITTEN to it, which is exactly why
+# shipping them matters: without them every cold start recompiles all ~417KB of
+# first-party source, every time, and can never cache the result. Reading a .pyc
+# from a read-only mount works fine. The CI build compiles them on purpose (see
+# the compileall step in .github/workflows/main_los-functions.yml) with
+# unchecked-hash invalidation, so a zip round trip cannot invalidate them on
+# mtime.
+#
+# The one thing that makes them worthless is a magic-tag mismatch: a .pyc built
+# by a different Python minor version than the runtime is silently ignored, not
+# used. That is why PYTHON_VERSION in the workflow has to track the Function
+# App's configured runtime version.
+#
+# .python_packages is a local `pip install --target` tree. Remote build resolves
+# requirements.txt on Azure, so shipping a locally-built one only risks a
+# platform mismatch.
+.python_packages/
+
+# Local development settings. Azure App Settings supply these in the cloud.
+local.settings.json
+
+# The browser application. Static Web Apps deploys frontend/ from its own
+# workflow (.github/workflows/azure-static-web-apps-*.yml, app_location: /frontend).
+frontend/
+node_modules/
+package.json
+package-lock.json
+
+# Test suite and its fixtures
+tests/
+.pytest_cache/
+.coverage
+
+# Operator and one-off scripts. Run from a checkout, not from the deployed app.
+scripts/
+backfill_supplement.py
+benchmark_los.py
+benchmark_supplement_grid.py
+migrate_supplement.py
+profile_supplement_source.py
+validate_los_read_model.py
+validate_supplement_parity.py
+
+# Captured profiler output, kept for reference in the repo only.
+supplement-profile.json
+
+# Documentation
+*.md
+docs/
+
+# Empty legacy v1 function directories, superseded by the v2 model in
+# function_app.py. They hold nothing but stale bytecode.
+costdata/
+TimerFunc/

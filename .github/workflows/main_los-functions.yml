@@ -78,6 +78,34 @@ jobs:
       - name: Run frontend tests
         run: npm test
 
+      # Precompile first-party source so a cold start loads bytecode instead of
+      # parsing ~417KB of Python it cannot cache. Worth ~145-190ms per cold
+      # start, and worth exactly nothing if the magic tag does not match the
+      # runtime - a .pyc from another minor version is ignored, not used. So
+      # PYTHON_VERSION above MUST track the Function App's configured Python
+      # version; the step prints both halves of that contract for the log.
+      #
+      # unchecked-hash, not the default timestamp invalidation: the artifact goes
+      # through a zip/unzip round trip that does not preserve source mtimes, and
+      # a timestamp-invalidated .pyc would be discarded on arrival.
+      - name: Precompile first-party bytecode
+        run: |
+          echo "compiling with $(python -V), for a runtime pinned at ${{ env.PYTHON_VERSION }}"
+          python -m compileall -q --invalidation-mode unchecked-hash \
+            function_app.py cost_database.py database.py \
+            services queries shared
+          echo "compiled $(find services queries shared -name '*.pyc' | wc -l) modules"
+
+      # Bytecode is kept on purpose - see the compileall step above. The Flex
+      # mount is read-only, so the worker can never write a .pyc itself; without
+      # one in the package it recompiles every module on every cold start and
+      # throws the result away. This job checks out fresh, so the only .pyc in
+      # here are the ones compileall just produced against PYTHON_VERSION.
+      #
+      # The exclusions below mirror .funcignore. functions-action honours
+      # .funcignore when it packages the directory, so this is belt-and-braces -
+      # but it also keeps the artifact that moves between these two jobs small.
+      # tests/ is excluded, so its own __pycache__ goes with it.
       - name: Zip artifact for deployment
         run: |
           zip -r release.zip . \
@@ -85,7 +113,35 @@ jobs:
             -x ".venv/*" \
             -x ".git/*" \
             -x ".github/*" \
-            -x "__pycache__/*"
+            -x ".python_packages/*" \
+            -x "frontend/*" \
+            -x "tests/*" \
+            -x "scripts/*" \
+            -x "node_modules/*" \
+            -x "*.md" \
+            -x "supplement-profile.json" \
+            -x "local.settings.json"
+
+      # A deploy that silently dropped sql/ would still start, and would still
+      # serve every database that had already taken its migrations - then fail the
+      # first request on a freshly created one, months later, in whichever
+      # environment happened to get rebuilt. The schema services and
+      # shared/sql_runner.py read these files off disk at runtime, so assert the
+      # package still carries them.
+      - name: Verify the package keeps its runtime SQL
+        run: |
+          for required in \
+            sql/migrations/017_cost_publication.sql \
+            sql/tables/cost_input_settings.sql \
+            sql/export/parking_data.sql \
+            sql/import/upsert_parking_data.sql
+          do
+            unzip -l release.zip "$required" | grep -q "$required" \
+              || { echo "release.zip is missing $required"; exit 1; }
+          done
+          test "$(unzip -l release.zip '*.pyc' | grep -c '\.pyc')" -gt 0 \
+            || { echo "release.zip carries no bytecode; cold start will recompile"; exit 1; }
+          echo "release.zip: $(stat -c%s release.zip) bytes"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

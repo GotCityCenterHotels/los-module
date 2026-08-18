@@ -17,7 +17,9 @@ from services.hotels_service import fetch_hotels
 from services.los_facts_service import (
     LosReadModelUnavailableError,
     fetch_los_facts,
+    fetch_los_publication,
     fetch_los_read_model_status,
+    los_read_model_enabled,
 )
 from services.los_schema_service import LosSchemaError
 from services.los_sync_service import sync_los
@@ -84,9 +86,21 @@ COST_DATA_RESPONSE_CACHE_MAX_ENTRIES = max(
 # without importing facts or saving settings. Increment this when the Cost Data
 # response contract or calculation changes.
 COST_DATA_RESPONSE_SCHEMA_VERSION = 2
-_cost_response_cache = OrderedDict()
-_cost_response_inflight = {}
-_cost_response_lock = Lock()
+
+# LOS facts is the largest response the app produces - a year of per-hotel,
+# per-LOS rows - and it had no server-side byte cache at all, only a validator.
+# Two browsers, two tabs, or the Average LOS and LOS Distribution pages asking
+# for the same published range each paid the whole query, the whole Python row
+# shaping, and the whole gzip. Four entries cover a year and its neighbours for
+# both comparison bases.
+LOS_FACTS_MAX_AGE_SECONDS = int(os.environ.get("LOS_FACTS_MAX_AGE_SECONDS", "300"))
+LOS_FACTS_RESPONSE_CACHE_MAX_ENTRIES = max(
+    1,
+    int(os.environ.get("LOS_FACTS_RESPONSE_CACHE_MAX_ENTRIES", "4")),
+)
+# Increment when the LOS facts response contract or row shape changes, so a
+# deployment cannot serve new-shaped bytes under an old validator.
+LOS_FACTS_RESPONSE_SCHEMA_VERSION = 1
 # Matches the server-side TTL in services/hotels_service.py and the browser-side
 # one in frontend/los-api.js, so all three agree on how long a hotel list stands.
 HOTEL_LIST_MAX_AGE_SECONDS = int(
@@ -300,81 +314,133 @@ def content_hash_response(req, payload, prefix, max_age):
     )
 
 
-def _cost_response(req, entry, etag):
-    headers = {
-        "ETag": etag,
-        "Cache-Control": f"private, max-age={COST_DATA_MAX_AGE_SECONDS}",
-        "Vary": "Accept-Encoding",
-    }
-    accepts_gzip = "gzip" in (
-        req.headers.get("Accept-Encoding") or ""
-    ).lower()
-    body = entry[1] if accepts_gzip else entry[0]
-    if accepts_gzip:
-        headers["Content-Encoding"] = "gzip"
-    return func.HttpResponse(
-        body=body,
-        status_code=200,
-        mimetype="application/json",
-        headers=headers,
-    )
+class VersionedResponseCache:
+    """Complete response bytes, built once per publication and reused.
+
+    Every read route here serves a published snapshot, so identical parameters
+    against an unchanged publication are identical bytes. Two things follow, and
+    this holds both: a matching validator can be answered before any query runs,
+    and a miss can be built once for however many callers want it at the same
+    moment rather than once each.
+
+    Both encodings are kept. Which one goes on the wire is the client's choice,
+    and compressing the same body again per request was the second-largest CPU
+    cost on these routes after the query itself.
+    """
+
+    def __init__(self, name, max_age_seconds, max_entries):
+        self.name = name
+        self.max_age_seconds = max_age_seconds
+        self.max_entries = max_entries
+        # Exposed rather than private: the tests reach for these to isolate one
+        # case from the next, and a worker-local cache has no other seam.
+        self.entries = OrderedDict()
+        self.inflight = {}
+        self._lock = Lock()
+
+    def _headers(self, etag):
+        return {
+            "ETag": etag,
+            "Cache-Control": f"private, max-age={self.max_age_seconds}",
+            "Vary": "Accept-Encoding",
+        }
+
+    def _respond(self, req, entry, etag):
+        headers = self._headers(etag)
+        accepts_gzip = "gzip" in (
+            req.headers.get("Accept-Encoding") or ""
+        ).lower()
+        if accepts_gzip:
+            headers["Content-Encoding"] = "gzip"
+        return func.HttpResponse(
+            body=entry[1] if accepts_gzip else entry[0],
+            status_code=200,
+            mimetype="application/json",
+            headers=headers,
+        )
+
+    def not_modified(self, etag):
+        return func.HttpResponse(status_code=304, headers=self._headers(etag))
+
+    def respond(self, req, cache_key, etag, payload_factory):
+        """Answer from the validator, then the cache, then a shared build.
+
+        ``payload_factory`` returns ``(payload, cacheable)``. A degraded payload
+        - one assembled after a dependency failed - is served but not retained.
+        """
+        if req.headers.get("If-None-Match") == etag:
+            return self.not_modified(etag)
+
+        with self._lock:
+            entry = self.entries.pop(cache_key, None)
+            if entry is not None:
+                self.entries[cache_key] = entry
+                return self._respond(req, entry, etag)
+
+            pending = self.inflight.get(cache_key)
+            if pending is None:
+                pending = Future()
+                self.inflight[cache_key] = pending
+                owns_build = True
+            else:
+                owns_build = False
+
+        if not owns_build:
+            return self._respond(req, pending.result(), etag)
+
+        try:
+            payload, cacheable = payload_factory()
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            entry = (body, gzip.compress(body, compresslevel=5))
+        except BaseException as error:
+            pending.set_exception(error)
+            raise
+        else:
+            if cacheable:
+                with self._lock:
+                    self.entries[cache_key] = entry
+                    while len(self.entries) > self.max_entries:
+                        self.entries.popitem(last=False)
+            pending.set_result(entry)
+            return self._respond(req, entry, etag)
+        finally:
+            with self._lock:
+                if self.inflight.get(cache_key) is pending:
+                    del self.inflight[cache_key]
+
+
+_cost_response_bytes = VersionedResponseCache(
+    "costdata",
+    COST_DATA_MAX_AGE_SECONDS,
+    COST_DATA_RESPONSE_CACHE_MAX_ENTRIES,
+)
+_los_facts_response_bytes = VersionedResponseCache(
+    "los-facts",
+    LOS_FACTS_MAX_AGE_SECONDS,
+    LOS_FACTS_RESPONSE_CACHE_MAX_ENTRIES,
+)
+
+# The names the tests and the rest of this module already use. Same objects, so
+# clearing either one clears the cache it names.
+_cost_response_cache = _cost_response_bytes.entries
+_cost_response_inflight = _cost_response_bytes.inflight
 
 
 def versioned_cost_response(req, cache_key, etag, payload_factory):
-    """Build and cache complete Cost Data response bytes once per publication.
+    return _cost_response_bytes.respond(req, cache_key, etag, payload_factory)
 
-    The ETag is derived from the Database A publication and request parameters,
-    so a matching validator can answer before any fact query or JSON encoding.
-    Concurrent cold requests share the same complete build.
-    """
-    if req.headers.get("If-None-Match") == etag:
-        return func.HttpResponse(
-            status_code=304,
-            headers={
-                "ETag": etag,
-                "Cache-Control": (
-                    f"private, max-age={COST_DATA_MAX_AGE_SECONDS}"
-                ),
-                "Vary": "Accept-Encoding",
-            },
-        )
 
-    with _cost_response_lock:
-        entry = _cost_response_cache.pop(cache_key, None)
-        if entry is not None:
-            _cost_response_cache[cache_key] = entry
-            return _cost_response(req, entry, etag)
-
-        pending = _cost_response_inflight.get(cache_key)
-        if pending is None:
-            pending = Future()
-            _cost_response_inflight[cache_key] = pending
-            owns_build = True
-        else:
-            owns_build = False
-
-    if not owns_build:
-        return _cost_response(req, pending.result(), etag)
-
-    try:
-        payload, cacheable = payload_factory()
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        entry = (body, gzip.compress(body, compresslevel=5))
-    except BaseException as error:
-        pending.set_exception(error)
-        raise
-    else:
-        if cacheable:
-            with _cost_response_lock:
-                _cost_response_cache[cache_key] = entry
-                while len(_cost_response_cache) > COST_DATA_RESPONSE_CACHE_MAX_ENTRIES:
-                    _cost_response_cache.popitem(last=False)
-        pending.set_result(entry)
-        return _cost_response(req, entry, etag)
-    finally:
-        with _cost_response_lock:
-            if _cost_response_inflight.get(cache_key) is pending:
-                del _cost_response_inflight[cache_key]
+def _los_facts_payload(start_date, end_date, ly_comparison_basis, facts):
+    return {
+        "parameters": {
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "lyComparisonBasis": ly_comparison_basis,
+        },
+        "runId": facts.run_id,
+        "rowCount": len(facts.rows),
+        "data": facts.rows,
+    }
 
 
 def shift_cost_comparison_date(value, basis):
@@ -508,40 +574,69 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
 
     start_date, end_date, ly_comparison_basis = parameters
 
+    # The raw-query fallback reads live source data, so it has no publication to
+    # validate against and must not be cached or reused.
+    if not los_read_model_enabled():
+        try:
+            facts = fetch_los_facts(start_date, end_date, ly_comparison_basis)
+        except (LosReadModelUnavailableError, LosSchemaError) as error:
+            return json_response({"error": str(error)}, 503)
+        except Exception:
+            logging.exception("LOS facts endpoint failed")
+            return json_response({"error": "Unable to retrieve LOS facts"}, 500)
+        return compressed_json_response(req, _los_facts_payload(
+            start_date, end_date, ly_comparison_basis, facts
+        ))
+
+    # Resolving the publication first is the whole point. It is one indexed
+    # single-row read, cached for a few seconds, and it is everything the
+    # validator needs - so an If-None-Match repeat is answered here, before the
+    # range scan and before a hundred thousand rows are shaped into JSON. That
+    # repeat used to cost exactly as much as a full 200.
     try:
-        facts = fetch_los_facts(start_date, end_date, ly_comparison_basis)
+        publication = fetch_los_publication()
+    except (LosReadModelUnavailableError, LosSchemaError) as error:
+        return json_response({"error": str(error)}, 503)
+    except Exception:
+        logging.exception("LOS publication lookup failed")
+        return json_response({"error": "Unable to retrieve LOS facts"}, 500)
+
+    # Average LOS and LOS Distribution show the same published facts, so opening
+    # one after the other - or reopening either - is a repeat of a request whose
+    # answer cannot have changed while the publication has not.
+    etag = content_etag("los-facts", "|".join([
+        str(LOS_FACTS_RESPONSE_SCHEMA_VERSION),
+        start_date.isoformat(),
+        end_date.isoformat(),
+        ly_comparison_basis,
+        str(publication.run_id),
+        publication.published_at.isoformat(),
+    ]))
+    cache_key = (
+        LOS_FACTS_RESPONSE_SCHEMA_VERSION,
+        publication.run_id,
+        start_date,
+        end_date,
+        ly_comparison_basis,
+    )
+
+    def build_payload():
+        facts = fetch_los_facts(
+            start_date, end_date, ly_comparison_basis, publication
+        )
+        return _los_facts_payload(
+            start_date, end_date, ly_comparison_basis, facts
+        ), True
+
+    try:
+        return _los_facts_response_bytes.respond(
+            req, cache_key, etag, build_payload
+        )
     except (LosReadModelUnavailableError, LosSchemaError) as error:
         return json_response({"error": str(error)}, 503)
     except Exception:
         logging.exception("LOS facts endpoint failed")
         return json_response({"error": "Unable to retrieve LOS facts"}, 500)
-
-    payload = {
-        "parameters": {
-            "startDate": start_date.isoformat(),
-            "endDate": end_date.isoformat(),
-            "lyComparisonBasis": ly_comparison_basis,
-        },
-        "runId": facts.run_id,
-        "rowCount": len(facts.rows),
-        "data": facts.rows,
-    }
-
-    # The raw-query fallback reads live source data, so it has no publication to
-    # validate against and must not be cached.
-    if facts.run_id is None:
-        return compressed_json_response(req, payload)
-
-    # Average LOS and LOS Distribution show the same published facts, so opening
-    # one after the other - or reopening either - is a repeat of a request whose
-    # answer cannot have changed while the publication has not.
-    return cached_json_response(req, payload, content_etag("los-facts", "|".join([
-        start_date.isoformat(),
-        end_date.isoformat(),
-        ly_comparison_basis,
-        str(facts.run_id),
-        facts.published_at.isoformat(),
-    ])))
 
 
 @app.route(

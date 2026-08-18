@@ -3,6 +3,7 @@ import os
 
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from time import monotonic
 
 from psycopg.rows import dict_row
@@ -26,6 +27,68 @@ class LosReadModelUnavailableError(RuntimeError):
 # be told so. They are None on the raw-query fallback, which has no publication
 # to name.
 LosFacts = namedtuple("LosFacts", ("rows", "run_id", "published_at"))
+
+# The identity on its own, resolvable without touching a fact row. The HTTP
+# layer needs exactly this and nothing else to build the response validator, and
+# it used to get it by running the whole query first - so an If-None-Match repeat
+# paid the full range scan and the full Python row shaping before finding out it
+# only had to answer 304.
+LosPublication = namedtuple("LosPublication", ("run_id", "published_at"))
+
+# Long enough to absorb the burst of requests one page load makes (Average LOS
+# and LOS Distribution read the same publication, and the month picker fans out
+# up to three ranges at once), short enough to stay well inside the 300 second
+# freshness the route already advertises. Matches the sibling pointer in
+# services/cost_publication_service.py.
+_PUBLICATION_CACHE_SECONDS = float(
+    os.environ.get("LOS_PUBLICATION_CACHE_SECONDS", "5")
+)
+_publication_cache = None
+_publication_lock = Lock()
+
+
+def _reset_publication_cache():
+    """Test seam and explicit invalidation for a worker-local cache."""
+    global _publication_cache
+    with _publication_lock:
+        _publication_cache = None
+
+
+def fetch_los_publication():
+    """Which publication the read model would answer from right now.
+
+    One indexed single-row read against Database A, then reused for a few
+    seconds. This is what lets the route put a validator on the response before
+    deciding whether to build a body at all.
+    """
+    global _publication_cache
+    with _publication_lock:
+        cached = _publication_cache
+        if cached is not None and monotonic() < cached[0]:
+            return cached[1]
+
+    ensure_los_schema()
+    with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("""
+                SELECT run_id, published_at
+                FROM functions.los_publication
+                WHERE singleton
+            """)
+            row = cursor.fetchone()
+
+    if row is None:
+        raise LosReadModelUnavailableError(
+            "LOS read model has not been published"
+        )
+
+    publication = LosPublication(row["run_id"], row["published_at"])
+    with _publication_lock:
+        _publication_cache = (
+            monotonic() + _PUBLICATION_CACHE_SECONDS,
+            publication,
+        )
+    return publication
 
 
 def los_read_model_enabled():
@@ -92,26 +155,23 @@ def fetch_los_read_model_status():
     }
 
 
-def _fetch_published_los_facts(start_date, end_date, ly_comparison_basis):
+def _fetch_published_los_facts(
+    start_date, end_date, ly_comparison_basis, publication=None
+):
     ensure_los_schema()
     started_at = monotonic()
+    # Resolving the publication first, on its own, is what lets the fact query
+    # below take a constant run_id and read nothing but its own index. It also
+    # fails fast: with nothing published there is no point scanning for rows that
+    # cannot exist.
+    #
+    # The HTTP layer resolves it before this call now, because it needs the same
+    # two fields to build the response validator. Taking it as an argument is
+    # what stops that from becoming a second round trip for the same row.
+    if publication is None:
+        publication = fetch_los_publication()
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
-            # Resolving the publication first, on its own, is what lets the fact
-            # query below take a constant run_id and read nothing but its own
-            # index. It also fails fast: with nothing published there is no
-            # point scanning for rows that cannot exist.
-            cursor.execute("""
-                SELECT run_id, published_at
-                FROM functions.los_publication
-                WHERE singleton
-            """)
-            publication = cursor.fetchone()
-            if publication is None:
-                raise LosReadModelUnavailableError(
-                    "LOS read model has not been published"
-                )
-
             # The hotel dimension is a handful of rows and every fact row
             # carries a foreign key into it, so joining it per row - across a
             # hundred thousand of them - buys nothing that one lookup table
@@ -136,15 +196,15 @@ def _fetch_published_los_facts(start_date, end_date, ly_comparison_basis):
                   AND comparison_basis = %s
                   AND arrival_date BETWEEN %s AND %s
             """, (
-                publication["run_id"], ly_comparison_basis, start_date, end_date
+                publication.run_id, ly_comparison_basis, start_date, end_date
             ))
             rows = cursor.fetchall()
 
-    if _is_stale(publication["published_at"]):
+    if _is_stale(publication.published_at):
         logging.warning(
             "LOS publication is stale run_id=%s published_at=%s",
-            publication["run_id"],
-            publication["published_at"].isoformat(),
+            publication.run_id,
+            publication.published_at.isoformat(),
         )
 
     facts = []
@@ -167,7 +227,7 @@ def _fetch_published_los_facts(start_date, end_date, ly_comparison_basis):
     elapsed_ms = (monotonic() - started_at) * 1000
     logging.info(
         "LOS read model query completed run_id=%s row_count=%d duration_ms=%.1f",
-        publication["run_id"],
+        publication.run_id,
         len(facts),
         elapsed_ms,
     )
@@ -175,13 +235,15 @@ def _fetch_published_los_facts(start_date, end_date, ly_comparison_basis):
         logging.warning(
             "LOS read model query exceeded target duration_ms=%.1f", elapsed_ms
         )
-    return LosFacts(facts, publication["run_id"], publication["published_at"])
+    return LosFacts(facts, publication.run_id, publication.published_at)
 
 
-def fetch_los_facts(start_date, end_date, ly_comparison_basis):
+def fetch_los_facts(
+    start_date, end_date, ly_comparison_basis, publication=None
+):
     if los_read_model_enabled():
         return _fetch_published_los_facts(
-            start_date, end_date, ly_comparison_basis
+            start_date, end_date, ly_comparison_basis, publication
         )
 
     parameters = {
