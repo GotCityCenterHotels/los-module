@@ -738,11 +738,31 @@ def cost_settings(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(
     route="costdata/import",
     methods=["POST"],
-    # FUNCTION, matching los/import and supplement/import. The Function App
-    # answers on its own public hostname - Static Web Apps is a proxy, not a
-    # gate - so ANONYMOUS here meant anyone on the internet could trigger a full
-    # cross-database import.
-    auth_level=func.AuthLevel.FUNCTION,
+    # ANONYMOUS, matching every other costdata route.
+    #
+    # This was FUNCTION on the premise that "the Function App answers on its own
+    # public hostname - Static Web Apps is a proxy, not a gate". That premise no
+    # longer holds: the app is a Static Web Apps LINKED BACKEND, so App Service
+    # Authentication fronts it and a direct request to the Function App's own
+    # hostname is refused before the route is reached at all - it comes back as
+    # {"code":400,"message":"Login not supported for provider azureStaticWebApps"}.
+    # The site itself is behind Static Web Apps password protection on top of that.
+    #
+    # So the key was not the gate; it was just the reason the operator could not
+    # use the button. Two layers still stand, and they are the same two that
+    # already guard costdata/settings - a PUT that rewrites every cost figure for
+    # every hotel, and which has always been ANONYMOUS. This import is idempotent
+    # upserts against the same data the nightly timer rewrites anyway, so it is the
+    # less consequential of the two by some distance.
+    #
+    # What would invalidate this: unlinking the backend from Static Web Apps, or
+    # disabling App Service Authentication on the Function App. Either one leaves
+    # every costdata route open, not only this one, so the check belongs to the
+    # deployment rather than to this decorator - see COST_RESERVATION_MIX_DEPLOYMENT.md.
+    #
+    # los/import and supplement/import are deliberately left as FUNCTION. Nothing
+    # in the application calls them, so nothing is blocked by their staying shut.
+    auth_level=func.AuthLevel.ANONYMOUS,
 )
 @app.queue_output(
     arg_name="message",

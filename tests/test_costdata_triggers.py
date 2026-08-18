@@ -23,6 +23,36 @@ cost_pool.close()
 pool.close()
 
 
+_registered_functions = None
+
+
+def registered_functions():
+    """function_app.app.get_functions(), computed once for the whole module.
+
+    It is not idempotent: the second call in a process re-registers every name and
+    then rejects the list for containing duplicates, so two tests each asking for
+    it means whichever runs second fails with a confusing complaint about a
+    function neither of them mentions.
+    """
+    global _registered_functions
+    if _registered_functions is None:
+        _registered_functions = function_app.app.get_functions()
+    return _registered_functions
+
+
+def http_routes():
+    """{route: authLevel} for every HTTP-triggered function."""
+    levels = {}
+    for registered in registered_functions():
+        for binding in registered.get_bindings():
+            shape = binding.get_dict_repr()
+            if shape.get("type") == "httpTrigger":
+                levels[shape.get("route")] = (
+                    str(shape.get("authLevel")).lower().replace("authlevel.", "")
+                )
+    return levels
+
+
 class FakeTimer:
     past_due = False
 
@@ -184,17 +214,11 @@ class CostDataTriggerTests(unittest.TestCase):
         self.assertTrue(fail.call_args.args[2])
 
     def test_v2_function_app_registers_manual_and_timer_triggers(self):
-        registered_functions = function_app.app.get_functions()
         function_names = {
             registered.get_function_name()
-            for registered in registered_functions
+            for registered in registered_functions()
         }
-        routes = {
-            binding.get_dict_repr().get("route")
-            for registered in registered_functions
-            for binding in registered.get_bindings()
-            if binding.get_dict_repr().get("type") == "httpTrigger"
-        }
+        routes = set(http_routes())
 
         self.assertIn("CostDataImport", function_names)
         self.assertIn("CostDataTimer", function_names)
@@ -210,6 +234,34 @@ class CostDataTriggerTests(unittest.TestCase):
         self.assertIn("los/import", routes)
         self.assertIn("los/status", routes)
         self.assertNotIn("costdata/settings/hotels", routes)
+
+    def test_every_costdata_route_is_reachable_from_the_page(self):
+        """The import is guarded by the platform, not by a key the operator lacks.
+
+        It was FUNCTION on the premise that the Function App answers on its own
+        public hostname. It does not: the app is a Static Web Apps linked backend,
+        so App Service Authentication refuses a direct request before the route is
+        reached, and the site is behind Static Web Apps password protection on top.
+        The key gated nothing except the operator, who could not use the button at
+        all - while costdata/settings, a PUT that rewrites every cost figure for
+        every hotel, has always been ANONYMOUS behind those same two layers.
+        """
+        levels = http_routes()
+        cost_routes = {
+            route: level for route, level in levels.items()
+            if route and route.startswith("costdata/")
+        }
+        self.assertIn("costdata/import", cost_routes)
+        # One posture for the whole family, so no single route is the odd one out
+        # that quietly cannot be called.
+        self.assertEqual(set(cost_routes.values()), {"anonymous"}, cost_routes)
+        # Polling a job needs no credential either, or the button could start an
+        # import and then not be able to watch it.
+        self.assertEqual(levels.get("imports/{job_id}"), "anonymous")
+        # The other two import families stay shut: nothing in the application calls
+        # them, so nothing is blocked by that.
+        for route in ("los/import", "supplement/import"):
+            self.assertEqual(levels.get(route), "function", route)
 
 
 if __name__ == "__main__":
