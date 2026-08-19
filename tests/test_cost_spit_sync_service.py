@@ -155,6 +155,54 @@ class CostSpitSyncTests(unittest.TestCase):
         _start, end = sync.coverage_window(date(2026, 8, 19))
         self.assertGreater(end, date(2026, 8, 19))
 
+    def test_the_pages_own_default_request_is_inside_published_coverage(self):
+        """The one reading SPIT has to answer.
+
+        The page opens on 1 January to today and asks for the same span last
+        year, so the snapshot only covers that - not an arbitrary picked range.
+        The arithmetic on the two sides is written in different places (the route
+        shifts the requested dates, the publisher shifts the coverage window), so
+        this walks a year of days and asserts they agree on every one of them,
+        for both bases, including the leap-year and staleness edges that a single
+        example would step over.
+        """
+        from shared.comparison_dates import shift_cost_comparison_date
+        from services.cost_data_service import COST_SPIT_MAX_STALE_DAYS
+
+        for offset in range(0, 366):
+            today = date(2026, 1, 1) + timedelta(days=offset)
+            plan = sync.snapshot_plan(today)
+
+            # What the route asks for, from the page's default range.
+            requested_start = date(today.year, 1, 1)
+            requested_end = today
+
+            for basis in sync.COMPARISON_BASES:
+                published = plan[basis]
+                asked_start = shift_cost_comparison_date(requested_start, basis)
+                asked_end = shift_cost_comparison_date(requested_end, basis)
+
+                self.assertGreaterEqual(
+                    asked_start, published["start_date"],
+                    f"{basis} on {today}: range starts before coverage",
+                )
+                self.assertLessEqual(
+                    asked_end, published["end_date"],
+                    f"{basis} on {today}: range ends after coverage",
+                )
+
+            # And the same request still fits a publication left over from a few
+            # nights ago, which is what the staleness allowance lets us serve.
+            stale_plan = sync.snapshot_plan(
+                today - timedelta(days=COST_SPIT_MAX_STALE_DAYS)
+            )
+            for basis in sync.COMPARISON_BASES:
+                self.assertLessEqual(
+                    shift_cost_comparison_date(requested_end, basis),
+                    stale_plan[basis]["end_date"],
+                    f"{basis} on {today}: a stale publication cannot cover today",
+                )
+
     def test_the_two_bases_are_streamed_concurrently(self):
         """Two independent source queries on their own connections writing
         disjoint rows. Run one after the other, their durations simply added."""
