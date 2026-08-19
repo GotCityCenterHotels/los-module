@@ -1068,11 +1068,20 @@ tbody tr.total-row:hover {
 
 .cost-query {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    /* One field per row. A native date input has a minimum width of its own -
+       four digits, two separators, two more pairs and a calendar button - and
+       half of this sidebar is under it, which is what took the picker apart. */
+    grid-template-columns: minmax(0, 1fr);
     gap: 14px 12px;
     align-items: start;
     align-content: start;
     padding: 18px 18px 20px;
+}
+
+.cost-query input[type="date"] {
+    /* Chrome will not lay the segments out below this and starts dropping
+       parts of the control instead of scrolling it. */
+    min-width: 150px;
 }
 
 .cost-query .filter-field {
@@ -1115,13 +1124,6 @@ tbody tr.total-row:hover {
     color: #475467;
     font-size: 13px;
     font-weight: 600;
-}
-
-.line-toggles-note {
-    margin: 2px 0 10px;
-    color: #98a2b3;
-    font-size: 11.5px;
-    line-height: 1.45;
 }
 
 .line-toggle-list {
@@ -1224,20 +1226,44 @@ tbody tr.total-row:hover {
 }
 
 .gop-row th {
-    padding: 9px 0;
+    padding: 9px 12px 9px 0;
     color: #344054;
     font-size: 13.5px;
     font-weight: 500;
     text-align: left;
 }
 
+/* Which point in time each column is read at, said once at the top rather than
+   on every row. */
+.gop-head-row th {
+    padding: 0 0 8px 14px;
+    border-bottom: 1px solid #e4e7ec;
+    color: #667085;
+    font-size: 10.5px;
+    font-weight: 750;
+    letter-spacing: 0.08em;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.gop-head-row th.is-comparison {
+    color: #98a2b3;
+}
+
 .gop-amount {
-    padding: 9px 0;
+    padding: 9px 0 9px 14px;
     color: var(--cost-ink);
     font-size: 15px;
     font-variant-numeric: tabular-nums;
     text-align: right;
     white-space: nowrap;
+}
+
+/* Last year, in both of its readings: the same figures at a lower contrast, so
+   the column the reader is accountable for stays the one that reads first. */
+.gop-amount.is-comparison {
+    color: #98a2b3;
+    font-size: 13.5px;
 }
 
 .gop-row.is-revenue th,
@@ -1253,6 +1279,12 @@ tbody tr.total-row:hover {
 
 .gop-row.is-cost .gop-amount {
     color: #b42318;
+}
+
+/* A cost is still a cost last year, so it is still red - but a weaker one, or
+   three columns of red compete for the same alarm. */
+.gop-row.is-cost .gop-amount.is-comparison {
+    color: #dc8b84;
 }
 
 /* The first cost row, which is the one immediately after the last revenue
@@ -1274,6 +1306,14 @@ tbody tr.total-row:hover {
 
 .gop-row.is-result .gop-amount.is-negative {
     color: #b42318;
+}
+
+.gop-row.is-result .gop-amount.is-comparison {
+    font-size: 15px;
+}
+
+.gop-row.is-result .gop-amount.is-comparison.is-negative {
+    color: #dc8b84;
 }
 
 /* Every derivation that the fact data cannot support exactly is stated here
@@ -1304,10 +1344,17 @@ tbody tr.total-row:hover {
     animation: cost-rise 320ms ease-out both;
 }
 
+/* Two columns, not three, and no member of either comes and goes: the reset
+   control moved out from between them precisely because appearing in the middle
+   of a grid re-measured both tracks and slid the controls out from under the
+   pointer that had just clicked one. */
 .gop-chart-panel .gop-heading {
     display: grid;
-    grid-template-columns: minmax(150px, 1fr) auto minmax(150px, 1fr);
+    grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
     align-items: center;
+    /* The actions wrap onto a second line at some widths; reserving both keeps
+       the plot below from stepping up and down as they do. */
+    min-height: 44px;
     margin-bottom: 2px;
 }
 
@@ -1320,9 +1367,20 @@ tbody tr.total-row:hover {
     justify-self: end;
 }
 
+/* Directly under the month row, the width of the plot it resets, and always
+   present: only the label appears and disappears. A control that is removed
+   from the flow on click takes every pixel below it with it, which is what made
+   zooming feel like the page jumping. */
+.gop-chart-reset-row {
+    /* The same alignment the timeline uses, so the bar sits under the buttons
+       rather than under the axis labels. */
+    padding: 4px 2.2% 0 6.9%;
+}
+
 .chart-reset {
-    width: auto;
-    height: 32px;
+    display: block;
+    width: 100%;
+    height: 30px;
     padding: 0 12px;
     border: 1px solid #d8d2ea;
     border-radius: 6px;
@@ -1333,10 +1391,30 @@ tbody tr.total-row:hover {
     transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
 }
 
-.chart-reset:hover {
+.chart-reset:hover:not(:disabled) {
     border-color: #7f56d9;
     background: #f4f0ff;
     color: #53389e;
+}
+
+/* Nothing to reset. It keeps its height and loses everything that invites a
+   click, including its label, which the script empties. */
+.chart-reset:disabled {
+    border-color: #eaecf0;
+    border-style: dashed;
+    background: transparent;
+    cursor: default;
+}
+
+/* What the chart is currently showing, and which button above produced it. */
+.gop-chart-scope {
+    min-height: 30px;
+    margin: 6px 0 0;
+    padding: 0 1px;
+    color: #667085;
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.35;
 }
 
 .chart-comparison-buttons {
@@ -1379,8 +1457,14 @@ tbody tr.total-row:hover {
 }
 
 .gop-chart-legend {
-    gap: 20px;
+    flex-wrap: wrap;
+    gap: 8px 20px;
+    align-items: center;
+    /* Its own row now, and the two comparison entries appear in it. Holding the
+       height means switching a comparison on does not lift the whole chart. */
+    min-height: 38px;
     margin: 0;
+    padding: 4px 2px 0;
     font-size: 12px;
 }
 
@@ -1482,8 +1566,11 @@ tbody tr.total-row:hover {
     overscroll-behavior-inline: contain;
 }
 
+/* All three scroll together inside the viewport, so the reset bar stays the
+   width of the plot it resets however narrow the window gets. */
 .gop-chart,
-.gop-chart-timeline {
+.gop-chart-timeline,
+.gop-chart-reset-row {
     min-width: 760px;
 }
 
@@ -1545,7 +1632,9 @@ tbody tr.total-row:hover {
 }
 
 .chart-time-button:hover,
-.chart-time-button[aria-pressed="true"] {
+.chart-time-button[aria-pressed="true"],
+.chart-time-row.is-month .chart-time-button:hover,
+.chart-time-row.is-month .chart-time-button[aria-pressed="true"] {
     background: #ede9fe;
     color: #6941c6;
 }
@@ -1587,15 +1676,54 @@ tbody tr.total-row:hover {
     stroke-width: 1.5;
 }
 
-.gop-chart-note {
-    margin: 6px 2px 0;
-    color: #667085;
-    font-size: 11.5px;
+/* Behind the bars of the period whose breakdown is open. */
+.gop-bar-selected {
+    fill: rgba(124, 58, 237, 0.09);
+    stroke: rgba(124, 58, 237, 0.35);
+    stroke-width: 1;
 }
 
-.gop-chart-note strong {
-    color: #344054;
-    font-weight: 650;
+/* Every band opens its own breakdown, so every band is clickable. */
+.gop-chart .chart-hit-area {
+    cursor: pointer;
+}
+
+/* One bar, opened. Every revenue and cost group behind it, in the same three
+   columns the statement uses, because "the bar is taller than last year" is
+   never the end of the question. */
+.gop-bar-detail {
+    margin: 14px 0 0;
+    padding: 14px 16px 4px;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+    background: #fbfcfd;
+}
+
+.gop-bar-detail-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+}
+
+.gop-bar-detail-heading h3 {
+    margin: 0;
+    color: var(--cost-ink);
+    font-size: 17px;
+    letter-spacing: -0.02em;
+}
+
+.gop-bar-detail-heading .section-eyebrow {
+    margin-bottom: 4px;
+}
+
+.gop-bar-detail-wrapper {
+    overflow-x: auto;
+    margin-top: 6px;
+}
+
+.gop-bar-detail-table {
+    min-width: 420px;
 }
 
 /* A comparison that could not be loaded. Not the page's error panel: this
@@ -1791,14 +1919,22 @@ tbody tr.total-row:hover {
     .gop-chart-panel .gop-heading {
         display: flex;
         align-items: flex-start;
+        min-height: 0;
     }
 
     .gop-heading-actions {
         justify-content: flex-start;
     }
 
-    .chart-reset {
-        order: 3;
+    /* Wrapping legends and a narrower plot both make these taller than the
+       desktop reservation, and a fixed one would only clip them. */
+    .gop-chart-legend,
+    .gop-chart-scope {
+        min-height: 0;
+    }
+
+    .gop-bar-detail {
+        padding: 12px 12px 4px;
     }
 }
 
@@ -3907,8 +4043,10 @@ tbody tr.total-row:hover {
         grid-template-columns: minmax(0, 1fr);
     }
 
+    /* Wider than the sidebar allowed, so the fields can pair up again - but
+       not below what a native date input needs to render its segments. */
     .cost-query {
-        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     }
 
     .cost-query .line-toggle-list {

@@ -71,13 +71,17 @@
         showLyFinal: document.getElementById("gopChartShowLyFinal"),
         showSpit: document.getElementById("gopChartShowSpit"),
         lyBasis: document.getElementById("gopChartLyBasis"),
-        chartNote: document.getElementById("gopChartNote"),
         comparisonNote: document.getElementById("gopComparisonNote"),
         lyLegend: document.querySelectorAll(".gop-legend-ly-entry"),
         comparisonCostLabel: document.getElementById("gopComparisonCostLabel"),
         comparisonRevenueLabel: document.getElementById("gopComparisonRevenueLabel"),
         chartReset: document.getElementById("gopChartReset"),
+        chartScope: document.getElementById("gopChartScope"),
         chartTimeline: document.getElementById("gopChartTimeline"),
+        barDetail: document.getElementById("gopBarDetail"),
+        barDetailTitle: document.getElementById("gopBarDetailTitle"),
+        barDetailRows: document.getElementById("gopBarDetailRows"),
+        barDetailClose: document.getElementById("gopBarDetailClose"),
         loadButton: document.getElementById("costLoadButton"),
         status: document.getElementById("costStatus"),
         scope: document.getElementById("costScope"),
@@ -131,11 +135,28 @@
     // what the date inputs currently say: the comparison has to be fetched for
     // the range on screen, not for one the reader has typed but not applied yet.
     let loadedRange = null;
-    // Last year's facts, as {key, data}. Fetched only when the comparison is
-    // switched on, and re-fetched when the range or the basis changes.
+    // Last year's facts, as {key, data, spit}. One fetch answers both readings
+    // of last year: `data` is the comparison range as it finally settled, and
+    // the lifecycle adjustments beside it wind that same range back to the
+    // matching point in its own booking curve. Both are columns of the
+    // statement now rather than an extra reading behind a toggle, so this
+    // travels with the range and is re-fetched when the range or the alignment
+    // basis changes - never when the chart switches between them.
     let comparison = null;
+    // Why last year is missing, when it is. Kept apart from the SPIT
+    // availability note: a failed request and an unbuilt snapshot are different
+    // problems with different answers.
+    let comparisonError = "";
+    // Which of the two readings the chart draws beside this year. Null draws
+    // this year alone and leaves both statement columns exactly as they are.
     let comparisonMode = null;
     let chartZoom = null;
+    // The bar the reader has opened, as its period key. Cleared whenever the
+    // buckets change meaning - a new grain, a new zoom, a new query.
+    let selectedPeriodKey = null;
+    // Set when a bar is opened from the keyboard, so redrawing the plot does
+    // not drop focus to the document body.
+    let refocusPeriodKey = null;
     let activeDataset = "roomRevenue";
     // Every group counts until it is switched off in Query settings. Clearing
     // one takes it out of the statement, out of GOP and out of the chart, so
@@ -171,8 +192,10 @@
         // are held while one is already in flight.
         if (elements.showLyFinal) elements.showLyFinal.disabled = value;
         if (elements.showSpit) elements.showSpit.disabled = value;
+        // The basis decides the range both comparison columns are read from,
+        // so it is live whenever there are figures on screen to compare.
         if (elements.lyBasis) {
-            elements.lyBasis.disabled = value || !comparisonMode;
+            elements.lyBasis.disabled = value || !loadedData;
         }
         document.querySelector(".cost-workspace").setAttribute("aria-busy", String(value));
     }
@@ -188,13 +211,13 @@
 
     function comparisonKey() {
         if (!loadedRange) return "";
-        return `${loadedRange.startDate}|${loadedRange.endDate}|${elements.lyBasis.value}|${comparisonMode}`;
+        // Not keyed on which series the chart draws: one response carries
+        // both, so switching between them is a redraw, not a request.
+        return `${loadedRange.startDate}|${loadedRange.endDate}|${elements.lyBasis.value}`;
     }
 
     function syncComparisonControls() {
-        // A basis that changes nothing while the comparison is off is a control
-        // that lies about having an effect.
-        if (elements.lyBasis) elements.lyBasis.disabled = !comparisonMode;
+        if (elements.lyBasis) elements.lyBasis.disabled = !loadedData;
         if (elements.showLyFinal) {
             elements.showLyFinal.setAttribute(
                 "aria-pressed", String(comparisonMode === "final")
@@ -234,27 +257,27 @@
      */
     async function loadComparison(forRange, key) {
         const range = LosFormat.lastYearRange(forRange, elements.lyBasis.value);
-        elements.comparisonNote.hidden = true;
         try {
             const parameters = new URLSearchParams({
                 ...forRange,
                 includeComparison: "true",
                 lyComparisonBasis: elements.lyBasis.value,
-                comparisonMode
+                // Always the SPIT request. It returns the settled comparison
+                // facts and the lifecycle adjustments in one body, which is
+                // both comparison columns for one round trip; asking for
+                // "final" would return the same facts and drop the adjustments.
+                comparisonMode: "spit"
             });
             const payload = await LosApi.fetchJson(
                 `${API_URL}?${parameters}`
             );
             const candidate = payload.comparison || {};
-            if (comparisonMode === "spit" && !candidate.spit?.available) {
-                throw new Error("the historical lifecycle snapshot is not available");
-            }
             comparison = {
                 key,
-                mode: comparisonMode,
                 data: candidate.data || {},
                 spit: candidate.spit || null
             };
+            comparisonError = "";
         }
         catch (error) {
             console.error(error);
@@ -263,11 +286,10 @@
             // clearing the statement: this year's figures are still complete and
             // correct, and hiding them over a comparison that is an extra reading
             // would be the larger loss.
-            const label = comparisonMode === "spit" ? "SPIT" : "LY Final";
-            elements.comparisonNote.textContent =
-                `${label} (${range.startDate} – ${range.endDate}) could not be loaded: `
-                + `${error.message || "the request failed"}. The chart shows this year only.`;
-            elements.comparisonNote.hidden = false;
+            comparisonError =
+                `Last year (${range.startDate} – ${range.endDate}) could not be `
+                + `loaded: ${error.message || "the request failed"}. `
+                + "SPIT LY and FINAL LY are empty; this year is unaffected.";
         }
     }
 
@@ -275,9 +297,9 @@
     // through setLoading, and doing it here as well released them halfway
     // through a load that was still running.
     async function ensureComparison() {
-        if (!comparisonMode || !loadedRange) {
+        if (!loadedRange) {
             comparison = null;
-            elements.comparisonNote.hidden = true;
+            comparisonError = "";
             return;
         }
         const key = comparisonKey();
@@ -296,12 +318,13 @@
                 endDate: elements.endDate.value
             };
             const parameters = new URLSearchParams(range);
-            const wantsComparison = Boolean(comparisonMode);
-            if (wantsComparison) {
-                parameters.set("includeComparison", "true");
-                parameters.set("lyComparisonBasis", elements.lyBasis.value);
-                parameters.set("comparisonMode", comparisonMode);
-            }
+            // Last year travels with every query now: SPIT LY and FINAL LY are
+            // columns of the statement rather than an extra reading behind a
+            // toggle, so there is no reading of this page that does not want
+            // them. The SPIT mode is what carries both.
+            parameters.set("includeComparison", "true");
+            parameters.set("lyComparisonBasis", elements.lyBasis.value);
+            parameters.set("comparisonMode", "spit");
 
             let payload;
             let comparisonFailure = null;
@@ -313,9 +336,8 @@
                 payload = await LosApi.fetchJson(`${API_URL}?${parameters}`);
             }
             catch (error) {
-                if (!wantsComparison) throw error;
                 // Preserve the established partial-failure contract: a problem
-                // building the optional comparison must not hide a valid current
+                // building the comparison must not hide a valid current
                 // statement. Retry only the smaller current-only response.
                 console.error(error);
                 comparisonFailure = error;
@@ -329,6 +351,7 @@
             loadedSettings = payload.costSettings || {};
             loadedRange = range;
             chartZoom = null;
+            selectedPeriodKey = null;
             if (elements.chartGrain) {
                 elements.chartGrain.disabled = false;
                 elements.chartGrain.value = elements.grain.value;
@@ -336,36 +359,27 @@
             populateHotels(payload.hotels || []);
             updateFreshness();
 
-            if (wantsComparison && comparisonMode === "spit"
-                && payload.comparison && !payload.comparison.spit?.available) {
-                comparisonFailure = new Error(
-                    "the historical lifecycle snapshot is not available"
-                );
-            }
-            if (wantsComparison && payload.comparison && !comparisonFailure) {
+            // An unbuilt SPIT snapshot is not a failed comparison: LY Final is
+            // still exact, and the statement says so per column rather than
+            // discarding both.
+            if (payload.comparison && !comparisonFailure) {
                 comparison = {
-                    key: `${range.startDate}|${range.endDate}|${elements.lyBasis.value}|${comparisonMode}`,
-                    mode: comparisonMode,
+                    key: comparisonKey(),
                     data: payload.comparison.data || {},
                     spit: payload.comparison.spit || null
                 };
-                elements.comparisonNote.hidden = true;
+                comparisonError = "";
             }
-            else if (wantsComparison) {
+            else {
                 const previous = LosFormat.lastYearRange(
                     range,
                     elements.lyBasis.value
                 );
                 comparison = null;
-                const label = comparisonMode === "spit" ? "SPIT" : "LY Final";
-                elements.comparisonNote.textContent =
-                    `${label} (${previous.startDate} â€“ ${previous.endDate}) could not be loaded: `
-                    + `${comparisonFailure?.message || "the request failed"}. The chart shows this year only.`;
-                elements.comparisonNote.hidden = false;
-            }
-            else {
-                comparison = null;
-                elements.comparisonNote.hidden = true;
+                comparisonError =
+                    `Last year (${previous.startDate} – ${previous.endDate}) could not be `
+                    + `loaded: ${comparisonFailure?.message || "the request failed"}. `
+                    + "SPIT LY and FINAL LY are empty; this year is unaffected.";
             }
 
             render();
@@ -497,34 +511,109 @@
 
     // The GOP statement is net of VAT throughout: every figure is a net revenue
     // stream or a cost derived from Cost Input. No gross figure appears here.
-    function renderGop() {
-        const statement = CostData.calculateGop(loadedData, {
+    //
+    // Three columns, one label. Last year is costed under today's rulebook, not
+    // last year's: Cost Input is not versioned, so the comparison answers "what
+    // would last year's volumes cost to run now" rather than "what did it cost
+    // then". Its flags are dropped - they would repeat this year's, about the
+    // same configuration.
+    function statementOf(data, grain) {
+        if (!data) return null;
+        return CostData.calculateGop(data, {
             hotelName: elements.hotel.value,
             settingsByHotel: loadedSettings,
-            grain: elements.grain.value,
+            grain,
             activeLines: Array.from(activeLines)
         });
+    }
+
+    // Last year's facts restamped onto this year's dates, in both readings.
+    // SPIT is adjusted before it is aligned: the lifecycle snapshot is keyed on
+    // last year's own stay dates, and restamping first would look every night
+    // up under a date the snapshot has never heard of.
+    function comparisonDatasets(hotels) {
+        if (!comparison) return {final: null, spit: null};
+        const basis = elements.lyBasis.value;
+        return {
+            final: CostData.alignToComparison(comparison.data, basis, hotels),
+            spit: comparison.spit && comparison.spit.available
+                ? CostData.alignToComparison(
+                    CostData.applySpitAdjustments(
+                        comparison.data,
+                        comparison.spit.adjustments || [],
+                        comparison.spit.cutoffDate || ""
+                    ),
+                    basis,
+                    hotels
+                )
+                : null
+        };
+    }
+
+    // One column's figures, keyed by statement line. A null column is one with
+    // nothing behind it, and reads as an em dash rather than as a zero: "we did
+    // not have this" and "this was nothing" are different answers.
+    function amountsOf(statement) {
+        if (!statement) return null;
+        return new Map(statement.lines.map((line) => [line.key, line.amount]));
+    }
+
+    function periodAmountsOf(statement, key) {
+        if (!statement) return null;
+        const period = (statement.periods || []).find(
+            (candidate) => candidate.periodKey === key
+        );
+        return period ? new Map(Object.entries(period.amounts)) : null;
+    }
+
+    function amountCell(line, amounts, isComparison) {
+        const cell = document.createElement("td");
+        cell.className = "gop-amount";
+        if (isComparison) cell.classList.add("is-comparison");
+        const amount = amounts ? amounts.get(line.key) : undefined;
+        if (amount === undefined || amount === null) {
+            cell.textContent = "—";
+            return cell;
+        }
+        cell.textContent = line.type === "cost"
+            ? signedCost(amount)
+            : LosFormat.formatSek(amount);
+        if (line.type === "result" && amount < 0) cell.classList.add("is-negative");
+        return cell;
+    }
+
+    // The label is written once, on the left; everything after it is the same
+    // line read at a different point in time.
+    function statementRows(lines, columns) {
+        return lines.map((line) => {
+            const row = document.createElement("tr");
+            row.className = `gop-row is-${line.type}`;
+            const label = document.createElement("th");
+            label.scope = "row";
+            label.textContent = line.label;
+            row.append(label);
+            columns.forEach((amounts, index) => {
+                row.append(amountCell(line, amounts, index > 0));
+            });
+            return row;
+        });
+    }
+
+    function renderGop() {
+        const grain = elements.grain.value;
+        const statement = statementOf(loadedData, grain);
 
         elements.gopScope.textContent = statement.hotels.length
             ? `${statement.currency} · net excl. VAT · ${statement.hotels.length} `
                 + `${statement.hotels.length === 1 ? "hotel" : "hotels"}`
             : "No hotels selected";
 
-        elements.gopRows.replaceChildren(...statement.lines.map((line) => {
-            const row = document.createElement("tr");
-            row.className = `gop-row is-${line.type}`;
-            const label = document.createElement("th");
-            label.scope = "row";
-            label.textContent = line.label;
-            const amount = document.createElement("td");
-            amount.className = "gop-amount";
-            amount.textContent = line.type === "cost"
-                ? signedCost(line.amount)
-                : LosFormat.formatSek(line.amount);
-            if (line.type === "result" && line.amount < 0) amount.classList.add("is-negative");
-            row.append(label, amount);
-            return row;
-        }));
+        const lastYear = comparisonDatasets(statement.hotels);
+        elements.gopRows.replaceChildren(...statementRows(statement.lines, [
+            amountsOf(statement),
+            amountsOf(statementOf(lastYear.spit, "")),
+            amountsOf(statementOf(lastYear.final, ""))
+        ]));
 
         elements.gopFlags.replaceChildren(...statement.flags.map((message) => {
             const item = document.createElement("li");
@@ -532,55 +621,92 @@
             return item;
         }));
         elements.gopFlags.hidden = statement.flags.length === 0;
+        updateComparisonNote(Boolean(lastYear.spit));
 
-        // Costed under today's rulebook, not last year's: Cost Input is not
-        // versioned, so the comparison answers "what would last year's volumes
-        // cost to run now" rather than "what did it cost then". Its flags are
-        // dropped - they would repeat this year's, about the same configuration.
-        let comparisonData = null;
-        if (comparison) {
-            const source = comparison.mode === "spit"
-                ? CostData.applySpitAdjustments(
-                    comparison.data,
-                    comparison.spit?.adjustments || [],
-                    comparison.spit?.cutoffDate || ""
-                )
-                : comparison.data;
-            comparisonData = CostData.alignToComparison(
-                source, elements.lyBasis.value, statement.hotels
-            );
-        }
-
-        const chartGrain = chartZoom ? "day" : elements.grain.value;
-        const chartData = chartZoom
-            ? dataInRange(loadedData, chartZoom.startDate, chartZoom.endDate)
-            : loadedData;
+        const chartGrain = chartZoom ? "day" : grain;
+        const slice = (data) => (data && chartZoom
+            ? dataInRange(data, chartZoom.startDate, chartZoom.endDate)
+            : data);
         const chartStatement = chartZoom
-            ? CostData.calculateGop(chartData, {
-                hotelName: elements.hotel.value,
-                settingsByHotel: loadedSettings,
-                grain: chartGrain,
-                activeLines: Array.from(activeLines)
-            })
+            ? statementOf(slice(loadedData), chartGrain)
             : statement;
-        const compared = comparisonData
-            ? CostData.calculateGop(
-                chartZoom
-                    ? dataInRange(
-                        comparisonData, chartZoom.startDate, chartZoom.endDate
-                    )
-                    : comparisonData,
-                {
-                    hotelName: elements.hotel.value,
-                    settingsByHotel: loadedSettings,
-                    grain: chartGrain,
-                    activeLines: Array.from(activeLines)
-                }
-            )
+        // Last year period by period is needed for the bars that are drawn and
+        // for a bar the reader has opened, and for nothing else: bucketing a
+        // year of daily facts twice more is not free, and neither reading is on
+        // screen until one of those two things is true.
+        const wantsPeriods = Boolean(comparisonMode) || Boolean(selectedPeriodKey);
+        const finalPeriods = wantsPeriods
+            ? statementOf(slice(lastYear.final), chartGrain)
             : null;
+        const spitPeriods = wantsPeriods
+            ? statementOf(slice(lastYear.spit), chartGrain)
+            : null;
+        const compared = comparisonMode === "spit"
+            ? spitPeriods
+            : comparisonMode === "final" ? finalPeriods : null;
 
         renderGopChart(chartStatement, compared, chartGrain);
         renderChartTimeline();
+        renderBarDetail(chartStatement, spitPeriods, finalPeriods, chartGrain);
+    }
+
+    // A comparison that could not be fetched and a lifecycle snapshot that was
+    // never built are different problems with different answers, so they are
+    // never reported as the same sentence.
+    function updateComparisonNote(spitAvailable) {
+        const message = comparisonError
+            || (comparison && !spitAvailable
+                ? "SPIT LY is not available for this range: the historical "
+                    + "lifecycle snapshot has not been built for it. FINAL LY "
+                    + "and this year are unaffected."
+                : "");
+        if (!message) {
+            elements.comparisonNote.hidden = true;
+            return;
+        }
+        elements.comparisonNote.textContent = message;
+        elements.comparisonNote.hidden = false;
+    }
+
+    // The groups behind one bar. A bar is a single number twice over - what the
+    // period cost and what it earned - and the question it raises is always
+    // which group moved, so opening it answers that in the same three columns
+    // the statement uses.
+    function renderBarDetail(statement, spit, final, grain) {
+        if (!selectedPeriodKey) {
+            elements.barDetail.hidden = true;
+            return;
+        }
+        const amounts = periodAmountsOf(statement, selectedPeriodKey);
+        // A grain, a zoom or a narrower hotel scope can retire the key under an
+        // open panel. Closing it is the honest answer; leaving the previous
+        // period's figures under a heading nobody chose is not.
+        if (!amounts) {
+            selectedPeriodKey = null;
+            elements.barDetail.hidden = true;
+            return;
+        }
+        elements.barDetailTitle.textContent =
+            LosFormat.periodLabel(selectedPeriodKey, grain);
+        elements.barDetailRows.replaceChildren(...statementRows(statement.lines, [
+            amounts,
+            periodAmountsOf(spit, selectedPeriodKey),
+            periodAmountsOf(final, selectedPeriodKey)
+        ]));
+        elements.barDetail.hidden = false;
+    }
+
+    // Clicking the open bar closes it, so the gesture that opened the breakdown
+    // is the one that puts it away.
+    function selectPeriod(key, fromKeyboard) {
+        selectedPeriodKey = selectedPeriodKey === key ? null : key;
+        refocusPeriodKey = fromKeyboard ? key : null;
+        renderGop();
+    }
+
+    function closeBarDetail() {
+        selectedPeriodKey = null;
+        renderGop();
     }
 
     // ---------------------------------------------------------------------
@@ -638,8 +764,7 @@
         );
         const showComparison = Boolean(lastYear);
         // Before the empty check, or an emptied chart keeps the previous
-        // reading's note and legend and claims two bars where there are none.
-        setChartNote(showComparison);
+        // reading's legend and claims two bars where there are none.
         syncComparisonLegend(showComparison);
         if (!periods.length) {
             chartEmpty("Nothing to chart for the hotels and period you selected.");
@@ -775,6 +900,14 @@
 
         const labelStep = Math.max(1, Math.ceil(periods.length / 14));
         periods.forEach((period, index) => {
+            // Behind the bars, not over them: the open period has to be
+            // findable at a glance without any of its own marks being tinted.
+            if (period.periodKey === selectedPeriodKey) {
+                svg.append(svgNode("rect", {
+                    x: margin.left + band * index, y: margin.top,
+                    width: band, height: plotHeight, class: "gop-bar-selected"
+                }));
+            }
             drawStack(period, barLeft(index, false), CHART_COLOURS, false);
             const previous = comparisonPeriods.get(period.periodKey);
             // A period with no counterpart last year draws no second bar at all.
@@ -866,10 +999,12 @@
 
         periods.forEach((period, index) => {
             const previous = comparisonPeriods.get(period.periodKey);
+            const isOpen = period.periodKey === selectedPeriodKey;
             const hit = svgNode("rect", {
                 x: margin.left + band * index, y: margin.top,
                 width: band, height: plotHeight,
-                class: "chart-hit-area", tabindex: "0",
+                class: "chart-hit-area", tabindex: "0", role: "button",
+                "aria-pressed": String(isOpen),
                 "aria-label":
                     `${LosFormat.periodLabel(period.periodKey, grain)}: `
                     + `revenue ${LosFormat.formatSek(period.revenue)}, `
@@ -886,11 +1021,29 @@
                                 + `${LosFormat.formatSek(Math.abs(previous.gop))}`
                             : `. No matching ${comparisonName()} period`
                         : "")
+                    + (isOpen
+                        ? ". Open below; select again to close"
+                        : ". Select to break this period down by group")
             });
             hit.addEventListener("mouseenter", () => showPeriod(index));
             hit.addEventListener("focus", () => showPeriod(index));
             hit.addEventListener("mouseleave", () => { tooltip.hidden = true; });
             hit.addEventListener("blur", () => { tooltip.hidden = true; });
+            hit.addEventListener("click", () => selectPeriod(period.periodKey));
+            // An SVG rect is not a button, so Enter and Space are not activation
+            // keys here until they are made into them.
+            hit.addEventListener("keydown", (event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                selectPeriod(period.periodKey, true);
+            });
+            // Redrawing the plot replaces the node focus was on, which would
+            // otherwise drop a keyboard reader back to the document body every
+            // time they opened or closed a bar.
+            if (period.periodKey === refocusPeriodKey) {
+                refocusPeriodKey = null;
+                requestAnimationFrame(() => hit.focus());
+            }
             svg.append(hit);
         });
 
@@ -966,6 +1119,12 @@
                 label: kind === "month"
                     ? monthFormatter.format(naturalStart)
                     : `W${isoWeekNumber(naturalStart)}`,
+                // "W12" is enough on a button 30px wide and not enough in a
+                // sentence that has to say which period is on screen.
+                name: kind === "month"
+                    ? monthFormatter.format(naturalStart)
+                    : `week ${isoWeekNumber(naturalStart)}, `
+                        + `${naturalStart.getUTCFullYear()}`,
                 title: kind === "month"
                     ? `Zoom to ${monthFormatter.format(naturalStart)}`
                     : `Zoom to week ${isoWeekNumber(naturalStart)}, ${naturalStart.getUTCFullYear()}`
@@ -979,9 +1138,13 @@
         chartZoom = {
             type: segment.kind,
             key: segment.key,
+            name: segment.name,
             startDate: segment.startDate,
             endDate: segment.endDate
         };
+        // A zoom is a different set of buckets, so whatever bar was open no
+        // longer names anything that is on the chart.
+        selectedPeriodKey = null;
         if (elements.chartGrain) {
             elements.chartGrain.value = "day";
             elements.chartGrain.disabled = true;
@@ -991,6 +1154,7 @@
 
     function resetChartView() {
         chartZoom = null;
+        selectedPeriodKey = null;
         if (elements.chartGrain) {
             elements.chartGrain.disabled = false;
             elements.chartGrain.value = elements.grain.value;
@@ -1028,29 +1192,35 @@
             return row;
         });
         elements.chartTimeline.replaceChildren(...rows);
-        if (elements.chartReset) elements.chartReset.hidden = !chartZoom;
+        syncChartView();
     }
 
-    // Rebuilt rather than retyped as textContent, so the control's name keeps the
-    // emphasis the markup gave it and the note still points at the thing the
-    // reader has to change.
-    function setChartNote(showComparison) {
-        const control = document.createElement("strong");
-        control.textContent = "Group by";
-        elements.chartNote.replaceChildren(
-            document.createTextNode(
-                showComparison ? "Two bars per " : "One bar per "
-            ),
-            control,
-            document.createTextNode(
-                showComparison
-                    ? ` period: this year on the left, ${comparisonName()} on the right. `
-                        + "Bar height is what the period cost to run; the marker is "
-                        + "the revenue it earned."
-                    : " period. Bar height is what the period cost to run; the "
-                        + "marker is the revenue it earned."
-            )
-        );
+    const GRAIN_NOUNS = Object.freeze({
+        day: "day", week: "week", month: "month", year: "year"
+    });
+
+    // The reset control keeps its place in the layout whether or not there is
+    // anything to reset - only its label comes and goes - because a control that
+    // appears on click is a control that moves everything under it on click.
+    // The line beneath it always says which slice of the range is on the chart,
+    // which is the one thing the week and month rows above cannot say once the
+    // pointer has left them.
+    function syncChartView() {
+        if (elements.chartReset) {
+            elements.chartReset.disabled = !chartZoom;
+            elements.chartReset.textContent = chartZoom ? "Reset view" : "";
+        }
+        if (!elements.chartScope) return;
+        if (!loadedRange) {
+            elements.chartScope.textContent = "";
+            return;
+        }
+        const grain = GRAIN_NOUNS[elements.grain.value] || elements.grain.value;
+        elements.chartScope.textContent = chartZoom
+            ? `Zoomed into ${chartZoom.name} · ${chartZoom.startDate} – `
+                + `${chartZoom.endDate} · one bar per day`
+            : `Showing the whole range · ${loadedRange.startDate} – `
+                + `${loadedRange.endDate} · one bar per ${grain}`;
     }
 
     function tooltipTitle(text) {
@@ -1179,6 +1349,7 @@
     // directions, so neither can be left showing a grain that is not in force.
     function setGrain(value) {
         chartZoom = null;
+        selectedPeriodKey = null;
         if (elements.chartGrain) elements.chartGrain.disabled = false;
         if (elements.grain.value !== value) elements.grain.value = value;
         if (elements.chartGrain && elements.chartGrain.value !== value) {
@@ -1187,9 +1358,10 @@
         render();
     }
 
-    // Switching the comparison on is the one control here that can need a
-    // request, so it goes through the same busy state the Update data button does
-    // rather than appearing to do nothing for a second.
+    // Changing the alignment basis is the one control here that can need a
+    // request - it moves the range last year is read from - so it goes through
+    // the same busy state the Update data button does rather than appearing to
+    // do nothing for a second.
     async function refreshComparison() {
         syncComparisonControls();
         if (!loadedData) return;
@@ -1201,10 +1373,13 @@
         finally { setLoading(false); }
     }
 
-    async function toggleComparison(mode) {
+    // Both readings travel with the query, so this cannot need the network:
+    // it chooses which of the two already-loaded series the bars are paired
+    // with, and the statement's columns do not move either way.
+    function toggleComparison(mode) {
         comparisonMode = comparisonMode === mode ? null : mode;
-        comparison = null;
-        await refreshComparison();
+        syncComparisonControls();
+        if (loadedData) render();
     }
 
     elements.loadButton.addEventListener("click", loadData);
@@ -1235,6 +1410,9 @@
     elements.lineReset.addEventListener("click", showEveryLine);
     if (elements.chartReset) {
         elements.chartReset.addEventListener("click", resetChartView);
+    }
+    if (elements.barDetailClose) {
+        elements.barDetailClose.addEventListener("click", closeBarDetail);
     }
     for (const tab of document.querySelectorAll("[data-dataset]")) {
         tab.addEventListener("click", () => selectDataset(tab));

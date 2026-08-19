@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cost Data</title>
-    <link rel="stylesheet" href="styles.css?v=266f423faf">
+    <link rel="stylesheet" href="styles.css?v=12a8fe5cde">
 </head>
 <body>
     <main class="container cost-workspace">
@@ -19,7 +19,6 @@
         <header class="page-header cost-header">
             <div>
                 <h1>Cost Data</h1>
-                <p>Review revenue, payments, operating costs, and hotel movements.</p>
             </div>
             <div class="freshness" id="freshness" hidden>
                 <span>Latest source update</span>
@@ -68,9 +67,6 @@
 
                 <fieldset class="line-toggles">
                     <legend>Groups shown</legend>
-                    <p class="line-toggles-note">
-                        Every group counts towards GOP unless it is cleared here.
-                    </p>
                     <div id="gopLineToggles" class="line-toggle-list"></div>
                     <button type="button" id="gopLineResetButton" class="text-button" hidden>
                         Show every group
@@ -89,8 +85,17 @@
 
                 <table class="gop-table">
                     <caption class="visually-hidden">
-                        Net revenue, operating costs, and gross operating profit for the selected scope
+                        Net revenue, operating costs, and gross operating profit for the
+                        selected scope, on the books now and at the two points last year
                     </caption>
+                    <thead>
+                        <tr class="gop-head-row">
+                            <td></td>
+                            <th scope="col">OTB</th>
+                            <th scope="col" class="is-comparison">SPIT LY</th>
+                            <th scope="col" class="is-comparison">FINAL LY</th>
+                        </tr>
+                    </thead>
                     <tbody id="gopRows"></tbody>
                 </table>
 
@@ -103,9 +108,6 @@
                 <div>
                     <h2 id="gopChartTitle">Cost against revenue</h2>
                 </div>
-                <button type="button" id="gopChartReset" class="chart-reset" hidden>
-                    Reset view
-                </button>
                 <div class="gop-heading-actions">
                     <div class="chart-comparison-buttons" role="group" aria-label="Comparison view">
                         <button type="button" id="gopChartShowLyFinal" aria-pressed="false">
@@ -135,27 +137,66 @@
                             <option value="year">Year</option>
                         </select>
                     </div>
-                    <!-- ARIA prohibits naming a generic element, so the aria-label here
-                         was simply dropped; the list roles give it something nameable. -->
-                    <div class="chart-legend gop-chart-legend" role="list" aria-label="Chart legend">
-                        <span role="listitem"><i class="legend-swatch gop-legend-base"></i>Base amount</span>
-                        <span role="listitem"><i class="legend-swatch gop-legend-profit"></i>Profit</span>
-                        <span role="listitem"><i class="legend-swatch gop-legend-loss"></i>Loss</span>
-                        <span role="listitem"><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
-                        <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-base"></i><span id="gopComparisonCostLabel">LY Final cost</span></span>
-                        <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-revenue"></i><span id="gopComparisonRevenueLabel">LY Final revenue</span></span>
-                    </div>
                 </div>
+            </div>
+
+            <!-- Its own row, at a reserved height. In the actions row it changed
+                 the width of everything beside it the moment a comparison was
+                 switched on, which moved three controls under the pointer. -->
+            <!-- ARIA prohibits naming a generic element, so the aria-label here
+                 was simply dropped; the list roles give it something nameable. -->
+            <div class="chart-legend gop-chart-legend" role="list" aria-label="Chart legend">
+                <span role="listitem"><i class="legend-swatch gop-legend-base"></i>Base amount</span>
+                <span role="listitem"><i class="legend-swatch gop-legend-profit"></i>Profit</span>
+                <span role="listitem"><i class="legend-swatch gop-legend-loss"></i>Loss</span>
+                <span role="listitem"><i class="legend-swatch gop-legend-revenue"></i>Revenue level</span>
+                <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-base"></i><span id="gopComparisonCostLabel">LY Final cost</span></span>
+                <span role="listitem" class="gop-legend-ly-entry" hidden><i class="legend-swatch gop-legend-ly-revenue"></i><span id="gopComparisonRevenueLabel">LY Final revenue</span></span>
             </div>
 
             <div class="gop-chart-viewport">
                 <div id="gopChart" class="los-chart gop-chart"></div>
                 <div id="gopChartTimeline" class="gop-chart-timeline" aria-label="Zoom chart by week or month"></div>
+                <!-- Under the month row, the width of the plot itself, and always
+                     in the layout: only its label comes and goes, so switching a
+                     zoom on and off never moves the chart above it. -->
+                <div class="gop-chart-reset-row">
+                    <button type="button" id="gopChartReset" class="chart-reset"
+                            aria-label="Reset view" disabled>
+                        Reset view
+                    </button>
+                    <p class="gop-chart-scope" id="gopChartScope"></p>
+                </div>
             </div>
-            <p class="gop-chart-note" id="gopChartNote">
-                One bar per <strong>Group by</strong> period. Bar height is what the
-                period cost to run; the marker is the revenue it earned.
-            </p>
+
+            <section id="gopBarDetail" class="gop-bar-detail" aria-labelledby="gopBarDetailTitle" hidden>
+                <div class="gop-bar-detail-heading">
+                    <div>
+                        <span class="section-eyebrow">SELECTED PERIOD</span>
+                        <h3 id="gopBarDetailTitle"></h3>
+                    </div>
+                    <button type="button" id="gopBarDetailClose" class="text-button">
+                        Close
+                    </button>
+                </div>
+                <div class="table-wrapper gop-bar-detail-wrapper">
+                    <table class="gop-table gop-bar-detail-table">
+                        <caption class="visually-hidden">
+                            Every revenue and cost group for the selected bar
+                        </caption>
+                        <thead>
+                            <tr class="gop-head-row">
+                                <td></td>
+                                <th scope="col">OTB</th>
+                                <th scope="col" class="is-comparison">SPIT LY</th>
+                                <th scope="col" class="is-comparison">FINAL LY</th>
+                            </tr>
+                        </thead>
+                        <tbody id="gopBarDetailRows"></tbody>
+                    </table>
+                </div>
+            </section>
+
             <p class="gop-chart-warning" id="gopComparisonNote" role="status" hidden></p>
         </section>
 
@@ -188,6 +229,6 @@
     <script src="los-api.js?v=6716bb7e54"></script>
     <script src="los-format.js?v=15781a9639"></script>
     <script src="costdata-data.js?v=361a52d16b"></script>
-    <script src="costdata.js?v=e2511c9699"></script>
+    <script src="costdata.js?v=f397bc0d05"></script>
 </body>
 </html>

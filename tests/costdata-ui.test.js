@@ -813,17 +813,99 @@ test("the chart offers LY Final and SPIT as paired-bar comparisons", () => {
     assert.match(script, /CostData\.applySpitAdjustments\(/);
 });
 
-test("last year is fetched only when it is switched on, and cached per range", () => {
+test("one request answers both readings of last year, cached per range", () => {
     const script = read("costdata.js");
 
-    // The page's default range is a year to date. Loading last year with every
-    // update would double the cost of a query most readings never compare.
+    // SPIT LY and FINAL LY are columns of the statement now, so there is no
+    // reading of the page that does not want them and nothing to defer. The
+    // SPIT request is what carries both: it returns the settled comparison
+    // facts and the lifecycle adjustments in one body.
+    assert.match(script, /parameters\.set\("comparisonMode", "spit"\)/);
     assert.match(script, /async function ensureComparison\(\)/);
     assert.match(script, /if \(comparison && comparison\.key === key\) return;/);
     // Keyed on the range the facts on screen cover, not on what the date inputs
-    // currently say - and on the basis, because a different basis is a different
-    // range and mode.
-    assert.match(script, /\$\{loadedRange\.startDate\}\|\$\{loadedRange\.endDate\}\|\$\{elements\.lyBasis\.value\}\|\$\{comparisonMode\}/);
+    // currently say, and on the basis, because a different basis is a different
+    // range. Deliberately NOT on which series the chart draws: both are in
+    // hand, so switching between them must not reach the network.
+    assert.match(script, /\$\{loadedRange\.startDate\}\|\$\{loadedRange\.endDate\}\|\$\{elements\.lyBasis\.value\}`/);
+    const toggle = /function toggleComparison\(mode\)[\s\S]*?\n {4}\}/.exec(script)[0];
+    assert.doesNotMatch(toggle, /await|ensureComparison|fetch/);
+});
+
+test("the statement reads one label against OTB, SPIT LY and FINAL LY", () => {
+    const html = read("costdata.html");
+    const script = read("costdata.js");
+    const css = read("styles.css");
+
+    // The label is written once; every column after it is the same line read at
+    // a different point in time.
+    const statement = /id="gopStatement"[\s\S]*?<\/section>/.exec(html)[0];
+    assert.match(statement, /<th scope="col">OTB<\/th>/);
+    assert.match(statement, /<th scope="col" class="is-comparison">SPIT LY<\/th>/);
+    assert.match(statement, /<th scope="col" class="is-comparison">FINAL LY<\/th>/);
+    assert.match(script, /function statementRows\(lines, columns\)/);
+    assert.match(script, /amountsOf\(statementOf\(lastYear\.spit, ""\)\)/);
+    assert.match(script, /amountsOf\(statementOf\(lastYear\.final, ""\)\)/);
+    // Grey, and a weaker red on the costs: three columns of full-strength red
+    // all compete for the same alarm.
+    assert.match(css, /\.gop-amount\.is-comparison \{/);
+    assert.match(css, /\.gop-row\.is-cost \.gop-amount\.is-comparison \{/);
+});
+
+test("a bar opens into the groups behind it", () => {
+    const html = read("costdata.html");
+    const script = read("costdata.js");
+
+    assert.match(html, /id="gopBarDetail"/);
+    assert.match(html, /id="gopBarDetailRows"/);
+    // Clicking the open bar closes it, so one gesture does both.
+    assert.match(script, /selectedPeriodKey = selectedPeriodKey === key \? null : key;/);
+    assert.match(script, /hit\.addEventListener\("click", \(\) => selectPeriod\(period\.periodKey\)\)/);
+    assert.match(script, /function renderBarDetail\(statement, spit, final, grain\)/);
+    // Every group, not only the totals the bar itself draws.
+    assert.match(script, /periodAmountsOf\(statement, selectedPeriodKey\)/);
+    // A grain or a zoom retires the key, and the panel must close rather than
+    // keep the previous period's figures under a heading nobody chose.
+    for (const clears of [
+        /function setChartZoom\(segment\) \{[\s\S]*?selectedPeriodKey = null;/,
+        /function resetChartView\(\) \{[\s\S]*?selectedPeriodKey = null;/,
+        /function setGrain\(value\) \{[\s\S]*?selectedPeriodKey = null;/
+    ]) {
+        assert.match(script, clears);
+    }
+});
+
+test("the zoom controls keep their place, and say what they zoomed to", () => {
+    const html = read("costdata.html");
+    const script = read("costdata.js");
+    const css = read("styles.css");
+
+    // Full width, under the month row, inside the scrolling viewport so it is
+    // the width of the plot it resets.
+    assert.match(
+        html, /class="gop-chart-viewport"[\s\S]*id="gopChartReset"/
+    );
+    const order = ["gopChartTimeline", "gopChartReset", "gopChartScope"]
+        .map((id) => html.indexOf(id));
+    assert.ok(
+        order[0] < order[1] && order[1] < order[2],
+        "reset and its scope line belong under the month row, in that order"
+    );
+    assert.match(css, /\.gop-chart-reset-row \{/);
+    // Same scrolling width group as the plot and the timeline.
+    assert.match(
+        css, /\.gop-chart-timeline,[\s\S]{0,40}\.gop-chart-reset-row \{[^}]*min-width/
+    );
+    // Never removed from the flow - only the label comes and goes - or every
+    // pixel below it moves on click.
+    assert.match(script, /elements\.chartReset\.textContent = chartZoom \? "Reset view" : "";/);
+    assert.doesNotMatch(script, /elements\.chartReset\.hidden/);
+    assert.match(script, /Zoomed into \$\{chartZoom\.name\}/);
+    // A pressed month has to look pressed. Its own row rule is more specific
+    // than the shared one, so it needs naming explicitly.
+    assert.match(
+        css, /\.chart-time-row\.is-month \.chart-time-button\[aria-pressed="true"\]/
+    );
 });
 
 test("the chart has reset, week, and month zoom controls", () => {
