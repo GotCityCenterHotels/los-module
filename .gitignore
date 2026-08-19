@@ -222,3 +222,8 @@ __marimo__/
 # tracked - so the first developer to point it at a real database would have
 # committed those credentials. local.settings.json.example carries the shape.
 local.settings.json
+
+# Node build tooling. esbuild is a devDependency of the frontend minify step
+# (scripts/build-frontend.js); package-lock.json IS tracked so `npm ci` in the
+# Static Web Apps workflow resolves the same bytes every run.
+node_modules/

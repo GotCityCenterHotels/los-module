@@ -75,6 +75,12 @@ jobs:
         with:
           node-version: '22'
 
+      # This job does not deploy the frontend, but tests/build-frontend.test.js
+      # skips itself when esbuild is absent - so without npm ci the minify step
+      # that the Static Web Apps workflow depends on would go untested here.
+      - name: Install frontend build dependencies
+        run: npm ci
+
       - name: Run frontend tests
         run: npm test
 

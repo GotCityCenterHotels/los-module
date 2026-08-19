@@ -16,6 +16,11 @@
  *
  *   node scripts/stamp-assets.js          rewrite the HTML
  *   node scripts/stamp-assets.js --check   report drift, change nothing
+ *
+ * The directory is a parameter because scripts/build-frontend.js re-stamps its
+ * minified copy in dist/, where the tokens have to name the minified bytes rather
+ * than the sources a browser is never served. Everything here defaults to
+ * frontend/, which is what the CLI and the tests use.
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -32,17 +37,31 @@ function contentHash(file) {
         .slice(0, 10);
 }
 
-function stamp(html) {
+function stamp(html, directory = frontend) {
     return html.replace(REFERENCE, (whole, attribute, asset) => {
-        const target = path.join(frontend, asset);
+        const target = path.join(directory, asset);
         // Anything not shipped from this directory is left exactly as it is.
         if (!fs.existsSync(target)) return whole;
         return `${attribute}="${asset}?v=${contentHash(target)}"`;
     });
 }
 
-function pages() {
-    return fs.readdirSync(frontend).filter((file) => file.endsWith(".html"));
+function pages(directory = frontend) {
+    return fs.readdirSync(directory).filter((file) => file.endsWith(".html"));
+}
+
+/** Rewrite every page in one directory against its own assets. */
+function stampDirectory(directory) {
+    const rewritten = [];
+    for (const page of pages(directory)) {
+        const file = path.join(directory, page);
+        const before = fs.readFileSync(file, "utf8");
+        const after = stamp(before, directory);
+        if (before === after) continue;
+        fs.writeFileSync(file, after);
+        rewritten.push(page);
+    }
+    return rewritten;
 }
 
 function main() {
@@ -72,4 +91,4 @@ function main() {
 }
 
 if (require.main === module) process.exit(main());
-module.exports = {contentHash, stamp, pages};
+module.exports = {contentHash, stamp, pages, stampDirectory};

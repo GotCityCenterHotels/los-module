@@ -23,8 +23,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+      # npm ci, not npm install: esbuild is pinned in package.json and the
+      # deployed bytes should not depend on when the workflow happened to run.
+      - name: Install build dependencies
+        run: npm ci
+
       - name: Run frontend tests
         run: npm test
+
+      # styles.css is render-blocking on all five pages and was 19.8KB gzipped -
+      # over the ~14.6KB initial congestion window, so it cost a second round trip
+      # before first paint on every cold-cache visit. Minified it is 11.6KB and
+      # fits in one. dist/ is stamped against the minified bytes, so a cached
+      # token always names content that was actually served.
+      - name: Build the deployable frontend
+        run: npm run build
       - name: Build And Deploy
         id: builddeploy
         uses: Azure/static-web-apps-deploy@v1
@@ -34,7 +47,7 @@ jobs:
           action: "upload"
           ###### Repository/Build Configurations - These values can be configured to match your app requirements. ######
           # For more information regarding Static Web App workflow configurations, please visit: https://aka.ms/swaworkflowconfig
-          app_location: "/frontend" # App source code path
+          app_location: "/dist" # Built by `npm run build` from /frontend
           api_location: "" # Api source code path - optional
           output_location: "" # Files in app_location are already deployable
           skip_app_build: true
