@@ -313,19 +313,34 @@ payments AS (
     WHERE item.stay_date BETWEEN %(start_date)s AND %(end_date)s
     GROUP BY enterprise.name, item.stay_date, item.amount_currency
 ),
-stay_lengths AS (
-    SELECT reservation_id, enterprise_id, count(*)::numeric AS stay_nights
+-- A cleaning is shared evenly across the nights of its stay, so every night
+-- needs to know how long its own stay was. That was a self-join: aggregate
+-- eligible_nights into one row per stay, then join it back to eligible_nights.
+--
+-- It was also, on its own, the reason this query never finished. eligible_nights
+-- is a materialized CTE, which is an optimisation barrier - Postgres cannot see
+-- statistics through it and estimated 3 rows where there are 93,557. On an
+-- estimate of 3 it chose a nested loop and re-aggregated the whole CTE per outer
+-- row, so a stage that should cost seconds ran past seven minutes. Marking
+-- stay_lengths MATERIALIZED forces the aggregate to happen once and still took
+-- 348s, because the join is what the bad estimate ruins.
+--
+-- A window function needs no join at all: one pass, partitioned by stay. Same
+-- 22,950 rows and the same total to four decimals, in 34.7s against >420s.
+allocated_nights AS MATERIALIZED (
+    SELECT reservation_id, enterprise_id, stay_date, category_id, category_name,
+           occupancy,
+           count(*) OVER (PARTITION BY reservation_id, enterprise_id)::numeric
+               AS stay_nights
     FROM eligible_nights
-    GROUP BY reservation_id, enterprise_id
 ),
 cleaning_allocations AS (
     SELECT trim(enterprise.name)::text AS hotel_name,
            night.stay_date::text AS stay_date,
            night.category_name, night.occupancy,
-           sum(1::numeric / length.stay_nights)::text AS allocated_cleanings,
+           sum(1::numeric / night.stay_nights)::text AS allocated_cleanings,
            NULL::timestamptz AS last_updated_at
-    FROM eligible_nights night
-    JOIN stay_lengths length USING (reservation_id, enterprise_id)
+    FROM allocated_nights night
     JOIN enterprise_current enterprise
       ON enterprise.tenant_key = 'GCCH'
      AND enterprise.id = night.enterprise_id

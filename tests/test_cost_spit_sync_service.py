@@ -118,32 +118,42 @@ class CostSpitSyncTests(unittest.TestCase):
         self.assertIn("fact_count integer not null", ddl)
 
     def test_snapshot_plan_matches_the_http_comparison_dates(self):
-        """Mid-year there is nothing behind 1 January a legal range can reach,
-        so the plan is the calendar year and the lead-in costs nothing."""
+        """The plan is 1 January to today, shifted - which is the page's own
+        default range - not the whole calendar year."""
+        margin = timedelta(days=sync.COVERAGE_FORWARD_DAYS)
         plan = sync.snapshot_plan(date(2026, 8, 19))
 
         self.assertEqual(plan["sameDate"], {
             "cutoff_date": date(2025, 8, 19),
             "start_date": date(2025, 1, 1),
-            "end_date": date(2025, 12, 31),
+            "end_date": date(2025, 8, 19) + margin,
         })
         self.assertEqual(plan["sameWeekday"], {
             "cutoff_date": date(2025, 8, 20),
             "start_date": date(2025, 1, 2),
-            "end_date": date(2026, 1, 1),
+            "end_date": date(2025, 8, 20) + margin,
         })
 
-    def test_coverage_reaches_back_only_while_january_can_use_it(self):
-        """In early January the page's own default range looks back across the
-        year boundary, so coverage extends behind 1 January. Every extra day is
-        another day of lifecycle scan, so it is not paid for in August."""
-        lead_in = timedelta(days=sync.COVERAGE_LEAD_IN_DAYS)
+    def test_coverage_stops_at_today_rather_than_year_end(self):
+        """SPIT serves the default reading only, so scanning to 31 December
+        bought nothing. In August that is about a third less source scan."""
+        start, end = sync.coverage_window(date(2026, 8, 19))
+        self.assertEqual(start, date(2026, 1, 1))
+        self.assertLess(end, date(2026, 12, 31))
 
-        january = sync.coverage_window(date(2026, 1, 3))
-        self.assertEqual(january, (date(2026, 1, 1) - lead_in, date(2026, 12, 31)))
+    def test_coverage_reaches_past_today_far_enough_to_be_served_stale(self):
+        """A request just after midnight, or one answered from a publication a
+        night or two old, asks for a range ending after the snapshot was built.
+        The margin has to outlast the staleness allowance or that range falls
+        off the end of coverage and reports unavailable."""
+        from services import cost_data_service
 
-        august = sync.coverage_window(date(2026, 8, 19))
-        self.assertEqual(august, (date(2026, 1, 1), date(2026, 12, 31)))
+        self.assertGreater(
+            sync.COVERAGE_FORWARD_DAYS,
+            cost_data_service.COST_SPIT_MAX_STALE_DAYS,
+        )
+        _start, end = sync.coverage_window(date(2026, 8, 19))
+        self.assertGreater(end, date(2026, 8, 19))
 
     def test_the_two_bases_are_streamed_concurrently(self):
         """Two independent source queries on their own connections writing

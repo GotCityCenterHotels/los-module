@@ -71,14 +71,19 @@ SOURCE_STATEMENT_TIMEOUT_MS = int(
 # synchronization is live, so anything still 'running' and this old is abandoned.
 ABANDONED_RUN_HOURS = int(os.environ.get("COST_SPIT_ABANDONED_RUN_HOURS", "6"))
 
-# The Cost Data page opens on 1 January to today, so a reading taken in early
-# January is the one that wants to look back across the year boundary. A lead-in
-# before 1 January covers that, but every extra day is another day of source
-# lifecycle scan, so it is only spent while the calendar can actually use it:
-# inside the lead-in window itself. For the other ten months of the year it
-# costs nothing, because nothing in range can reach behind 1 January.
-COVERAGE_LEAD_IN_DAYS = int(
-    os.environ.get("COST_SPIT_COVERAGE_LEAD_IN_DAYS", "45")
+# SPIT answers one reading: the Cost Data page's default, 1 January to today
+# against the same span last year. It is not asked to serve an arbitrary picked
+# range, so the window stops at today rather than running to 31 December - in
+# August that is a third less lifecycle scan for exactly the same answer, and it
+# grows back only as the year does.
+#
+# The forward margin is what keeps that from being brittle. A request made just
+# after midnight, or served from a publication a night or two old, asks for a
+# range ending later than the snapshot was built for; without the margin it
+# would fall off the end of the covered range and report unavailable. It is
+# deliberately larger than COST_SPIT_MAX_STALE_DAYS for that reason.
+COVERAGE_FORWARD_DAYS = int(
+    os.environ.get("COST_SPIT_COVERAGE_FORWARD_DAYS", "10")
 )
 
 STOCKHOLM = ZoneInfo("Europe/Stockholm")
@@ -97,12 +102,9 @@ def stockholm_today():
 
 def coverage_window(as_of_date):
     """The current-year span that the two snapshots are shifted from."""
-    first_of_year = date(as_of_date.year, 1, 1)
-    lead_in = timedelta(days=COVERAGE_LEAD_IN_DAYS)
-    within_lead_in = as_of_date - first_of_year < lead_in
     return (
-        first_of_year - lead_in if within_lead_in else first_of_year,
-        date(as_of_date.year, 12, 31),
+        date(as_of_date.year, 1, 1),
+        as_of_date + timedelta(days=COVERAGE_FORWARD_DAYS),
     )
 
 
