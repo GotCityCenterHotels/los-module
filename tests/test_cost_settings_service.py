@@ -1301,3 +1301,44 @@ class CleaningInheritanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadAllCostSettingsPipelineTests(unittest.TestCase):
+    """The whole rulebook is read in one pipelined pass.
+
+    Ten statements ran one after another on a shared cursor, fully serialized, and
+    on the Cost Data build they land after the dataset fan-out rather than under
+    it. _read_cost_settings already pipelines the same shape for one property.
+    """
+
+    def test_the_statement_names_cannot_collide_with_the_collections(self):
+        # The results are gathered into one dict keyed by name. If a collection
+        # were ever called "profiles", "groups", or "originGroups" it would
+        # overwrite that result set and the rulebook would silently lose a table.
+        reserved = {"profiles", "groups", "originGroups"}
+        self.assertEqual(
+            reserved & set(cost_settings_service.COLLECTION_QUERIES),
+            set(),
+            "a collection name collides with a reserved result-set name",
+        )
+
+    def test_the_extracted_sql_is_still_the_statement_it_replaced(self):
+        # Lifted to module level so the statement list reads as a list; the text
+        # has to be unchanged or the shapes downstream stop matching.
+        self.assertIn(
+            "functions.cost_property_settings",
+            cost_settings_service._ALL_PROFILES_SQL,
+        )
+        self.assertIn("hotel.hotel_name", cost_settings_service._ALL_PROFILES_SQL)
+        self.assertIn(
+            "functions.cost_distribution_groups",
+            cost_settings_service._ALL_DISTRIBUTION_GROUPS_SQL,
+        )
+        self.assertIn(
+            "enterprise_id",
+            cost_settings_service._ALL_DISTRIBUTION_GROUPS_SQL,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

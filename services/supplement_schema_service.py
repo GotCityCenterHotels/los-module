@@ -5,6 +5,7 @@ from threading import Lock
 
 from cost_database import cost_pool
 from services.cost_schema_service import ensure_cost_settings_schema
+from services.schema_bootstrap import migrations_are_current
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,19 @@ def ensure_supplement_schema():
     with _schema_lock:
         if _schema_ready:
             return
+
+        # Fast path: two round trips, no advisory lock. A migration name is
+        # recorded in the transaction that applies it, so a worker that can see
+        # every expected name knows the schema is current without coordinating.
+        # The lock below is cluster-wide, so taking it unconditionally made the
+        # parallel requests one page load fires serialize behind each other.
+        with cost_pool.connection() as connection:
+            with connection.cursor() as cursor:
+                if migrations_are_current(
+                    cursor, [name for name, _ in MIGRATIONS]
+                ):
+                    _schema_ready = True
+                    return
 
         # Supplement publishes into the shared hotel dimension. Ensure the
         # Cost Data publication pointer that names changes to that dimension is

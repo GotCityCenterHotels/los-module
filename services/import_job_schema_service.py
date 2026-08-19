@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Lock
 
 from cost_database import cost_pool
+from services.schema_bootstrap import migrations_are_current
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +27,17 @@ def ensure_import_job_schema():
     with _schema_lock:
         if _schema_ready:
             return
+
+        # Fast path: two round trips, no advisory lock. A migration name is
+        # recorded in the transaction that applies it, so a worker that can see
+        # every expected name knows the schema is current without coordinating.
+        # The lock below is cluster-wide, so taking it unconditionally made the
+        # parallel requests one page load fires serialize behind each other.
+        with cost_pool.connection() as connection:
+            with connection.cursor() as cursor:
+                if migrations_are_current(cursor, [MIGRATION_NAME]):
+                    _schema_ready = True
+                    return
 
         with cost_pool.connection() as connection:
             with connection.cursor() as cursor:

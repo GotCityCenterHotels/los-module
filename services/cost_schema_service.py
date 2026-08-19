@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Lock
 
 from cost_database import cost_pool
+from services.schema_bootstrap import pending_migrations
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -73,21 +74,11 @@ def _read_sql(path):
 def _pending_migrations(cursor):
     """Migrations not yet recorded, in one round trip.
 
-    Checking each of them with its own SELECT cost one network round trip per
-    migration on every cold worker, all to discover that nothing needs doing.
-    Returns None when the bookkeeping table itself is missing, which means the
-    full bootstrap has to run.
+    The shared implementation now lives in services/schema_bootstrap.py, so
+    all four schema services answer this question the same way. This keeps the
+    module-local name the rest of this file and its tests already use.
     """
-    cursor.execute("SELECT to_regclass('functions.schema_migrations')")
-    if cursor.fetchone()[0] is None:
-        return None
-    cursor.execute(
-        "SELECT migration_name FROM functions.schema_migrations "
-        "WHERE migration_name = ANY(%s)",
-        ([name for name, _ in MIGRATIONS],),
-    )
-    applied = {row[0] for row in cursor.fetchall()}
-    return [name for name, _ in MIGRATIONS if name not in applied]
+    return pending_migrations(cursor, [name for name, _ in MIGRATIONS])
 
 
 def ensure_cost_settings_schema():

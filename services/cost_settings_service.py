@@ -921,6 +921,23 @@ def fetch_all_cost_settings(publication_version=None):
     return dict(settings_by_hotel)
 
 
+_ALL_PROFILES_SQL = """
+    SELECT settings.*, hotel.hotel_name
+    FROM functions.cost_property_settings settings
+    JOIN functions.hotels hotel USING (enterprise_id)
+"""
+
+_ALL_DISTRIBUTION_GROUPS_SQL = """
+    SELECT g.enterprise_id, g.group_name, g.cost_percent,
+        coalesce(json_agg(json_build_object('matchType', r.match_type, 'matchValue', r.match_value)
+            ORDER BY r.distribution_rule_id) FILTER (WHERE r.distribution_rule_id IS NOT NULL), '[]') AS rules
+    FROM functions.cost_distribution_groups g
+    LEFT JOIN functions.cost_distribution_rules r USING (distribution_group_id)
+    GROUP BY g.distribution_group_id
+    ORDER BY g.enterprise_id, g.sort_order, g.distribution_group_id
+"""
+
+
 def _read_all_cost_settings():
     """Every property's saved cost rulebook, keyed by hotel name.
 
@@ -931,33 +948,44 @@ def _read_all_cost_settings():
     instead of costing it with invented numbers.
     """
     ensure_cost_settings_schema()
+    # None of these statements depends on another's result, and they ran one after
+    # another on a shared cursor - ten round trips, fully serialized, and on the
+    # Cost Data build they land after the dataset fan-out rather than under it.
+    # _read_cost_settings already pipelines the same shape for a single property;
+    # this is that, for every property.
+    statements = [
+        ("profiles", _ALL_PROFILES_SQL),
+        ("groups", _ALL_DISTRIBUTION_GROUPS_SQL),
+        *COLLECTION_QUERIES.items(),
+        ("originGroups", ALL_DISTRIBUTION_TREES_SQL),
+    ]
+
     with cost_pool.connection() as connection:
-        with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute("""
-                SELECT settings.*, hotel.hotel_name
-                FROM functions.cost_property_settings settings
-                JOIN functions.hotels hotel USING (enterprise_id)
-            """)
-            profiles = cursor.fetchall()
+        # Keyed off the connection object rather than psycopg.capabilities, for
+        # the same reason as _read_cost_settings: the library pipelines
+        # everywhere this really runs, but the test fakes hand out one shared
+        # cursor and cannot.
+        if hasattr(connection, "pipeline"):
+            cursors = {}
+            with connection.pipeline():
+                for name, query in statements:
+                    cursor = connection.cursor(row_factory=dict_row)
+                    cursor.execute(query)
+                    cursors[name] = cursor
+            results = {
+                name: cursor.fetchall() for name, cursor in cursors.items()
+            }
+        else:
+            results = {}
+            with connection.cursor(row_factory=dict_row) as cursor:
+                for name, query in statements:
+                    cursor.execute(query)
+                    results[name] = cursor.fetchall()
 
-            cursor.execute("""
-                SELECT g.enterprise_id, g.group_name, g.cost_percent,
-                    coalesce(json_agg(json_build_object('matchType', r.match_type, 'matchValue', r.match_value)
-                        ORDER BY r.distribution_rule_id) FILTER (WHERE r.distribution_rule_id IS NOT NULL), '[]') AS rules
-                FROM functions.cost_distribution_groups g
-                LEFT JOIN functions.cost_distribution_rules r USING (distribution_group_id)
-                GROUP BY g.distribution_group_id
-                ORDER BY g.enterprise_id, g.sort_order, g.distribution_group_id
-            """)
-            groups = cursor.fetchall()
-
-            collections = {}
-            for name, query in COLLECTION_QUERIES.items():
-                cursor.execute(query)
-                collections[name] = cursor.fetchall()
-
-            cursor.execute(ALL_DISTRIBUTION_TREES_SQL)
-            origin_groups = cursor.fetchall()
+    profiles = results["profiles"]
+    groups = results["groups"]
+    origin_groups = results["originGroups"]
+    collections = {name: results[name] for name in COLLECTION_QUERIES}
 
     by_enterprise = defaultdict(lambda: defaultdict(list))
     for row in groups:
