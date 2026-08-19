@@ -234,3 +234,83 @@ test("hotel metadata uses session cache and coalesces in-flight requests", async
     assert.equal(cached.fromCache, true);
     assert.equal(calls, 1);
 });
+
+test("the grain reaches every range request", async () => {
+    // The server rolls the date dimension up, so the grain is part of the
+    // request rather than a local repaint. A range that did not carry it would
+    // silently come back at day grain and be re-bucketed against rows the rest
+    // of the selection had already rolled up.
+    const urls = [];
+    const fetcher = async (url) => {
+        urls.push(url);
+        return { data: [] };
+    };
+
+    await LosApi.fetchLosFactRanges({
+        apiBaseUrl: "/test-api",
+        startDate: "2026-01-01",
+        endDate: "2026-12-31",
+        lyComparisonBasis: "sameDate",
+        grain: "month",
+        selectedMonths: ["2026-01", "2026-03"],
+        fetcher
+    });
+
+    assert.equal(urls.length, 2);
+    for (const url of urls) {
+        assert.match(url, /[?&]grain=month(&|$)/);
+    }
+});
+
+test("an absent grain still asks for the day grain the server defaults to", async () => {
+    const urls = [];
+    const fetcher = async (url) => {
+        urls.push(url);
+        return { data: [] };
+    };
+
+    await LosApi.fetchLosFactRanges({
+        apiBaseUrl: "/test-api",
+        startDate: "2026-01-01",
+        endDate: "2026-01-31",
+        lyComparisonBasis: "sameDate",
+        fetcher
+    });
+
+    assert.match(urls[0], /[?&]grain=day(&|$)/);
+});
+
+test("contiguous ranges cover exactly the selected months and nothing else", () => {
+    // app.js and distribution.js dropped their post-fetch month filter because
+    // this holds. If a range ever spanned an unselected month, a rolled-up
+    // response would fold that month's rows into a bucket nobody asked for and
+    // there would no longer be anything downstream to catch it.
+    const selected = ["2026-02", "2026-03", "2026-06", "2026-09", "2026-10", "2026-11"];
+    const ranges = LosApi.buildContiguousMonthRanges(selected, "2026-01-01", "2026-12-31");
+    const covered = new Set();
+
+    for (const { startDate, endDate } of ranges) {
+        assert.ok(startDate <= endDate, `${startDate} must not follow ${endDate}`);
+        const cursor = new Date(`${startDate}T00:00:00Z`);
+        const last = new Date(`${endDate}T00:00:00Z`);
+        while (cursor <= last) {
+            covered.add(cursor.toISOString().slice(0, 7));
+            cursor.setUTCDate(cursor.getUTCDate() + 1);
+        }
+    }
+
+    assert.deepEqual([...covered].sort(), [...selected].sort());
+});
+
+test("a range starts on the first and ends on the last day of its run", () => {
+    // A range that clipped a month short would drop the rows the server needs to
+    // build a complete bucket for it.
+    assert.deepEqual(
+        LosApi.buildContiguousMonthRanges(["2026-02"], "2026-01-01", "2026-12-31"),
+        [{ startDate: "2026-02-01", endDate: "2026-02-28" }]
+    );
+    assert.deepEqual(
+        LosApi.buildContiguousMonthRanges(["2028-02"], "2028-01-01", "2028-12-31"),
+        [{ startDate: "2028-02-01", endDate: "2028-02-29" }]
+    );
+});

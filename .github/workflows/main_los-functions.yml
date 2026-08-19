@@ -88,6 +88,11 @@ jobs:
       # unchecked-hash, not the default timestamp invalidation: the artifact goes
       # through a zip/unzip round trip that does not preserve source mtimes, and
       # a timestamp-invalidated .pyc would be discarded on arrival.
+      #
+      # The flip side, if you ever run this step by hand in a working tree: an
+      # unchecked-hash .pyc is loaded WITHOUT comparing it to its source, so it
+      # will shadow every later edit until you delete it. It belongs last, right
+      # before packaging, and nowhere else.
       - name: Precompile first-party bytecode
         run: |
           echo "compiling with $(python -V), for a runtime pinned at ${{ env.PYTHON_VERSION }}"

@@ -30,7 +30,11 @@ const periodPicker = LosPeriodPicker.create({
 });
 
 let loadedFacts = [];
-let loadedMonths = [];
+// The grain the loaded rows were rolled up to. Every label and axis has to read
+// this rather than the live <select>: the two differ for as long as a grain
+// change is in flight, and a failed one leaves the select showing a grain no
+// loaded row was ever bucketed by.
+let loadedGrain = null;
 let lastLoadedRequestKey = null;
 let hotelListLoaded = false;
 let requestInProgress = false;
@@ -151,6 +155,7 @@ function getRequestState() {
         startDate: startDateInput.value,
         endDate: endDateInput.value,
         lyComparisonBasis: lyComparisonInput.value,
+        grain: grainInput.value,
         selectedMonths: periodPicker.getSelectedMonths()
     };
 }
@@ -198,7 +203,7 @@ async function loadData() {
             ...requestedState
         });
         loadedFacts = payload.data || [];
-        loadedMonths = requestedState.selectedMonths;
+        loadedGrain = requestedState.grain;
         loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
@@ -218,6 +223,7 @@ async function loadData() {
         // which unhides all three sections again and repaints whatever is still
         // in loadedFacts - the numbers from the range we just failed to replace.
         loadedFacts = [];
+        loadedGrain = null;
         loadedRequestState = null;
     }
     finally {
@@ -230,10 +236,13 @@ function render() {
     if (lastLoadedRequestKey === null) return;
 
     const hotels = getSelectedHotels();
+    // No selectedMonths: buildContiguousMonthRanges already asked the server for
+    // exactly the selected months, so filtering again could only ever remove
+    // rows that belong - a week bucket rolled up server-side carries its Monday,
+    // which for the first week of a selected month can fall in the month before.
     const view = LosData.calculateAverageView(loadedFacts, {
-        grain: grainInput.value,
-        hotelNames: hotels,
-        selectedMonths: loadedMonths
+        grain: loadedGrain,
+        hotelNames: hotels
     });
     const rows = pivotAverageRows(view.rows);
     const summaryByScenario = Object.fromEntries(view.summaryRows.map((row) => [row.scenario, row]));
@@ -287,7 +296,7 @@ function renderTable(rows) {
         return;
     }
 
-    const grain = grainInput.value;
+    const grain = loadedGrain;
     // A day grain across a full portfolio is a row per date per hotel, and the
     // period label repeats once per hotel within each date.
     const periodLabels = new Map();
@@ -329,7 +338,7 @@ function renderTable(rows) {
 // they return no separate year band - it would only repeat what is already
 // under the tick. Day and week buckets still band the year below the axis.
 function getChartLabel(periodKey) {
-    return LosFormat.periodLabelParts(periodKey, grainInput.value);
+    return LosFormat.periodLabelParts(periodKey, loadedGrain);
 }
 
 function tooltipScenario(label, color, row) {
@@ -395,7 +404,7 @@ function renderChart(rows) {
 
     // "Jan 2026" is roughly twice as wide as the old "JAN", so a full year of
     // monthly ticks still fits but anything longer has to thin out.
-    const labelStep = grainInput.value === "month" && rows.length <= 12
+    const labelStep = loadedGrain === "month" && rows.length <= 12
         ? 1
         : Math.max(1, Math.ceil(rows.length / 10));
     rows.forEach((row, index) => {
@@ -512,7 +521,7 @@ function renderChart(rows) {
         hitArea.setAttribute("tabindex", "0");
         hitArea.setAttribute(
             "aria-label",
-            `Show data for ${LosFormat.periodLabel(row.periodKey, grainInput.value)}`
+            `Show data for ${LosFormat.periodLabel(row.periodKey, loadedGrain)}`
         );
         hitArea.addEventListener("mouseenter", () => showPoint(index));
         hitArea.addEventListener("focus", () => showPoint(index));
@@ -586,7 +595,18 @@ startDateInput.addEventListener("input", markBackendSettingChanged);
 endDateInput.addEventListener("input", markBackendSettingChanged);
 document.getElementById("monthPicker").addEventListener("periodchange", markBackendSettingChanged);
 lyComparisonInput.addEventListener("change", markBackendSettingChanged);
-grainInput.addEventListener("change", render);
+// The grain is now part of the request, because the server rolls the date
+// dimension up rather than shipping day-grain rows for the browser to reduce.
+// So this refetches instead of repainting. It stays automatic - the control felt
+// instant before and a refetch at the rolled-up size is a few hundred rows - but
+// it does nothing before the first Update, when there is no period to reload.
+grainInput.addEventListener("change", () => {
+    if (lastLoadedRequestKey === null) {
+        updateLoadButtonState();
+        return;
+    }
+    loadData();
+});
 loadButton.addEventListener("click", loadData);
 document.addEventListener("DOMContentLoaded", () => {
     updateHotelToggleText();

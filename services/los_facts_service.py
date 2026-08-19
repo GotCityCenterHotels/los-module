@@ -2,7 +2,7 @@ import logging
 import os
 
 from collections import namedtuple
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from time import monotonic
 
@@ -15,6 +15,23 @@ from services.los_schema_service import ensure_los_schema
 
 
 LOS_STALE_AFTER_HOURS = int(os.environ.get("LOS_STALE_AFTER_HOURS", "30"))
+
+# The date grains the read model can roll up to, mapped onto the date_trunc field
+# that produces them. The values are the browser's own period keys: PostgreSQL
+# truncates a week to its Monday, which is exactly what
+# LosData.getPeriodKey(date, "week") computes, so a rolled-up row lands on the
+# key the browser would have derived for it and its client-side aggregation
+# becomes an identity transform rather than a reduction.
+#
+# "day" is deliberately absent. It IS the storage grain of
+# reservation_los_daily, so date_trunc would be an identity transform bought with
+# a sort - the query below skips the GROUP BY entirely for it.
+LOS_ROLLUP_FIELDS = {
+    "week": "week",
+    "month": "month",
+    "year": "year",
+}
+LOS_GRAINS = ("day",) + tuple(LOS_ROLLUP_FIELDS)
 
 
 class LosReadModelUnavailableError(RuntimeError):
@@ -114,6 +131,48 @@ def _fact_json(row):
     }
 
 
+def _period_start(arrival_date, grain):
+    """The browser's period key for a date, computed server-side.
+
+    Mirrors LosData.getPeriodKey. Only the raw-query fallback needs this; the
+    read model path lets PostgreSQL do it in the GROUP BY.
+    """
+    if grain == "day":
+        return arrival_date
+    if grain == "month":
+        return arrival_date.replace(day=1)
+    if grain == "year":
+        return arrival_date.replace(month=1, day=1)
+    if grain == "week":
+        return arrival_date - timedelta(days=arrival_date.weekday())
+    raise ValueError(f"Unsupported LOS grain: {grain}")
+
+
+def _rollup_facts(facts, grain):
+    """Sum already-shaped fact rows onto their period start."""
+    if grain == "day":
+        return facts
+
+    grouped = {}
+    for fact in facts:
+        period = _period_start(
+            date.fromisoformat(fact["arrivalDate"]), grain
+        ).isoformat()
+        key = (
+            period,
+            fact["enterpriseId"],
+            fact["scenario"],
+            fact["los"],
+        )
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = dict(fact, arrivalDate=period)
+            continue
+        existing["bookingCount"] += fact["bookingCount"]
+        existing["nightCount"] += fact["nightCount"]
+    return list(grouped.values())
+
+
 def _is_stale(published_at):
     return (
         datetime.now(timezone.utc) - published_at
@@ -156,7 +215,7 @@ def fetch_los_read_model_status():
 
 
 def _fetch_published_los_facts(
-    start_date, end_date, ly_comparison_basis, publication=None
+    start_date, end_date, ly_comparison_basis, publication=None, grain="day"
 ):
     ensure_los_schema()
     started_at = monotonic()
@@ -188,16 +247,47 @@ def _fetch_published_los_facts(
             # Deliberately unordered. Every consumer of this payload groups and
             # re-sorts it - the browser sorts its own output rows - so ordering
             # a hundred thousand rows here was a sort nobody read.
-            cursor.execute("""
-                SELECT arrival_date, enterprise_id, scenario, los,
-                       booking_count, night_count
-                FROM functions.reservation_los_daily
-                WHERE run_id = %s
-                  AND comparison_basis = %s
-                  AND arrival_date BETWEEN %s AND %s
-            """, (
-                publication.run_id, ly_comparison_basis, start_date, end_date
-            ))
+            #
+            # The rollup is the whole point of the grain argument. A year at day
+            # grain is ~170k rows that the browser immediately reduces to ~430 at
+            # month grain, and shipping the difference cost more than every other
+            # term on the request combined: psycopg materialising the rows, the
+            # reshape loop below, json.dumps, gzip, the wire, and JSON.parse at
+            # the far end. Summing here is one hash aggregate on top of a scan the
+            # query already does.
+            #
+            # los and enterprise_id stay in the grouping. The Distribution page
+            # buckets by los and both pages filter by hotel in the browser, so
+            # collapsing either one would trade a payload win for a round trip on
+            # every interaction.
+            rollup_field = LOS_ROLLUP_FIELDS.get(grain)
+            if rollup_field is None:
+                cursor.execute("""
+                    SELECT arrival_date, enterprise_id, scenario, los,
+                           booking_count, night_count
+                    FROM functions.reservation_los_daily
+                    WHERE run_id = %s
+                      AND comparison_basis = %s
+                      AND arrival_date BETWEEN %s AND %s
+                """, (
+                    publication.run_id, ly_comparison_basis,
+                    start_date, end_date,
+                ))
+            else:
+                cursor.execute("""
+                    SELECT date_trunc(%s, arrival_date)::date AS arrival_date,
+                           enterprise_id, scenario, los,
+                           sum(booking_count)::bigint AS booking_count,
+                           sum(night_count)::bigint AS night_count
+                    FROM functions.reservation_los_daily
+                    WHERE run_id = %s
+                      AND comparison_basis = %s
+                      AND arrival_date BETWEEN %s AND %s
+                    GROUP BY 1, 2, 3, 4
+                """, (
+                    rollup_field, publication.run_id, ly_comparison_basis,
+                    start_date, end_date,
+                ))
             rows = cursor.fetchall()
 
     if _is_stale(publication.published_at):
@@ -226,8 +316,10 @@ def _fetch_published_los_facts(
 
     elapsed_ms = (monotonic() - started_at) * 1000
     logging.info(
-        "LOS read model query completed run_id=%s row_count=%d duration_ms=%.1f",
+        "LOS read model query completed run_id=%s grain=%s row_count=%d "
+        "duration_ms=%.1f",
         publication.run_id,
+        grain,
         len(facts),
         elapsed_ms,
     )
@@ -239,11 +331,11 @@ def _fetch_published_los_facts(
 
 
 def fetch_los_facts(
-    start_date, end_date, ly_comparison_basis, publication=None
+    start_date, end_date, ly_comparison_basis, publication=None, grain="day"
 ):
     if los_read_model_enabled():
         return _fetch_published_los_facts(
-            start_date, end_date, ly_comparison_basis, publication
+            start_date, end_date, ly_comparison_basis, publication, grain
         )
 
     parameters = {
@@ -272,4 +364,11 @@ def fetch_los_facts(
 
     # The raw query reads live source data, so there is no publication to
     # validate a cached response against.
-    return LosFacts([_fact_json(row) for row in rows], None, None)
+    #
+    # It also takes no grain: LOS_FACTS_SQL is the original arrival-date query.
+    # Rolling its rows up here rather than leaving them at day grain keeps one
+    # response contract across both paths, so the browser does not have to know
+    # which one answered.
+    return LosFacts(
+        _rollup_facts([_fact_json(row) for row in rows], grain), None, None
+    )

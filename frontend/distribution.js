@@ -23,7 +23,9 @@ const periodPicker = LosPeriodPicker.create({
 });
 
 let loadedFacts = [];
-let loadedMonths = [];
+// See app.js: labels read the grain the rows were rolled up to, not the live
+// <select>, which disagrees with it while a grain change is in flight.
+let loadedGrain = null;
 let lastLoadedRequestKey = null;
 let requestInProgress = false;
 let hotelRequestId = 0;
@@ -40,6 +42,7 @@ function getRequestState() {
         startDate: startDate.value,
         endDate: endDate.value,
         lyComparisonBasis: lyComparisonBasis.value,
+        grain: grain.value,
         selectedMonths: periodPicker.getSelectedMonths()
     };
 }
@@ -125,7 +128,7 @@ async function loadData() {
             ...requestedState
         });
         loadedFacts = payload.data || [];
-        loadedMonths = requestedState.selectedMonths;
+        loadedGrain = requestedState.grain;
         loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
@@ -144,7 +147,7 @@ async function loadData() {
         // repaint the previous period's distribution under the new settings.
         results.innerHTML = "";
         loadedFacts = [];
-        loadedMonths = [];
+        loadedGrain = null;
         loadedRequestState = null;
         lastLoadedRequestKey = null;
     }
@@ -158,14 +161,16 @@ function render() {
     if (lastLoadedRequestKey === null) return;
 
     const selectedHotel = hotelSelect.value;
+    // No selectedMonths: the request already covered exactly the selected
+    // months, and a server-rolled week bucket carries its Monday, which can fall
+    // in the month before the one asked for. See app.js.
     const rows = LosData.calculateDistribution(loadedFacts, {
-        grain: grain.value,
+        grain: loadedGrain,
         hotelNames: selectedHotel ? [selectedHotel] : null,
         scenario: scenario.value,
         portfolio: level.value === "total",
         metric: metric.value,
-        buckets: LosData.DEFAULT_LOS_BUCKETS,
-        selectedMonths: loadedMonths
+        buckets: LosData.DEFAULT_LOS_BUCKETS
     });
 
     if (rows.length === 0) {
@@ -173,7 +178,7 @@ function render() {
         return;
     }
 
-    const selectedGrain = grain.value;
+    const selectedGrain = loadedGrain;
     const unit = metric.value === "bookings" ? "reservations" : "nights";
     // A day grain across a full portfolio is a card per date per hotel, and the
     // period label is identical for every hotel within a date.
@@ -248,7 +253,14 @@ endDate.addEventListener("input", markBackendSettingChanged);
 document.getElementById("monthPicker").addEventListener("periodchange", markBackendSettingChanged);
 lyComparisonBasis.addEventListener("change", markBackendSettingChanged);
 loadButton.addEventListener("click", loadData);
-grain.addEventListener("change", render);
+// Part of the request now, not a local repaint - see app.js.
+grain.addEventListener("change", () => {
+    if (lastLoadedRequestKey === null) {
+        updateLoadButtonState();
+        return;
+    }
+    loadData();
+});
 hotelSelect.addEventListener("change", render);
 metric.addEventListener("change", render);
 scenario.addEventListener("change", render);

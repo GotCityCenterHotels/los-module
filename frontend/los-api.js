@@ -91,6 +91,12 @@
         return new Date(Date.UTC(year, month, 0)).getUTCDate();
     }
 
+    // Every range this returns covers exactly the selected months: the runs are
+    // contiguous, so every month between a run's first and last is itself
+    // selected. That is what lets the callers drop their own post-fetch month
+    // filter, which they have to now - a server-rolled row carries its period
+    // start, and a week bucket can legitimately start in the month before the
+    // one that was asked for.
     function buildContiguousMonthRanges(selectedMonths, startDate, endDate) {
         if (!selectedMonths || selectedMonths.length === 0) {
             return [{ startDate, endDate }];
@@ -191,6 +197,7 @@
         startDate,
         endDate,
         lyComparisonBasis,
+        grain = "day",
         selectedMonths = [],
         fetcher = fetchJson
     }) {
@@ -199,10 +206,18 @@
             ranges,
             MAX_CONCURRENT_RANGE_REQUESTS,
             async (range) => {
+                // The grain goes to the server, which rolls the date dimension
+                // up in SQL. A year at day grain is ~170k rows the browser only
+                // ever reduces to a few hundred; at month grain the server sends
+                // the few hundred. LosData still aggregates what arrives - on
+                // rolled-up rows that is an identity transform, because
+                // date_trunc lands them on the same period keys getPeriodKey
+                // computes.
                 const params = new URLSearchParams({
                     startDate: range.startDate,
                     endDate: range.endDate,
-                    lyComparisonBasis
+                    lyComparisonBasis,
+                    grain
                 });
                 try {
                     const payload = await fetcher(`${apiBaseUrl}/los/facts?${params}`);

@@ -15,6 +15,7 @@ import azure.functions as func
 
 from services.hotels_service import fetch_hotels
 from services.los_facts_service import (
+    LOS_GRAINS,
     LosReadModelUnavailableError,
     fetch_los_facts,
     fetch_los_publication,
@@ -104,7 +105,7 @@ LOS_FACTS_RESPONSE_CACHE_MAX_ENTRIES = max(
 )
 # Increment when the LOS facts response contract or row shape changes, so a
 # deployment cannot serve new-shaped bytes under an old validator.
-LOS_FACTS_RESPONSE_SCHEMA_VERSION = 1
+LOS_FACTS_RESPONSE_SCHEMA_VERSION = 2
 # Matches the server-side TTL in services/hotels_service.py and the browser-side
 # one in frontend/los-api.js, so all three agree on how long a hotel list stands.
 HOTEL_LIST_MAX_AGE_SECONDS = int(
@@ -434,12 +435,34 @@ def versioned_cost_response(req, cache_key, etag, payload_factory):
     return _cost_response_bytes.respond(req, cache_key, etag, payload_factory)
 
 
-def _los_facts_payload(start_date, end_date, ly_comparison_basis, facts):
+def parse_facts_grain(req):
+    """The date grain to roll the LOS response up to.
+
+    Defaults to day, which is the storage grain and the previous behaviour, so a
+    cached client that has not learned to send the parameter still gets exactly
+    the response it did before.
+    """
+    grain = req.params.get("grain") or "day"
+    if grain not in LOS_GRAINS:
+        return None, json_response(
+            {
+                "error": "Invalid grain",
+                "allowedValues": list(LOS_GRAINS),
+            },
+            400,
+        )
+    return grain, None
+
+
+def _los_facts_payload(
+    start_date, end_date, ly_comparison_basis, grain, facts
+):
     return {
         "parameters": {
             "startDate": start_date.isoformat(),
             "endDate": end_date.isoformat(),
             "lyComparisonBasis": ly_comparison_basis,
+            "grain": grain,
         },
         "runId": facts.run_id,
         "rowCount": len(facts.rows),
@@ -578,18 +601,24 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
 
     start_date, end_date, ly_comparison_basis = parameters
 
+    grain, grain_error = parse_facts_grain(req)
+    if grain_error is not None:
+        return grain_error
+
     # The raw-query fallback reads live source data, so it has no publication to
     # validate against and must not be cached or reused.
     if not los_read_model_enabled():
         try:
-            facts = fetch_los_facts(start_date, end_date, ly_comparison_basis)
+            facts = fetch_los_facts(
+                start_date, end_date, ly_comparison_basis, None, grain
+            )
         except (LosReadModelUnavailableError, LosSchemaError) as error:
             return json_response({"error": str(error)}, 503)
         except Exception:
             logging.exception("LOS facts endpoint failed")
             return json_response({"error": "Unable to retrieve LOS facts"}, 500)
         return compressed_json_response(req, _los_facts_payload(
-            start_date, end_date, ly_comparison_basis, facts
+            start_date, end_date, ly_comparison_basis, grain, facts
         ))
 
     # Resolving the publication first is the whole point. It is one indexed
@@ -613,6 +642,7 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
         start_date.isoformat(),
         end_date.isoformat(),
         ly_comparison_basis,
+        grain,
         str(publication.run_id),
         publication.published_at.isoformat(),
     ]))
@@ -622,14 +652,15 @@ def los_facts(req: func.HttpRequest) -> func.HttpResponse:
         start_date,
         end_date,
         ly_comparison_basis,
+        grain,
     )
 
     def build_payload():
         facts = fetch_los_facts(
-            start_date, end_date, ly_comparison_basis, publication
+            start_date, end_date, ly_comparison_basis, publication, grain
         )
         return _los_facts_payload(
-            start_date, end_date, ly_comparison_basis, facts
+            start_date, end_date, ly_comparison_basis, grain, facts
         ), True
 
     try:
