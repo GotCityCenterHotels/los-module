@@ -96,6 +96,47 @@ class CostDataServiceTests(unittest.TestCase):
         cost_data_service._result_cache.clear()
         cost_data_service._result_inflight.clear()
 
+    def test_the_slowest_dataset_is_submitted_in_the_first_wave(self):
+        """Submission order is not response order.
+
+        The executor is three wide and there are seven datasets, so submissions
+        queue. distributionRates is the longest by a wide margin and was declared
+        last, which meant its entire duration was appended to the request rather
+        than overlapping the six short queries.
+        """
+        order = cost_data_service._submission_order(
+            cost_data_service.COST_DATA_QUERIES
+        )
+        self.assertEqual(order[0], "distributionRates")
+        self.assertLess(
+            order.index("distributionRates"),
+            cost_data_service.COST_DATA_QUERY_CONCURRENCY,
+            "the slowest dataset must start in the first wave",
+        )
+
+    def test_submission_order_still_covers_every_dataset_exactly_once(self):
+        order = cost_data_service._submission_order(
+            cost_data_service.COST_DATA_QUERIES
+        )
+        self.assertEqual(
+            sorted(order), sorted(cost_data_service.COST_DATA_QUERIES)
+        )
+        self.assertEqual(len(order), len(set(order)))
+
+    def test_an_unprioritised_dataset_keeps_its_declared_position(self):
+        order = cost_data_service._submission_order(
+            {"a": "", "distributionRates": "", "b": "", "c": ""}
+        )
+        self.assertEqual(order, ["distributionRates", "a", "b", "c"])
+
+    def test_the_response_keeps_its_declared_key_order(self):
+        # Reordering submissions must not reorder the body: the response keys are
+        # rebuilt from COST_DATA_QUERIES, not from the pending map.
+        self.assertEqual(
+            list(cost_data_service.COST_DATA_QUERIES)[0],
+            "arrivalsDepartures",
+        )
+
     def test_every_dataset_renders_its_date_and_numerics_as_text(self):
         """The conversion belongs in PostgreSQL, not in _json_value.
 

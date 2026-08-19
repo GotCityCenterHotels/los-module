@@ -31,6 +31,25 @@ COST_DATA_QUERY_CONCURRENCY = max(
 _dataset_workers = ThreadPoolExecutor(
     max_workers=COST_DATA_QUERY_CONCURRENCY, thread_name_prefix="cost-data"
 )
+
+# Submission order, which is not the same thing as response order.
+#
+# The executor is three wide and there are seven datasets, so submissions queue.
+# distributionRates is by far the longest - it aggregates reservation-level mix
+# rows and prices them through the rulebook lateral - and it was declared last in
+# COST_DATA_QUERIES, so it only started once six shorter queries had finished.
+# Its whole duration was therefore appended to the request instead of overlapping
+# anything. Starting it in the first wave lets the six short ones run underneath
+# it.
+#
+# Anything not named here keeps its declared order behind those that are, so
+# adding a dataset needs no change unless it turns out to be a slow one.
+COST_DATA_SUBMISSION_PRIORITY = ("distributionRates", "cleaningAllocations")
+
+
+def _submission_order(datasets):
+    ranked = [name for name in COST_DATA_SUBMISSION_PRIORITY if name in datasets]
+    return ranked + [name for name in datasets if name not in set(ranked)]
 # Coordinators only: the actual SQL still runs through _dataset_workers and its
 # global three-connection ceiling. Two threads let the selected and comparison
 # ranges feed that queue together from one HTTP invocation.
@@ -170,13 +189,15 @@ def _fetch_cost_data_uncached(start_date, end_date):
                     datasets[dataset] = _json_rows(cursor.fetchall())
     else:
         pending = {
-            dataset: _dataset_workers.submit(_fetch_dataset, query, parameters)
-            for dataset, query in COST_DATA_QUERIES.items()
+            dataset: _dataset_workers.submit(
+                _fetch_dataset, COST_DATA_QUERIES[dataset], parameters
+            )
+            for dataset in _submission_order(COST_DATA_QUERIES)
         }
-        # Rebuilt in the declared order rather than in completion order, so the
-        # response keys do not shuffle from one request to the next.
+        # Rebuilt in the declared order rather than in submission or completion
+        # order, so the response keys do not shuffle from one request to the next.
         datasets = {
-            dataset: future.result() for dataset, future in pending.items()
+            dataset: pending[dataset].result() for dataset in COST_DATA_QUERIES
         }
 
     row_counts = {name: len(rows) for name, rows in datasets.items()}

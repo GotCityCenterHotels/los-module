@@ -20,10 +20,19 @@ from queries.los_sync import (
     SOURCE_CLOCK_SQL,
 )
 from services.los_schema_service import ensure_los_schema
-from shared.db import get_export_connection
+from shared.db import get_export_connection, get_import_connection
 
 
 SYNC_LOCK_NAME = "functions.los_sync"
+# The read path's index-only scan is only index-only where the visibility map
+# says so, and a bulk publication plus the pruning below leaves that map unset
+# until autovacuum happens to come round - which after a nightly write burst can
+# be hours after the rows anyone reads were written. Vacuuming here ties it to
+# the publication instead of to a daemon's schedule.
+VACUUM_TABLES = (
+    "functions.reservation_los_daily",
+    "functions.reservation_los_fact",
+)
 WATERMARK_OVERLAP_MINUTES = int(
     os.environ.get("LOS_WATERMARK_OVERLAP_MINUTES", "5")
 )
@@ -31,6 +40,15 @@ EXTRACT_BATCH_SIZE = int(os.environ.get("LOS_EXTRACT_BATCH_SIZE", "5000"))
 RESERVATION_CHUNK_SIZE = int(
     os.environ.get("LOS_RESERVATION_CHUNK_SIZE", "5000")
 )
+
+# How many superseded publications to keep alongside the live one.
+#
+# It was seven, so reservation_los_daily carried eight generations of rows and
+# ix_reservation_los_daily_lookup indexed all of them. The read path filters on a
+# single run_id, so seven eighths of that index was dead weight it still had to
+# descend through. One previous generation is what a rollback actually needs: the
+# publication pointer can be moved back to it without re-running a sync.
+LOS_RUN_RETENTION = max(0, int(os.environ.get("LOS_RUN_RETENTION", "1")))
 
 
 AGGREGATE_SQL = """
@@ -371,6 +389,31 @@ def _create_run(mode, watermark_from, source_clock):
             return cursor.fetchone()[0]
 
 
+def _vacuum_read_model():
+    """Set the visibility map and refresh statistics after a publication.
+
+    Deliberately best-effort. The publication is already committed and correct
+    by the time this runs, so a vacuum that is blocked, slow, or refused is a
+    lost optimisation rather than a failed sync, and must not turn a good
+    publication into a reported failure.
+
+    On its own connection, in autocommit: VACUUM is not allowed inside a
+    transaction block, and flipping autocommit on a pooled connection would
+    carry that change back into the pool.
+    """
+    for table in VACUUM_TABLES:
+        try:
+            with get_import_connection() as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    cursor.execute(f"VACUUM (ANALYZE) {table}")
+            logging.info("LOS read model vacuumed table=%s", table)
+        except Exception:
+            logging.warning(
+                "LOS read model vacuum skipped table=%s", table, exc_info=True
+            )
+
+
 def _mark_failed(run_id, error):
     with cost_pool.connection() as connection:
         with connection.cursor() as cursor:
@@ -540,15 +583,18 @@ def sync_los(mode="delta"):
                             WHERE status IN ('published', 'failed')
                               AND run_id <> %s
                             ORDER BY run_id DESC
-                            OFFSET 7
+                            OFFSET %s
                         )
-                    """, (run_id,))
+                    """, (run_id, LOS_RUN_RETENTION))
                     cost_publication_version = None
                     if fact_rows_written:
                         cost_publication_version = advance_cost_publication(
                             "hotels:los-sync",
                             cursor=cursor,
                         )
+
+            # Outside the transaction on purpose: VACUUM cannot run inside one.
+            _vacuum_read_model()
 
             if cost_publication_version is not None:
                 remember_cost_publication(cost_publication_version)
