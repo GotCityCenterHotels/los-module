@@ -2,10 +2,9 @@ import logging
 import os
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import date, datetime
-from decimal import Decimal
 from threading import Lock
 from time import monotonic
+from typing import NamedTuple
 
 from psycopg.rows import dict_row
 
@@ -13,6 +12,7 @@ from cost_database import cost_pool
 from queries.cost_data import COST_DATA_QUERIES
 from queries.cost_spit import COST_SPIT_DATASETS, COST_SPIT_READ_SQL
 from services.cost_schema_service import ensure_cost_settings_schema
+from shared.json_shape import json_rows
 
 
 # The datasets are independent reads, so they are fetched together rather than
@@ -79,59 +79,62 @@ _result_inflight = {}
 _result_cache_lock = Lock()
 
 
-def _json_value(value):
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        return str(value)
-    return value
-
-
-def _camel_case(column):
-    return "".join(
-        word if index == 0 else word.capitalize()
-        for index, word in enumerate(column.split("_"))
-    )
-
-
-def _json_rows(rows):
-    """Shape a whole result set for JSON.
-
-    Every row in a result set carries the same columns in the same order, so the
-    snake_case to camelCase rewrite - a split, a capitalize per word, and a join
-    - is done once for the set instead of once per cell. On six datasets of a
-    few thousand rows each that was tens of thousands of identical string
-    rebuilds per request.
-    """
-    if not rows:
-        return []
-    names = [_camel_case(column) for column in rows[0]]
-    return [
-        dict(zip(names, [_json_value(value) for value in row.values()]))
-        for row in rows
-    ]
-
-
 def _fetch_dataset(query, parameters):
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(query, parameters)
-            return _json_rows(cursor.fetchall())
+            return json_rows(cursor.fetchall())
 
 
 class CostSpitUnavailableError(RuntimeError):
     pass
 
 
-def _camel_payload(payload):
-    return {
-        _camel_case(column): _json_value(value)
-        for column, value in payload.items()
-    }
+# A published snapshot is a point in time, and an older one is still a truthful
+# point in time - just an earlier one. Refusing anything but today's meant that
+# between midnight and whenever the nightly import reached this dataset, and for
+# a whole day after any failed import, the page lost SPIT entirely rather than
+# showing last night's reading. Accepting a little lag and naming it is strictly
+# better than that. A publication ahead of the requested cutoff is still refused:
+# that one would count bookings created after the point in time being asked for.
+COST_SPIT_MAX_STALE_DAYS = int(os.environ.get("COST_SPIT_MAX_STALE_DAYS", "3"))
+
+
+class CostSpitSnapshot(NamedTuple):
+    """One published SPIT reading, still in the bytes the response will send.
+
+    ``data_json`` is the complete ``{dataset: [...]}`` object, already
+    serialized. It is deliberately not parsed: see _fetch_spit_read_model.
+    """
+
+    data_json: str
+    row_counts: dict
+    cutoff_date: object
+    stale_days: int
+
+
+def _array_body(text):
+    """The inside of a stored JSON array, without decoding it."""
+    body = text.strip()
+    if not body.startswith("[") or not body.endswith("]"):
+        raise ValueError("Published Cost SPIT fact_rows must be a JSON array")
+    return body[1:-1]
 
 
 def _fetch_spit_read_model(parameters):
-    """Read one published SPIT range from Database A's covering index."""
+    """Read one published SPIT range from Database A's covering index.
+
+    The rows arrive as the exact JSON text the response sends, so this function
+    concatenates rather than decodes: no json.loads, no per-row dict, no
+    re-encode on the way out. That matters because the page asks for 1 January
+    to today by default, and on a full year the decode-and-rebuild version cost
+    about 4.4 seconds of Python per uncached request against roughly 0.13 for
+    splicing the stored text - which was the entire budget this read model was
+    built to fit inside.
+
+    The seven datasets are joined into one fragment rather than seven, because
+    each one spliced separately rewrites the whole response body again.
+    """
     ensure_cost_settings_schema()
     with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
@@ -144,9 +147,17 @@ def _fetch_spit_read_model(parameters):
         )
 
     publication = rows[0]
-    if publication["cutoff_date"] != parameters["cutoff_date"]:
+    published_cutoff = publication["cutoff_date"]
+    requested_cutoff = parameters["cutoff_date"]
+    if published_cutoff > requested_cutoff:
         raise CostSpitUnavailableError(
-            "Cost SPIT publication is stale for the requested cutoff"
+            "Cost SPIT publication is ahead of the requested cutoff"
+        )
+    stale_days = (requested_cutoff - published_cutoff).days
+    if stale_days > COST_SPIT_MAX_STALE_DAYS:
+        raise CostSpitUnavailableError(
+            f"Cost SPIT publication is {stale_days} days behind the requested "
+            f"cutoff, beyond the {COST_SPIT_MAX_STALE_DAYS} day allowance"
         )
     if (
         parameters["start_date"] < publication["minimum_stay_date"]
@@ -156,18 +167,26 @@ def _fetch_spit_read_model(parameters):
             "Cost SPIT publication does not cover the requested range"
         )
 
-    datasets = {dataset: [] for dataset in COST_SPIT_DATASETS}
+    chunks = {dataset: [] for dataset in COST_SPIT_DATASETS}
+    counts = {dataset: 0 for dataset in COST_SPIT_DATASETS}
     for row in rows:
         dataset = row["dataset"]
         if dataset is None:
             continue
-        if dataset not in datasets:
+        if dataset not in chunks:
             raise ValueError(f"Unknown published Cost SPIT dataset: {dataset}")
-        fact_rows = row["fact_rows"] or []
-        if not isinstance(fact_rows, list):
-            raise ValueError("Published Cost SPIT fact_rows must be an array")
-        datasets[dataset].extend(_camel_payload(payload) for payload in fact_rows)
-    return datasets
+        body = _array_body(row["fact_rows"])
+        if body:
+            chunks[dataset].append(body)
+        counts[dataset] += row["fact_count"]
+
+    # The dataset names are the fixed identifiers validated above, so they are
+    # safe to write into the JSON object directly.
+    data_json = "{%s}" % ",".join(
+        '"%s":[%s]' % (dataset, ",".join(bodies))
+        for dataset, bodies in chunks.items()
+    )
+    return CostSpitSnapshot(data_json, counts, published_cutoff, stale_days)
 
 
 def _fetch_cost_data_uncached(start_date, end_date):
@@ -194,7 +213,7 @@ def _fetch_cost_data_uncached(start_date, end_date):
                 datasets = {}
                 for dataset, query in COST_DATA_QUERIES.items():
                     cursor.execute(query, parameters)
-                    datasets[dataset] = _json_rows(cursor.fetchall())
+                    datasets[dataset] = json_rows(cursor.fetchall())
     else:
         pending = {
             dataset: _dataset_workers.submit(
@@ -321,8 +340,11 @@ def fetch_cost_spit_data(
     """Read Cost Data as Database B stood at ``cutoff_date``.
 
     The expensive lifecycle reconstruction is published nightly. This request
-    only reads immutable daily arrays from Database A; an empty covered range is
-    valid, while a missing/stale publication is explicitly unavailable.
+    only reads immutable daily arrays from Database A and returns them still
+    serialized, for the caller to splice into the response body. An empty
+    covered range is valid; a missing, uncovered or too-stale publication is
+    explicitly unavailable, and the reading actually served names its own cutoff
+    rather than assuming it is the one that was asked for.
     """
 
     if comparison_basis not in {"sameDate", "sameWeekday"}:
@@ -336,18 +358,21 @@ def fetch_cost_spit_data(
             "comparison_basis": comparison_basis,
         }
         started_at = monotonic()
-        datasets = _fetch_spit_read_model(parameters)
-        counts = {dataset: len(rows) for dataset, rows in datasets.items()}
+        snapshot = _fetch_spit_read_model(parameters)
         logging.info(
             "Cost SPIT read-model lookup completed start_date=%s end_date=%s "
-            "cutoff_date=%s rows=%s duration_ms=%.1f",
+            "cutoff_date=%s published_cutoff=%s stale_days=%d rows=%d "
+            "bytes=%d duration_ms=%.1f",
             start_date,
             end_date,
             cutoff_date,
-            sum(counts.values()),
+            snapshot.cutoff_date,
+            snapshot.stale_days,
+            sum(snapshot.row_counts.values()),
+            len(snapshot.data_json),
             (monotonic() - started_at) * 1000,
         )
-        return datasets, counts
+        return snapshot
 
     return _cached_result(
         (

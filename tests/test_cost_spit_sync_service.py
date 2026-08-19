@@ -1,7 +1,9 @@
+import inspect
+import json
 import os
 import unittest
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,29 +97,69 @@ class CostSpitSyncTests(unittest.TestCase):
         self.assertIn("on delete cascade", migration)
         self.assertNotIn("integration_db", migration)
 
+    def test_the_shape_migration_stores_response_ready_json(self):
+        """json rather than jsonb, because json keeps the text verbatim: the
+        publisher writes the exact bytes the response sends and the read copies
+        them out again without either side reserialising."""
+        migration = (
+            Path(__file__).resolve().parent.parent
+            / "sql"
+            / "migrations"
+            / "021_cost_spit_read_model_shape.sql"
+        ).read_text(encoding="utf-8").lower()
+        ddl = "\n".join(
+            line for line in migration.splitlines()
+            if not line.strip().startswith("--")
+        )
+
+        self.assertIn("fact_rows json not null", ddl)
+        self.assertIn("json_typeof(fact_rows) = 'array'", ddl)
+        self.assertNotIn("jsonb", ddl)
+        self.assertIn("fact_count integer not null", ddl)
+
     def test_snapshot_plan_matches_the_http_comparison_dates(self):
+        lead_in = timedelta(days=sync.COVERAGE_LEAD_IN_DAYS)
         plan = sync.snapshot_plan(date(2026, 8, 19))
 
         self.assertEqual(plan["sameDate"], {
             "cutoff_date": date(2025, 8, 19),
-            "start_date": date(2025, 1, 1),
+            "start_date": date(2025, 1, 1) - lead_in,
             "end_date": date(2025, 12, 31),
         })
         self.assertEqual(plan["sameWeekday"], {
             "cutoff_date": date(2025, 8, 20),
-            "start_date": date(2025, 1, 2),
+            "start_date": date(2025, 1, 2) - lead_in,
             "end_date": date(2026, 1, 1),
         })
+
+    def test_coverage_reaches_back_before_the_first_of_january(self):
+        """The page opens on 1 January to today, so a reading taken in early
+        January compares against a range that starts in the previous year. The
+        lead-in is what keeps that request covered instead of unavailable."""
+        self.assertLess(
+            sync.coverage_window(date(2026, 1, 3))[0], date(2026, 1, 1)
+        )
+        self.assertEqual(
+            sync.coverage_window(date(2026, 1, 3))[1], date(2026, 12, 31)
+        )
 
     def test_source_rows_are_compacted_to_one_array_per_dataset_day(self):
         source = SourceConnection([
             {
                 "dataset": "arrivalsDepartures",
-                "payload": {"stay_date": "2025-01-01", "hotel_name": "A"},
+                "payload": {
+                    "stay_date": "2025-01-01",
+                    "hotel_name": "A",
+                    "last_updated_at": None,
+                },
             },
             {
                 "dataset": "arrivalsDepartures",
-                "payload": {"stay_date": "2025-01-01", "hotel_name": "B"},
+                "payload": {
+                    "stay_date": "2025-01-01",
+                    "hotel_name": "B",
+                    "last_updated_at": None,
+                },
             },
             {
                 "dataset": "breakfast",
@@ -139,12 +181,20 @@ class CostSpitSyncTests(unittest.TestCase):
         self.assertEqual(target.commits, 1)
         written = target.target.batches[0][1]
         self.assertEqual(
-            [(row[2], row[3], len(row[4].obj)) for row in written],
+            [(row[2], row[3], row[4]) for row in written],
             [
                 (date(2025, 1, 1), "arrivalsDepartures", 2),
                 (date(2025, 1, 2), "breakfast", 1),
             ],
         )
+        # Stored in the shape the response sends: camelCase keys, no nulls, and
+        # already serialized, so an HTTP read neither renames nor re-encodes.
+        self.assertEqual(json.loads(written[0][5]), [
+            {"stayDate": "2025-01-01", "hotelName": "A"},
+            {"stayDate": "2025-01-01", "hotelName": "B"},
+        ])
+        self.assertNotIn(" ", written[0][5])
+        self.assertIn("%s::json", sync.INSERT_DAILY_SQL)
         self.assertIn("SET LOCAL work_mem", source.setup.executions[0][0])
         self.assertEqual(
             source.source.executions[0][1],
@@ -154,6 +204,33 @@ class CostSpitSyncTests(unittest.TestCase):
                 "cutoff_date": date(2025, 8, 19),
             },
         )
+
+    def test_an_abandoned_run_is_discarded_before_a_new_one_starts(self):
+        """A run killed mid-stream keeps its committed daily rows behind a row
+        that still says running, which retention skips because it only prunes
+        finished runs. Holding the advisory lock means nothing else is live."""
+        source = inspect.getsource(sync._create_run)
+        self.assertIn("status = 'running'", source)
+        self.assertIn("make_interval", source)
+        self.assertIn("ABANDONED_RUN_HOURS", source)
+
+    def test_the_source_read_gets_a_background_statement_ceiling(self):
+        """The five minute export default is the short-statement ceiling. This
+        is the lifecycle scan the whole read model exists to move off the
+        request path, and it is allowed to take longer than that."""
+        self.assertGreater(sync.SOURCE_STATEMENT_TIMEOUT_MS, 300000)
+        self.assertIn(
+            "get_export_connection(SOURCE_STATEMENT_TIMEOUT_MS)",
+            inspect.getsource(sync._stream_basis),
+        )
+
+    def test_the_build_lock_does_not_hold_a_pooled_connection(self):
+        """The lock is held for the whole build. The pool is four wide with the
+        Cost Data read already capped at three, so borrowing one here left
+        nothing for the lookups every page request makes before anything else."""
+        source = inspect.getsource(sync.sync_cost_spit)
+        self.assertIn("get_import_connection() as lock_connection", source)
+        self.assertNotIn("cost_pool.connection() as lock_connection", source)
 
     def test_a_row_outside_the_published_coverage_is_rejected(self):
         source = SourceConnection([{

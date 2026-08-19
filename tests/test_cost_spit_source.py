@@ -1,8 +1,9 @@
+import json
 import os
 import threading
 import unittest
 
-from datetime import date
+from datetime import date, timedelta
 
 
 os.environ.setdefault("DB_HOST", "localhost")
@@ -63,6 +64,21 @@ class FakePool:
         return FakeConnection(FakeCursor(self.executions, self.lock, self.rows))
 
 
+def publication_row(**overrides):
+    row = {
+        "run_id": 4,
+        "cutoff_date": date(2025, 8, 19),
+        "minimum_stay_date": date(2025, 1, 1),
+        "maximum_stay_date": date(2025, 12, 31),
+        "dataset": None,
+        "stay_date": None,
+        "fact_count": 0,
+        "fact_rows": None,
+    }
+    row.update(overrides)
+    return row
+
+
 class CostSpitSourceTests(unittest.TestCase):
     def setUp(self):
         cost_data_service._result_cache.clear()
@@ -108,85 +124,125 @@ class CostSpitSourceTests(unittest.TestCase):
         self.assertIn("from functions.cost_spit_publication", normalized)
         self.assertIn("functions.cost_spit_daily", normalized)
         self.assertNotIn("order_item_current", normalized)
+        # Read as text, not as json: the stored rows are already in the shape
+        # and key case the response sends, so decoding them would only be
+        # undone by re-encoding them on the way out.
+        self.assertIn("daily.fact_rows::text", normalized)
+        self.assertIn("daily.fact_count", normalized)
 
-    def test_an_empty_lifecycle_result_is_available_not_missing(self):
-        fake_pool = FakePool(rows=[{
-            "run_id": 4,
-            "cutoff_date": date(2025, 8, 19),
-            "minimum_stay_date": date(2025, 1, 1),
-            "maximum_stay_date": date(2025, 12, 31),
-            "dataset": None,
-            "stay_date": None,
-            "fact_rows": None,
-        }])
+    def _read(self, rows, start, end, cutoff, published=None):
+        fake_pool = FakePool(rows=rows)
         original_pool = cost_data_service.cost_pool
         original_ensure = cost_data_service.ensure_cost_settings_schema
         cost_data_service.cost_pool = fake_pool
         cost_data_service.ensure_cost_settings_schema = lambda: None
         try:
-            datasets, counts = cost_data_service.fetch_cost_spit_data(
-                date(2025, 10, 1),
-                date(2025, 10, 31),
-                date(2025, 8, 19),
-                publication_version=7,
-            )
+            return cost_data_service.fetch_cost_spit_data(
+                start, end, cutoff, publication_version=published,
+            ), fake_pool
         finally:
             cost_data_service.cost_pool = original_pool
             cost_data_service.ensure_cost_settings_schema = original_ensure
 
-        self.assertEqual(set(datasets), set(COST_SPIT_DATASETS))
-        self.assertTrue(all(rows == [] for rows in datasets.values()))
-        self.assertTrue(all(count == 0 for count in counts.values()))
+    def test_an_empty_lifecycle_result_is_available_not_missing(self):
+        snapshot, fake_pool = self._read(
+            [publication_row()],
+            date(2025, 10, 1), date(2025, 10, 31), date(2025, 8, 19),
+            published=7,
+        )
+
+        self.assertEqual(json.loads(snapshot.data_json), {
+            dataset: [] for dataset in COST_SPIT_DATASETS
+        })
+        self.assertTrue(all(count == 0 for count in snapshot.row_counts.values()))
         self.assertEqual(len(fake_pool.executions), 1)
         for _query, parameters in fake_pool.executions:
             self.assertEqual(parameters["cutoff_date"], date(2025, 8, 19))
 
-    def test_tagged_rows_are_restored_to_the_existing_json_shape(self):
-        fake_pool = FakePool(rows=[{
-            "run_id": 5,
-            "cutoff_date": date(2025, 8, 19),
-            "minimum_stay_date": date(2025, 1, 1),
-            "maximum_stay_date": date(2025, 12, 31),
-            "dataset": "roomRevenue",
-            "stay_date": date(2025, 7, 1),
-            "fact_rows": [{
-                "hotel_name": "Hotel A",
-                "stay_date": "2025-07-01",
-                "room_revenue_incl_products_1_net": "123",
-            }],
-        }])
-        original_pool = cost_data_service.cost_pool
-        original_ensure = cost_data_service.ensure_cost_settings_schema
-        cost_data_service.cost_pool = fake_pool
-        cost_data_service.ensure_cost_settings_schema = lambda: None
-        try:
-            datasets, counts = cost_data_service.fetch_cost_spit_data(
-                date(2025, 7, 1),
-                date(2025, 7, 31),
-                date(2025, 8, 19),
-                publication_version=8,
-            )
-        finally:
-            cost_data_service.cost_pool = original_pool
-            cost_data_service.ensure_cost_settings_schema = original_ensure
+    def test_stored_rows_are_spliced_without_being_decoded(self):
+        """The stored text is concatenated, not parsed. What has to hold is that
+        the concatenation is still the JSON object the datasets describe."""
+        snapshot, _pool = self._read(
+            [
+                publication_row(
+                    dataset="roomRevenue",
+                    stay_date=date(2025, 7, 1),
+                    fact_count=2,
+                    fact_rows=(
+                        '[{"hotelName":"Hotel A","stayDate":"2025-07-01"},'
+                        '{"hotelName":"Hotel B","stayDate":"2025-07-01"}]'
+                    ),
+                ),
+                publication_row(
+                    dataset="roomRevenue",
+                    stay_date=date(2025, 7, 2),
+                    fact_count=1,
+                    fact_rows='[{"hotelName":"Hotel A","stayDate":"2025-07-02"}]',
+                ),
+                publication_row(
+                    dataset="payments",
+                    stay_date=date(2025, 7, 2),
+                    fact_count=0,
+                    fact_rows="[]",
+                ),
+            ],
+            date(2025, 7, 1), date(2025, 7, 31), date(2025, 8, 19),
+            published=8,
+        )
 
-        self.assertEqual(datasets["roomRevenue"], [{
-            "hotelName": "Hotel A",
-            "stayDate": "2025-07-01",
-            "roomRevenueInclProducts1Net": "123",
-        }])
-        self.assertEqual(counts["roomRevenue"], 1)
+        decoded = json.loads(snapshot.data_json)
+        self.assertEqual(decoded["roomRevenue"], [
+            {"hotelName": "Hotel A", "stayDate": "2025-07-01"},
+            {"hotelName": "Hotel B", "stayDate": "2025-07-01"},
+            {"hotelName": "Hotel A", "stayDate": "2025-07-02"},
+        ])
+        self.assertEqual(decoded["payments"], [])
+        self.assertEqual(snapshot.row_counts["roomRevenue"], 3)
+        self.assertEqual(snapshot.row_counts["payments"], 0)
+        # Every dataset the contract names is present even when unpublished for
+        # the range, so the browser never has to guard for a missing key.
+        self.assertEqual(set(decoded), set(COST_SPIT_DATASETS))
+
+    def test_a_publication_from_an_earlier_night_is_served_and_dated(self):
+        cutoff = date(2025, 8, 19)
+        snapshot, _pool = self._read(
+            [publication_row(cutoff_date=cutoff - timedelta(days=2))],
+            date(2025, 10, 1), date(2025, 10, 31), cutoff,
+            published=9,
+        )
+
+        self.assertEqual(snapshot.cutoff_date, cutoff - timedelta(days=2))
+        self.assertEqual(snapshot.stale_days, 2)
+
+    def test_a_publication_older_than_the_allowance_is_unavailable(self):
+        cutoff = date(2025, 8, 19)
+        stale = cutoff - timedelta(
+            days=cost_data_service.COST_SPIT_MAX_STALE_DAYS + 1
+        )
+        with self.assertRaisesRegex(
+            cost_data_service.CostSpitUnavailableError, "behind the requested"
+        ):
+            self._read(
+                [publication_row(cutoff_date=stale)],
+                date(2025, 10, 1), date(2025, 10, 31), cutoff,
+                published=10,
+            )
+
+    def test_a_publication_ahead_of_the_cutoff_is_refused(self):
+        """Later than the point in time being asked for means it counts bookings
+        that did not exist yet, which is the one error SPIT must never make."""
+        cutoff = date(2025, 8, 19)
+        with self.assertRaisesRegex(
+            cost_data_service.CostSpitUnavailableError, "ahead of"
+        ):
+            self._read(
+                [publication_row(cutoff_date=cutoff + timedelta(days=1))],
+                date(2025, 10, 1), date(2025, 10, 31), cutoff,
+                published=11,
+            )
 
     def test_an_uncovered_range_does_not_fall_back_to_the_live_source(self):
-        fake_pool = FakePool(rows=[{
-            "run_id": 6,
-            "cutoff_date": date(2025, 8, 19),
-            "minimum_stay_date": date(2025, 1, 1),
-            "maximum_stay_date": date(2025, 12, 31),
-            "dataset": None,
-            "stay_date": None,
-            "fact_rows": None,
-        }])
+        fake_pool = FakePool(rows=[publication_row(run_id=6)])
         original_pool = cost_data_service.cost_pool
         original_ensure = cost_data_service.ensure_cost_settings_schema
         cost_data_service.cost_pool = fake_pool

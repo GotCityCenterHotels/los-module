@@ -649,13 +649,26 @@
     // A comparison that could not be fetched and a lifecycle-as-of read that
     // was unavailable are different problems with different answers, so they are
     // never reported as the same sentence.
+    //
+    // A third case sits between them: the snapshot exists but was published on
+    // an earlier night. That is still a true point in time, so the column is
+    // shown rather than withheld - but it is a different point in time from the
+    // one the dates imply, so it says which.
     function updateComparisonNote(spitAvailable) {
+        const staleDays = spitAvailable ? (comparison?.spit?.staleDays || 0) : 0;
         const message = comparisonError
             || (comparison && !spitAvailable
                 ? "SPIT LY is not available for this range: the historical "
                     + "lifecycle snapshot has not been published for it. FINAL LY "
                     + "and this year are unaffected."
-                : "");
+                : staleDays > 0
+                    ? `SPIT LY is read as of ${comparison.spit.cutoffDate}, `
+                        + `${staleDays} day${staleDays === 1 ? "" : "s"} before `
+                        + `the matching point in time `
+                        + `(${comparison.spit.requestedCutoffDate}). The next `
+                        + "import brings it current. FINAL LY and this year are "
+                        + "unaffected."
+                    : "");
         if (!message) {
             elements.comparisonNote.hidden = true;
             return;

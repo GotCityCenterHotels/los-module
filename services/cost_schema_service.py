@@ -65,6 +65,10 @@ MIGRATIONS = (
         "020_cost_spit_read_model",
         APP_ROOT / "sql" / "migrations" / "020_cost_spit_read_model.sql",
     ),
+    (
+        "021_cost_spit_read_model_shape",
+        APP_ROOT / "sql" / "migrations" / "021_cost_spit_read_model_shape.sql",
+    ),
 )
 
 _schema_ready = False

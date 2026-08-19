@@ -61,6 +61,7 @@ from services.import_job_service import (
     log_pool_stats,
 )
 from shared.comparison_dates import shift_cost_comparison_date
+from shared.json_shape import RawJsonSplicer
 
 
 app = func.FunctionApp()
@@ -93,7 +94,7 @@ _cost_payload_workers = ThreadPoolExecutor(
 # Part of the validator because a deployment can change response semantics
 # without importing facts or saving settings. Increment this when the Cost Data
 # response contract or calculation changes.
-COST_DATA_RESPONSE_SCHEMA_VERSION = 5
+COST_DATA_RESPONSE_SCHEMA_VERSION = 6
 
 # LOS facts is the largest response the app produces - a year of per-hotel,
 # per-LOS rows - and it had no server-side byte cache at all, only a validator.
@@ -416,11 +417,15 @@ class VersionedResponseCache:
     def not_modified(self, etag):
         return func.HttpResponse(status_code=304, headers=self._headers(etag))
 
-    def respond(self, req, cache_key, etag, payload_factory):
+    def respond(self, req, cache_key, etag, payload_factory, serializer=None):
         """Answer from the validator, then the cache, then a shared build.
 
         ``payload_factory`` returns ``(payload, cacheable)``. A degraded payload
         - one assembled after a dependency failed - is served but not retained.
+
+        ``serializer`` turns that payload into body bytes, and exists for the one
+        caller whose payload already contains serialized JSON it must not
+        re-encode. Everything else gets plain json.dumps, unchanged.
         """
         if req.headers.get("If-None-Match") == etag:
             return self.not_modified(etag)
@@ -444,7 +449,11 @@ class VersionedResponseCache:
 
         try:
             payload, cacheable = payload_factory()
-            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            body = (
+                serializer(payload)
+                if serializer is not None
+                else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            )
             entry = (body, gzip.compress(body, compresslevel=5))
         except BaseException as error:
             pending.set_exception(error)
@@ -480,8 +489,10 @@ _cost_response_cache = _cost_response_bytes.entries
 _cost_response_inflight = _cost_response_bytes.inflight
 
 
-def versioned_cost_response(req, cache_key, etag, payload_factory):
-    return _cost_response_bytes.respond(req, cache_key, etag, payload_factory)
+def versioned_cost_response(req, cache_key, etag, payload_factory, serializer=None):
+    return _cost_response_bytes.respond(
+        req, cache_key, etag, payload_factory, serializer
+    )
 
 
 def parse_facts_grain(req):
@@ -858,6 +869,11 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         comparison_end,
     )
 
+    # The SPIT datasets arrive from Database A already serialized in the shape
+    # this response sends, and are spliced into the body rather than decoded and
+    # re-encoded. See shared.json_shape.RawJsonSplicer.
+    spit_fragments = RawJsonSplicer()
+
     def build_payload():
         if include_comparison:
             spit_future = (
@@ -885,11 +901,13 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             )
             if comparison_mode == "spit":
                 try:
-                    spit_datasets, spit_row_counts = spit_future.result()
+                    snapshot = spit_future.result()
                     spit_result = {
                         "available": True,
-                        "data": spit_datasets,
-                        "rowCounts": spit_row_counts,
+                        "data": spit_fragments.reserve(snapshot.data_json),
+                        "rowCounts": snapshot.row_counts,
+                        "cutoffDate": snapshot.cutoff_date.isoformat(),
+                        "staleDays": snapshot.stale_days,
                     }
                 except CostSpitUnavailableError as error:
                     logging.warning("Cost SPIT read model unavailable: %s", error)
@@ -897,6 +915,8 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                         "available": False,
                         "data": {},
                         "rowCounts": {},
+                        "cutoffDate": comparison_cutoff.isoformat(),
+                        "staleDays": 0,
                     }
                 except Exception:
                     # FINAL LY and the current statement are complete without the
@@ -908,6 +928,8 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                         "available": False,
                         "data": {},
                         "rowCounts": {},
+                        "cutoffDate": comparison_cutoff.isoformat(),
+                        "staleDays": 0,
                     }
             else:
                 spit_result = None
@@ -972,7 +994,13 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             if comparison_mode == "spit":
                 payload["comparison"]["spit"] = {
                     "available": spit_result["available"],
-                    "cutoffDate": comparison_cutoff.isoformat(),
+                    # The cutoff of the reading actually served, which is not
+                    # always the one asked for: a snapshot published a night or
+                    # two ago is a true point in time, just an earlier one, and
+                    # saying so beats withholding the column.
+                    "cutoffDate": spit_result["cutoffDate"],
+                    "requestedCutoffDate": comparison_cutoff.isoformat(),
+                    "staleDays": spit_result["staleDays"],
                     "method": "lifecycle",
                     "rowCounts": spit_result["rowCounts"],
                     "data": spit_result["data"],
@@ -985,6 +1013,7 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             cache_key,
             etag,
             build_payload,
+            spit_fragments.dumps if comparison_mode == "spit" else None,
         )
     except Exception:
         logging.exception("Cost data endpoint failed")

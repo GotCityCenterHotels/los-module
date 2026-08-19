@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -18,6 +18,20 @@ os.environ.setdefault("POSTGRES_USER", "app-test")
 os.environ.setdefault("POSTGRES_PASSWORD", "not-used")
 
 import function_app
+
+from services.cost_data_service import CostSpitSnapshot
+
+
+def snapshot(data, cutoff=None, stale_days=0):
+    """A published SPIT reading, carried as the serialized bytes it is stored as."""
+    return CostSpitSnapshot(
+        json.dumps(data, separators=(",", ":")),
+        {dataset: len(rows) for dataset, rows in data.items()},
+        cutoff or function_app.shift_cost_comparison_date(
+            datetime.now(ZoneInfo("Europe/Stockholm")).date(), "sameDate"
+        ),
+        stale_days,
+    )
 
 
 class FakeRequest:
@@ -118,7 +132,7 @@ class CostDataResponseCacheTests(unittest.TestCase):
             function_app, "fetch_cost_data_ranges", return_value=range_results()
         ), patch.object(
             function_app, "fetch_cost_spit_data",
-            return_value=(spit_data, {"roomRevenue": 1})
+            return_value=snapshot(spit_data)
         ) as fetch_spit, patch.object(
             function_app, "fetch_supplement_status", return_value={"runId": 42}
         ), patch.object(
@@ -141,11 +155,78 @@ class CostDataResponseCacheTests(unittest.TestCase):
         self.assertEqual(
             payload["comparison"]["spit"]["rowCounts"], {"roomRevenue": 1}
         )
+        self.assertEqual(payload["comparison"]["spit"]["staleDays"], 0)
+        self.assertEqual(
+            payload["comparison"]["spit"]["requestedCutoffDate"], cutoff.isoformat()
+        )
+
+    def test_a_stale_publication_is_served_and_names_its_own_cutoff(self):
+        """A snapshot from an earlier night is a true point in time, just an
+        earlier one. Withholding SPIT until tonight's import lands would blank
+        the column between midnight and the import, and all day after a failed
+        one, which is worse than showing a reading that says how old it is."""
+        spit_request = request()
+        spit_request.params["comparisonMode"] = "spit"
+        requested = function_app.shift_cost_comparison_date(
+            datetime.now(ZoneInfo("Europe/Stockholm")).date(), "sameDate"
+        )
+        published = requested - timedelta(days=2)
+        with patch.object(
+            function_app, "fetch_cost_publication_version", return_value=7
+        ), patch.object(
+            function_app, "fetch_cost_data_ranges", return_value=range_results()
+        ), patch.object(
+            function_app, "fetch_cost_spit_data",
+            return_value=snapshot(
+                {"roomRevenue": [{"hotelName": "Hotel A"}]},
+                cutoff=published,
+                stale_days=2,
+            )
+        ), patch.object(
+            function_app, "fetch_all_cost_settings", return_value={}
+        ):
+            payload = decode(function_app.cost_data_facts(spit_request))
+
+        spit = payload["comparison"]["spit"]
+        self.assertTrue(spit["available"])
+        self.assertEqual(spit["cutoffDate"], published.isoformat())
+        self.assertEqual(spit["requestedCutoffDate"], requested.isoformat())
+        self.assertEqual(spit["staleDays"], 2)
+
+    def test_the_spliced_body_is_byte_identical_to_encoding_the_payload(self):
+        """The SPIT datasets reach the body as stored text rather than being
+        decoded and re-encoded, so the thing that has to be proved is that the
+        shortcut produces the same bytes the long way round would have."""
+        spit_request = request()
+        spit_request.params["comparisonMode"] = "spit"
+        spit_data = {
+            "roomRevenue": [
+                {"hotelName": "Hotel A", "stayDate": "2023-02-28", "net": "3000"},
+                {"hotelName": "Hotel B", "stayDate": "2023-02-28", "net": "12.5"},
+            ],
+            "payments": [],
+        }
+        with patch.object(
+            function_app, "fetch_cost_publication_version", return_value=7
+        ), patch.object(
+            function_app, "fetch_cost_data_ranges", return_value=range_results()
+        ), patch.object(
+            function_app, "fetch_cost_spit_data", return_value=snapshot(spit_data)
+        ), patch.object(
+            function_app, "fetch_all_cost_settings", return_value={}
+        ):
+            payload = decode(function_app.cost_data_facts(spit_request))
+
+        self.assertEqual(payload["comparison"]["spit"]["data"], spit_data)
+        self.assertEqual(
+            payload["comparison"]["spit"]["rowCounts"],
+            {"roomRevenue": 2, "payments": 0},
+        )
 
     def test_a_failed_spit_read_keeps_final_and_is_not_cached(self):
         spit_request = request()
         spit_request.params["comparisonMode"] = "spit"
-        recovered = ({"roomRevenue": []}, {"roomRevenue": 0})
+        recovered = snapshot({"roomRevenue": []})
         with patch.object(
             function_app, "fetch_cost_publication_version", return_value=7
         ), patch.object(

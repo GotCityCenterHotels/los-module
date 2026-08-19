@@ -5,7 +5,7 @@ DATE_PREDICATE = "stay_date BETWEEN %(start_date)s AND %(end_date)s"
 
 # Dates and numerics are rendered to text HERE, not in Python.
 #
-# services/cost_data_service.py:_json_value used to convert every cell of every
+# shared/json_shape.py:json_value used to convert every cell of every
 # row: date.isoformat() at ~3us a call, str() on every Decimal, across seven
 # datasets of a few thousand rows each. Worse, psycopg had to build the date and
 # Decimal objects first, only for them to be thrown away a moment later as
