@@ -23,7 +23,6 @@ from services.los_facts_service import (
     los_read_model_enabled,
 )
 from services.los_schema_service import LosSchemaError
-from services.los_sync_service import sync_los
 from services.cost_data_service import (
     fetch_cost_data,
     fetch_cost_data_ranges,
@@ -51,7 +50,6 @@ from services.supplement_service import (
     fetch_supplement_status,
     list_supplement_hotels,
 )
-from services.supplement_sync_service import sync_supplement
 from services.import_job_schema_service import ImportJobSchemaError
 from services.import_job_service import (
     claim_import_job,
@@ -61,7 +59,6 @@ from services.import_job_service import (
     get_import_job,
     log_pool_stats,
 )
-from shared.pipeline import DATASETS, run_all_datasets, run_dataset
 
 
 app = func.FunctionApp()
@@ -111,6 +108,52 @@ LOS_FACTS_RESPONSE_SCHEMA_VERSION = 2
 HOTEL_LIST_MAX_AGE_SECONDS = int(
     os.environ.get("HOTEL_LIST_MAX_AGE_SECONDS", "300")
 )
+
+
+# The import pipeline and the two sync services are reachable only from the queue
+# worker and the enqueue routes, never from a read path - but Azure Functions
+# imports this module to index its triggers, so every HTTP cold start was paying
+# for their module graph anyway: about 37ms measured, and more on a 1-vCPU
+# instance. Importing them on use defers that to the worker process that needs
+# them.
+#
+# Wrappers rather than bare inline imports because the names have to stay on this
+# module: tests patch function_app.run_dataset, and a route or worker that had
+# imported the real function directly could not be intercepted. It is the pattern
+# shared/pipeline.py already uses for cost_mix_export_service.
+
+
+def run_dataset(dataset):
+    from shared.pipeline import run_dataset as pipeline_run_dataset
+
+    return pipeline_run_dataset(dataset)
+
+
+def run_all_datasets():
+    from shared.pipeline import run_all_datasets as pipeline_run_all
+
+    return pipeline_run_all()
+
+
+def dataset_names():
+    """The importable dataset names, for request validation."""
+    from shared.pipeline import DATASETS
+
+    return DATASETS
+
+
+def sync_los(mode):
+    from services.los_sync_service import sync_los as run_los_sync
+
+    return run_los_sync(mode)
+
+
+def sync_supplement(mode, snapshot_from, snapshot_to):
+    from services.supplement_sync_service import (
+        sync_supplement as run_supplement_sync,
+    )
+
+    return run_supplement_sync(mode, snapshot_from, snapshot_to)
 
 
 def validate_range_span(start_date: date, end_date: date):
@@ -1173,9 +1216,15 @@ def cost_data_import(
 
         dataset = body.get("dataset") or req.params.get("dataset") or "all"
         dataset = str(dataset).strip().lower()
-        if dataset != "all" and dataset not in DATASETS:
+        known_datasets = dataset_names()
+        if dataset != "all" and dataset not in known_datasets:
             return json_response(
-                {"error": f"Unknown dataset '{dataset}'. Allowed: {sorted(DATASETS)}"},
+                {
+                    "error": (
+                        f"Unknown dataset '{dataset}'. "
+                        f"Allowed: {sorted(known_datasets)}"
+                    )
+                },
                 400,
             )
         return enqueue_import_job(
