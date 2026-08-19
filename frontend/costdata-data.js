@@ -516,6 +516,82 @@
         return matchedShare * matched + (1 - matchedShare) * fallback;
     }
 
+    function folded(value) {
+        return String(value ?? "").trim().toLocaleLowerCase();
+    }
+
+    // Price the exact SPIT reservation mix with the Cost Input tree.  FINAL LY
+    // is priced in Database A because its mix is imported there; SPIT is rebuilt
+    // from Database B lifecycle rows, so its mix reaches this point unpriced.
+    // The matching order mirrors queries/cost_data.py: rate overrides agency,
+    // agency overrides origin, and unmatched revenue takes the property fallback
+    // later in effectiveDistributionPercent.
+    function distributionPercentForMix(row, settings) {
+        const origin = folded(row.origin);
+        const originGroup = (settings.distributionOriginGroups || []).find(
+            (group) => (group.origins || []).some((value) => folded(value) === origin)
+        );
+        if (!originGroup) return null;
+
+        let agencyFallback = null;
+        for (const agencyGroup of originGroup.agencyGroups || []) {
+            const filters = agencyGroup.filters || [];
+            const matches = !filters.length || filters.some((filter) => {
+                const field = filter.matchField === "channel"
+                    ? row.origin
+                    : row.travelAgency;
+                const term = folded(filter.containsValue);
+                return term && folded(field).includes(term);
+            });
+            if (!matches) continue;
+            if (agencyFallback === null) {
+                agencyFallback = numberOf(agencyGroup.fallbackPercent);
+            }
+            for (const rateGroup of agencyGroup.rateGroups || []) {
+                if ((rateGroup.rates || []).some(
+                    (rate) => folded(rate.rateName) === folded(row.rateName)
+                )) {
+                    return numberOf(rateGroup.costPercent);
+                }
+            }
+        }
+        return agencyFallback === null
+            ? numberOf(originGroup.fallbackPercent)
+            : agencyFallback;
+    }
+
+    function priceDistributionMix(rows, settings) {
+        const byDay = new Map();
+        for (const row of rows || []) {
+            const revenue = numberOf(row.roomRevenueNet);
+            let day = byDay.get(row.stayDate);
+            if (!day) {
+                day = {
+                    stayDate: row.stayDate,
+                    hotelName: row.hotelName,
+                    mixRevenue: 0,
+                    matchedRevenue: 0,
+                    weightedPercent: 0
+                };
+                byDay.set(row.stayDate, day);
+            }
+            day.mixRevenue += revenue;
+            const percent = distributionPercentForMix(row, settings);
+            if (percent === null) continue;
+            day.matchedRevenue += revenue;
+            day.weightedPercent += revenue * percent;
+        }
+        return Array.from(byDay.values()).map((day) => ({
+            stayDate: day.stayDate,
+            hotelName: day.hotelName,
+            mixRevenue: day.mixRevenue,
+            matchedRevenue: day.matchedRevenue,
+            matchedPercent: day.matchedRevenue === 0
+                ? null
+                : day.weightedPercent / day.matchedRevenue
+        }));
+    }
+
     // -----------------------------------------------------------------------
     // Comparing with last year
     //
@@ -550,71 +626,6 @@
                 }));
         }
         return aligned;
-    }
-
-    // SPIT (same point in time) uses the supplement lifecycle snapshot from the
-    // matching date last year. The snapshot supplies exact room-night revenue
-    // and occupied-room ratios; applying those ratios to the remaining
-    // reservation-derived facts removes bookings that did not yet exist at the
-    // cutoff while preserving each fact's own daily/category shape.
-    function applySpitAdjustments(source, adjustments, cutoff) {
-        const index = new Map();
-        for (const row of adjustments || []) {
-            if (!row || !row.hotelName || !row.stayDate) continue;
-            index.set(`${row.hotelName}|${row.stayDate}`, row);
-        }
-        const occupancyFields = Object.freeze({
-            payments: ["totalPaymentAmountGrossValue"],
-            breakfast: ["breakfastTotal", "breakfastNetCost"],
-            parking: ["totalReservationsUsingParking", "totalParkingAmountNetValue"],
-            arrivalsDepartures: ["totalArrivals", "totalDepartures"],
-            cleaningAllocations: ["allocatedCleanings"],
-            distributionRates: ["mixRevenue", "matchedRevenue"]
-        });
-        const result = {};
-
-        for (const [dataset, rows] of Object.entries(source || {})) {
-            const adjusted = [];
-            for (const row of rows || []) {
-                if (!row || !row.stayDate || row.stayDate <= cutoff) {
-                    adjusted.push(row);
-                    continue;
-                }
-                const point = index.get(`${row.hotelName}|${row.stayDate}`);
-                // A covered future night with no reservations at the cutoff is
-                // intentionally absent from SPIT, not a zero-valued final row.
-                if (!point) continue;
-                const finalRooms = numberOf(point.finalAssignedRooms);
-                const spitRooms = numberOf(point.spitAssignedRooms);
-                const occupancyRatio = finalRooms > 0
-                    ? Math.max(0, spitRooms / finalRooms)
-                    : (spitRooms > 0 ? 1 : 0);
-                const finalRevenue = numberOf(point.finalRoomRevenue);
-                const spitRevenue = numberOf(point.spitRoomRevenue);
-                const revenueRatio = finalRevenue !== 0
-                    ? Math.max(0, spitRevenue / finalRevenue)
-                    : occupancyRatio;
-                const copy = {...row};
-
-                if (dataset === "roomRevenue") {
-                    for (const field of [
-                        "roomRevenueExclProducts1Net",
-                        "productRevenue1Net",
-                        "roomRevenueInclProducts1Net"
-                    ]) {
-                        copy[field] = numberOf(row[field]) * revenueRatio;
-                    }
-                }
-                else {
-                    for (const field of occupancyFields[dataset] || []) {
-                        copy[field] = numberOf(row[field]) * occupancyRatio;
-                    }
-                }
-                adjusted.push(copy);
-            }
-            result[dataset] = adjusted;
-        }
-        return result;
     }
 
     function zeroTotals() {
@@ -755,7 +766,10 @@
             // property's fallback, which is why the two figures travel together.
             const hasDistributionTree = (settings.distributionOriginGroups || []).length
                 || (settings.distributionGroups || []).length;
-            const distributionRates = filterRows(source.distributionRates, hotel);
+            const rawDistributionMix = filterRows(source.distributionMix, hotel);
+            const distributionRates = rawDistributionMix.length
+                ? priceDistributionMix(rawDistributionMix, settings)
+                : filterRows(source.distributionRates, hotel);
             if (distributionRates.length) {
                 const rateByDay = new Map(
                     distributionRates.map((row) => [row.stayDate, row])
@@ -1088,7 +1102,6 @@
         summarize,
         calculateGop,
         alignToComparison,
-        applySpitAdjustments,
         // Exported for the tests: the nearest-band fallback and the checkbox
         // coercion are both easy to get subtly wrong and neither is reachable
         // through calculateGop without building a whole fixture.
@@ -1099,7 +1112,9 @@
         // a way no total would reveal.
         mixedCleaningCost,
         allocatedCleaningCost,
-        effectiveDistributionPercent
+        effectiveDistributionPercent,
+        distributionPercentForMix,
+        priceDistributionMix
     };
     if (typeof module === "object" && module.exports) module.exports = api;
     root.CostData = api;

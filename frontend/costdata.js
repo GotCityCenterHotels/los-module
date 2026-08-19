@@ -137,8 +137,8 @@
     let loadedRange = null;
     // Last year's facts, as {key, data, spit}. One fetch answers both readings
     // of last year: `data` is the comparison range as it finally settled, and
-    // the lifecycle adjustments beside it wind that same range back to the
-    // matching point in its own booking curve. Both are columns of the
+    // `spit.data` is rebuilt from the reservation/item population that existed
+    // at the matching point in its own booking curve. Both are columns of the
     // statement now rather than an extra reading behind a toggle, so this
     // travels with the range and is re-fetched when the range or the alignment
     // basis changes - never when the chart switches between them.
@@ -263,9 +263,9 @@
                 includeComparison: "true",
                 lyComparisonBasis: elements.lyBasis.value,
                 // Always the SPIT request. It returns the settled comparison
-                // facts and the lifecycle adjustments in one body, which is
+                // facts and the lifecycle-as-of datasets in one body, which is
                 // both comparison columns for one round trip; asking for
-                // "final" would return the same facts and drop the adjustments.
+                // "final" would return the same final facts and drop SPIT.
                 comparisonMode: "spit"
             });
             const payload = await LosApi.fetchJson(
@@ -359,8 +359,8 @@
             populateHotels(payload.hotels || []);
             updateFreshness();
 
-            // An unbuilt SPIT snapshot is not a failed comparison: LY Final is
-            // still exact, and the statement says so per column rather than
+            // An unavailable SPIT lifecycle read is not a failed comparison:
+            // LY Final is still exact, and the statement says so per column rather than
             // discarding both.
             if (payload.comparison && !comparisonFailure) {
                 comparison = {
@@ -528,9 +528,9 @@
     }
 
     // Last year's facts restamped onto this year's dates, in both readings.
-    // SPIT is adjusted before it is aligned: the lifecycle snapshot is keyed on
-    // last year's own stay dates, and restamping first would look every night
-    // up under a date the snapshot has never heard of.
+    // SPIT already consists only of reservations/items that existed at the
+    // comparable cutoff; unlike the former ratio path, it does not start from
+    // FINAL LY and therefore can retain something cancelled after that cutoff.
     function comparisonDatasets(hotels) {
         if (!comparison) return {final: null, spit: null};
         const basis = elements.lyBasis.value;
@@ -538,11 +538,7 @@
             final: CostData.alignToComparison(comparison.data, basis, hotels),
             spit: comparison.spit && comparison.spit.available
                 ? CostData.alignToComparison(
-                    CostData.applySpitAdjustments(
-                        comparison.data,
-                        comparison.spit.adjustments || [],
-                        comparison.spit.cutoffDate || ""
-                    ),
+                    comparison.spit.data || {},
                     basis,
                     hotels
                 )
@@ -650,14 +646,14 @@
         renderBarDetail(chartStatement, spitPeriods, finalPeriods, chartGrain);
     }
 
-    // A comparison that could not be fetched and a lifecycle snapshot that was
-    // never built are different problems with different answers, so they are
+    // A comparison that could not be fetched and a lifecycle-as-of read that
+    // was unavailable are different problems with different answers, so they are
     // never reported as the same sentence.
     function updateComparisonNote(spitAvailable) {
         const message = comparisonError
             || (comparison && !spitAvailable
                 ? "SPIT LY is not available for this range: the historical "
-                    + "lifecycle snapshot has not been built for it. FINAL LY "
+                    + "reservation lifecycle could not be read. FINAL LY "
                     + "and this year are unaffected."
                 : "");
         if (!message) {

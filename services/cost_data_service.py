@@ -10,7 +10,9 @@ from time import monotonic
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
+from database import pool as source_pool
 from queries.cost_data import COST_DATA_QUERIES
+from queries.cost_spit import COST_SPIT_QUERIES
 from services.cost_schema_service import ensure_cost_settings_schema
 
 
@@ -30,6 +32,30 @@ COST_DATA_QUERY_CONCURRENCY = max(
 )
 _dataset_workers = ThreadPoolExecutor(
     max_workers=COST_DATA_QUERY_CONCURRENCY, thread_name_prefix="cost-data"
+)
+
+# SPIT reads Database B, not the imported final-state tables in Database A.
+# Keeping its executor separate means the exact lifecycle reconstruction cannot
+# consume the Database A connection ceiling used by the current/final statement.
+_CONFIGURED_SPIT_CONCURRENCY = int(
+    os.environ.get("COST_SPIT_QUERY_CONCURRENCY", "3")
+)
+COST_SPIT_QUERY_CONCURRENCY = max(
+    1,
+    min(
+        _CONFIGURED_SPIT_CONCURRENCY,
+        source_pool.max_size,
+        len(COST_SPIT_QUERIES),
+    ),
+)
+_spit_workers = ThreadPoolExecutor(
+    max_workers=COST_SPIT_QUERY_CONCURRENCY,
+    thread_name_prefix="cost-spit",
+)
+COST_SPIT_SUBMISSION_PRIORITY = (
+    "distributionMix",
+    "cleaningAllocations",
+    "roomRevenue",
 )
 
 # Submission order, which is not the same thing as response order.
@@ -78,50 +104,6 @@ _result_inflight = {}
 _result_cache_lock = Lock()
 
 
-COST_SPIT_ADJUSTMENTS_SQL = """
-    WITH chosen_stays AS (
-        SELECT stay_date, hotel_code, max(snapshot_date) AS snapshot_date
-        FROM functions.supplement_snapshot_inventory
-        WHERE stay_date BETWEEN %(start_date)s AND %(end_date)s
-          AND snapshot_date <= %(cutoff_date)s
-        GROUP BY stay_date, hotel_code
-    ),
-    spit AS (
-        SELECT
-            chosen.stay_date,
-            chosen.hotel_code,
-            coalesce(sum(category.assigned_rooms), 0) AS spit_assigned_rooms,
-            coalesce(sum(category.room_revenue), 0) AS spit_room_revenue
-        FROM chosen_stays chosen
-        LEFT JOIN functions.supplement_snapshot_category category
-          USING (stay_date, hotel_code, snapshot_date)
-        GROUP BY chosen.stay_date, chosen.hotel_code
-    ),
-    final AS (
-        SELECT
-            stay_date,
-            hotel_code,
-            sum(assigned_rooms) AS final_assigned_rooms,
-            sum(room_revenue) AS final_room_revenue
-        FROM functions.supplement_latest_category
-        WHERE stay_date BETWEEN %(start_date)s AND %(end_date)s
-        GROUP BY stay_date, hotel_code
-    )
-    SELECT
-        hotel.hotel_name,
-        spit.stay_date,
-        spit.spit_assigned_rooms,
-        spit.spit_room_revenue,
-        coalesce(final.final_assigned_rooms, 0) AS final_assigned_rooms,
-        coalesce(final.final_room_revenue, 0) AS final_room_revenue
-    FROM spit
-    JOIN functions.hotels hotel
-      ON hotel.enterprise_id = spit.hotel_code
-    LEFT JOIN final USING (stay_date, hotel_code)
-    ORDER BY spit.stay_date, hotel.hotel_name
-"""
-
-
 def _json_value(value):
     if isinstance(value, (date, datetime)):
         return value.isoformat()
@@ -157,6 +139,13 @@ def _json_rows(rows):
 
 def _fetch_dataset(query, parameters):
     with cost_pool.connection() as connection:
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, parameters)
+            return _json_rows(cursor.fetchall())
+
+
+def _fetch_spit_dataset(query, parameters):
+    with source_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(query, parameters)
             return _json_rows(cursor.fetchall())
@@ -303,44 +292,68 @@ def fetch_cost_data_ranges(ranges, publication_version=None):
     )
 
 
-def fetch_cost_spit_adjustments(start_date, end_date, cutoff_date):
-    """Return lifecycle-snapshot ratios for a Cost Data SPIT comparison.
+def fetch_cost_spit_data(
+    start_date,
+    end_date,
+    cutoff_date,
+    publication_version=None,
+):
+    """Rebuild Cost Data exactly as Database B stood at ``cutoff_date``.
 
-    Supplement snapshots are built by filtering reservation and item created
-    dates at ``snapshot_date``. Reusing them here makes SPIT mean the same thing
-    on both pages and avoids reconstructing historical reservations from final
-    daily aggregates, which no longer carry their creation dates.
+    Unlike the imported tables, the source retains created and cancelled dates.
+    Each query applies the lifecycle boundary before aggregation, so a booking
+    created later is absent and a booking cancelled later is still present.  An
+    empty result is a valid SPIT answer, not an availability failure.
     """
-    with cost_pool.connection() as connection:
-        with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                "SELECT to_regclass('functions.supplement_snapshot_inventory') "
-                "AS inventory, "
-                "to_regclass('functions.supplement_snapshot_category') AS category, "
-                "to_regclass('functions.supplement_latest_category') AS latest"
-            )
-            tables = cursor.fetchone()
-            if not all(tables.values()):
-                logging.warning(
-                    "Cost SPIT unavailable: supplement lifecycle tables are missing"
-                )
-                return {"available": False, "rows": []}
 
-            cursor.execute(
-                COST_SPIT_ADJUSTMENTS_SQL,
-                {
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "cutoff_date": cutoff_date,
-                },
+    def build():
+        parameters = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "cutoff_date": cutoff_date,
+        }
+        order = [
+            *(
+                dataset
+                for dataset in COST_SPIT_SUBMISSION_PRIORITY
+                if dataset in COST_SPIT_QUERIES
+            ),
+            *(
+                dataset
+                for dataset in COST_SPIT_QUERIES
+                if dataset not in COST_SPIT_SUBMISSION_PRIORITY
+            ),
+        ]
+        pending = {
+            dataset: _spit_workers.submit(
+                _fetch_spit_dataset,
+                COST_SPIT_QUERIES[dataset],
+                parameters,
             )
-            rows = _json_rows(cursor.fetchall())
-            logging.info(
-                "Cost SPIT adjustments completed start_date=%s end_date=%s "
-                "cutoff_date=%s rows=%d",
-                start_date,
-                end_date,
-                cutoff_date,
-                len(rows),
-            )
-            return {"available": bool(rows), "rows": rows}
+            for dataset in order
+        }
+        datasets = {
+            dataset: pending[dataset].result()
+            for dataset in COST_SPIT_QUERIES
+        }
+        counts = {dataset: len(rows) for dataset, rows in datasets.items()}
+        logging.info(
+            "Cost SPIT lifecycle read completed start_date=%s end_date=%s "
+            "cutoff_date=%s rows=%s",
+            start_date,
+            end_date,
+            cutoff_date,
+            sum(counts.values()),
+        )
+        return datasets, counts
+
+    return _cached_result(
+        (
+            "spit",
+            publication_version,
+            start_date,
+            end_date,
+            cutoff_date,
+        ),
+        build,
+    )

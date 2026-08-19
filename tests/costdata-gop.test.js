@@ -330,28 +330,59 @@ test("rent uses each revenue category on the night that earned it", () => {
     assert.equal(statement.periods[1].amounts.rentCost, 1050);
 });
 
-test("SPIT removes future bookings using the lifecycle snapshot ratios", () => {
-    const final = {
+test("SPIT can cost a lifecycle row that no longer exists in FINAL LY", () => {
+    const spit = {
         roomRevenue: [{
             stayDate: "2025-10-10", hotelName: "A", amountCurrency: "SEK",
-            roomRevenueExclProducts1Net: 8000,
-            productRevenue1Net: 2000,
-            roomRevenueInclProducts1Net: 10000
+            roomRevenueExclProducts1Net: 2400,
+            productRevenue1Net: 600,
+            roomRevenueInclProducts1Net: 3000
         }],
         cleaningAllocations: [{
             stayDate: "2025-10-10", hotelName: "A", categoryName: "Double",
-            occupancy: 1, allocatedCleanings: 10
+            occupancy: 1, allocatedCleanings: 1
         }]
     };
-    const spit = CostData.applySpitAdjustments(final, [{
-        stayDate: "2025-10-10", hotelName: "A",
-        finalAssignedRooms: 10, spitAssignedRooms: 4,
-        finalRoomRevenue: 10000, spitRoomRevenue: 3000
-    }], "2025-08-19");
+    const statement = CostData.calculateGop(spit, { settingsByHotel: settings });
 
-    assert.equal(spit.roomRevenue[0].roomRevenueInclProducts1Net, 3000);
-    assert.equal(spit.roomRevenue[0].roomRevenueExclProducts1Net, 2400);
-    assert.equal(spit.cleaningAllocations[0].allocatedCleanings, 4);
+    assert.equal(lineFor(statement, "roomRevenue"), 3000);
+    assert.equal(lineFor(statement, "cleaningCost"), 150);
+});
+
+test("an exact lifecycle distribution mix is priced with the saved tree", () => {
+    const tree = {
+        A: {
+            ...settings.A,
+            distributionOriginGroups: [{
+                groupName: "OTA", fallbackPercent: "12",
+                origins: ["ChannelManager"],
+                agencyGroups: [{
+                    groupName: "Booking", fallbackPercent: "15",
+                    filters: [{matchField: "travelAgency", containsValue: "booking"}],
+                    rateGroups: [{
+                        groupName: "Promo", costPercent: "20",
+                        rates: [{rateName: "Summer"}]
+                    }]
+                }]
+            }]
+        }
+    };
+    const lifecycle = {
+        ...data,
+        distributionMix: [
+            {stayDate: "2026-01-02", hotelName: "A", origin: "ChannelManager",
+                travelAgency: "Booking.com B.V.", rateName: "Summer", roomRevenueNet: "6000"},
+            {stayDate: "2026-01-02", hotelName: "A", origin: "ChannelManager",
+                travelAgency: "Direct OTA", rateName: "Base", roomRevenueNet: "4000"}
+        ]
+    };
+
+    // Day one: 60% at the rate override (20%) and 40% at the origin fallback
+    // (12%) = 1,680. Day two has no mix and takes the property's 10% fallback.
+    assert.equal(
+        lineFor(CostData.calculateGop(lifecycle, {settingsByHotel: tree}), "distributionCost"),
+        2280
+    );
 });
 
 test("distribution charges each day at its own matched percentage", () => {

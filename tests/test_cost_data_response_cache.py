@@ -102,16 +102,14 @@ class CostDataResponseCacheTests(unittest.TestCase):
         self.assertEqual(payload["comparison"]["parameters"]["startDate"], "2023-02-28")
         self.assertEqual(payload["comparison"]["data"]["roomRevenue"][0]["stayDate"], "2023-02-28")
 
-    def test_spit_comparison_carries_the_same_point_in_time_adjustments(self):
+    def test_spit_comparison_carries_lifecycle_as_of_datasets(self):
         spit_request = request()
         spit_request.params["comparisonMode"] = "spit"
-        adjustments = {
-            "available": True,
-            "rows": [{
+        spit_data = {
+            "roomRevenue": [{
                 "hotelName": "Hotel A",
                 "stayDate": "2023-02-28",
-                "spitAssignedRooms": "4",
-                "finalAssignedRooms": "10",
+                "roomRevenueInclProducts1Net": "3000",
             }],
         }
         with patch.object(
@@ -119,7 +117,8 @@ class CostDataResponseCacheTests(unittest.TestCase):
         ), patch.object(
             function_app, "fetch_cost_data_ranges", return_value=range_results()
         ), patch.object(
-            function_app, "fetch_cost_spit_adjustments", return_value=adjustments
+            function_app, "fetch_cost_spit_data",
+            return_value=(spit_data, {"roomRevenue": 1})
         ) as fetch_spit, patch.object(
             function_app, "fetch_supplement_status", return_value={"runId": 42}
         ), patch.object(
@@ -131,12 +130,41 @@ class CostDataResponseCacheTests(unittest.TestCase):
             datetime.now(ZoneInfo("Europe/Stockholm")).date(), "sameDate"
         )
         fetch_spit.assert_called_once_with(
-            date(2023, 2, 28), date(2023, 2, 28), cutoff
+            date(2023, 2, 28), date(2023, 2, 28), cutoff,
+            7,
         )
         payload = decode(response)
         self.assertEqual(payload["comparison"]["parameters"]["mode"], "spit")
         self.assertEqual(payload["comparison"]["spit"]["cutoffDate"], cutoff.isoformat())
-        self.assertEqual(payload["comparison"]["spit"]["adjustments"], adjustments["rows"])
+        self.assertEqual(payload["comparison"]["spit"]["method"], "lifecycle")
+        self.assertEqual(payload["comparison"]["spit"]["data"], spit_data)
+        self.assertEqual(
+            payload["comparison"]["spit"]["rowCounts"], {"roomRevenue": 1}
+        )
+
+    def test_a_failed_spit_read_keeps_final_and_is_not_cached(self):
+        spit_request = request()
+        spit_request.params["comparisonMode"] = "spit"
+        recovered = ({"roomRevenue": []}, {"roomRevenue": 0})
+        with patch.object(
+            function_app, "fetch_cost_publication_version", return_value=7
+        ), patch.object(
+            function_app, "fetch_cost_data_ranges", return_value=range_results()
+        ), patch.object(
+            function_app, "fetch_cost_spit_data",
+            side_effect=[RuntimeError("source unavailable"), recovered]
+        ) as fetch_spit, patch.object(
+            function_app, "fetch_supplement_status", return_value={"runId": 42}
+        ), patch.object(
+            function_app, "fetch_all_cost_settings", return_value={}
+        ):
+            failed = decode(function_app.cost_data_facts(spit_request))
+            healthy = decode(function_app.cost_data_facts(spit_request))
+
+        self.assertFalse(failed["comparison"]["spit"]["available"])
+        self.assertEqual(failed["comparison"]["data"], range_results()["comparison"][0])
+        self.assertTrue(healthy["comparison"]["spit"]["available"])
+        self.assertEqual(fetch_spit.call_count, 2)
 
     def test_complete_encoded_response_is_reused_for_one_publication(self):
         with patch.object(

@@ -4,7 +4,7 @@ import logging
 import os
 
 from collections import OrderedDict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from threading import Lock
@@ -26,7 +26,7 @@ from services.los_schema_service import LosSchemaError
 from services.cost_data_service import (
     fetch_cost_data,
     fetch_cost_data_ranges,
-    fetch_cost_spit_adjustments,
+    fetch_cost_spit_data,
 )
 from services.cost_publication_service import fetch_cost_publication_version
 from services.cost_settings_service import (
@@ -84,10 +84,14 @@ COST_DATA_RESPONSE_CACHE_MAX_ENTRIES = max(
     1,
     int(os.environ.get("COST_DATA_RESPONSE_CACHE_MAX_ENTRIES", "8")),
 )
+_cost_payload_workers = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="cost-payload",
+)
 # Part of the validator because a deployment can change response semantics
 # without importing facts or saving settings. Increment this when the Cost Data
 # response contract or calculation changes.
-COST_DATA_RESPONSE_SCHEMA_VERSION = 3
+COST_DATA_RESPONSE_SCHEMA_VERSION = 4
 
 # LOS facts is the largest response the app produces - a year of per-hotel,
 # per-LOS rows - and it had no server-side byte cache at all, only a validator.
@@ -844,9 +848,9 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         try:
             spit_publication = fetch_supplement_status().get("runId")
         except Exception:
-            # The adjustment lookup below will report SPIT as unavailable. Keep
-            # LY Final/current facts usable instead of turning a comparison-only
-            # dependency into a page-level failure.
+            # This marker only invalidates the short response cache when the
+            # integration mirror advances. The lifecycle read below can still
+            # succeed, so a marker failure must not take down either comparison.
             logging.exception("Cost SPIT publication lookup failed")
 
     identity = "|".join([
@@ -877,6 +881,17 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
 
     def build_payload():
         if include_comparison:
+            spit_future = (
+                _cost_payload_workers.submit(
+                    fetch_cost_spit_data,
+                    comparison_start,
+                    comparison_end,
+                    comparison_cutoff,
+                    publication_version,
+                )
+                if comparison_mode == "spit"
+                else None
+            )
             range_results = fetch_cost_data_ranges(
                 (
                     ("current", start_date, end_date),
@@ -888,15 +903,27 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             comparison_datasets, comparison_row_counts = (
                 range_results["comparison"]
             )
-            spit_adjustments = (
-                fetch_cost_spit_adjustments(
-                    comparison_start,
-                    comparison_end,
-                    comparison_cutoff,
-                )
-                if comparison_mode == "spit"
-                else None
-            )
+            if comparison_mode == "spit":
+                try:
+                    spit_datasets, spit_row_counts = spit_future.result()
+                    spit_result = {
+                        "available": True,
+                        "data": spit_datasets,
+                        "rowCounts": spit_row_counts,
+                    }
+                except Exception:
+                    # FINAL LY and the current statement are complete without the
+                    # source lifecycle read.  Keep them visible and report SPIT
+                    # as unavailable rather than falling back to the old ratio
+                    # approximation or failing the whole page.
+                    logging.exception("Cost SPIT lifecycle read failed")
+                    spit_result = {
+                        "available": False,
+                        "data": {},
+                        "rowCounts": {},
+                    }
+            else:
+                spit_result = None
         else:
             datasets, row_counts = fetch_cost_data(
                 start_date,
@@ -904,13 +931,15 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                 publication_version=publication_version,
             )
             comparison_datasets = comparison_row_counts = None
-            spit_adjustments = None
+            spit_result = None
 
         # The GOP statement is computed entirely from the saved Cost Input
         # rulebook. Preserve the existing partial-failure behaviour: facts can
         # still be shown when that lookup is temporarily unavailable, but do not
         # retain that degraded body in the server response cache.
-        cacheable = True
+        cacheable = not (
+            spit_result is not None and not spit_result["available"]
+        )
         try:
             cost_settings = fetch_all_cost_settings(
                 publication_version=publication_version,
@@ -955,9 +984,11 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
             }
             if comparison_mode == "spit":
                 payload["comparison"]["spit"] = {
-                    "available": spit_adjustments["available"],
+                    "available": spit_result["available"],
                     "cutoffDate": comparison_cutoff.isoformat(),
-                    "adjustments": spit_adjustments["rows"],
+                    "method": "lifecycle",
+                    "rowCounts": spit_result["rowCounts"],
+                    "data": spit_result["data"],
                 }
         return payload, cacheable
 

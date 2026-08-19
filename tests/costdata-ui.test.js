@@ -810,7 +810,8 @@ test("the chart offers LY Final and SPIT as paired-bar comparisons", () => {
     assert.match(script, /drawStack\(previous, barLeft\(index, true\), LY_COLOURS, true\)/);
     assert.match(css, /\.gop-bar-revenue\.is-comparison \{/);
     assert.match(script, /comparisonMode === "spit"/);
-    assert.match(script, /CostData\.applySpitAdjustments\(/);
+    assert.match(script, /comparison\.spit\.data \|\| \{\}/);
+    assert.doesNotMatch(script, /applySpitAdjustments/);
 });
 
 test("one request answers both readings of last year, cached per range", () => {
@@ -819,7 +820,7 @@ test("one request answers both readings of last year, cached per range", () => {
     // SPIT LY and FINAL LY are columns of the statement now, so there is no
     // reading of the page that does not want them and nothing to defer. The
     // SPIT request is what carries both: it returns the settled comparison
-    // facts and the lifecycle adjustments in one body.
+    // facts and the lifecycle-as-of datasets in one body.
     assert.match(script, /parameters\.set\("comparisonMode", "spit"\)/);
     assert.match(script, /async function ensureComparison\(\)/);
     assert.match(script, /if \(comparison && comparison\.key === key\) return;/);
