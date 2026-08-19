@@ -373,3 +373,29 @@ SELECT dataset, payload
 FROM result_rows
 ORDER BY dataset_order, payload ->> 'stay_date', payload ->> 'hotel_name'
 """
+
+
+# HTTP reads never touch integration_db. One publication row selects a complete
+# immutable run; the covering index then reads only daily arrays inside the
+# requested comparison range. LEFT JOIN preserves publication metadata for a
+# legitimately empty range, which is different from an unpublished read model.
+COST_SPIT_READ_SQL = """
+SELECT
+    publication.run_id,
+    publication.cutoff_date,
+    publication.minimum_stay_date,
+    publication.maximum_stay_date,
+    daily.dataset,
+    daily.stay_date,
+    daily.fact_rows
+FROM functions.cost_spit_publication publication
+JOIN functions.cost_spit_sync_runs run
+  ON run.run_id = publication.run_id
+ AND run.status = 'published'
+LEFT JOIN functions.cost_spit_daily daily
+  ON daily.run_id = publication.run_id
+ AND daily.comparison_basis = publication.comparison_basis
+ AND daily.stay_date BETWEEN %(start_date)s AND %(end_date)s
+WHERE publication.comparison_basis = %(comparison_basis)s
+ORDER BY daily.stay_date, daily.dataset
+"""

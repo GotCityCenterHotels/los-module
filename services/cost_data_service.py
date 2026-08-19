@@ -10,9 +10,8 @@ from time import monotonic
 from psycopg.rows import dict_row
 
 from cost_database import cost_pool
-from database import pool as source_pool
 from queries.cost_data import COST_DATA_QUERIES
-from queries.cost_spit import COST_SPIT_DATASETS, COST_SPIT_SQL
+from queries.cost_spit import COST_SPIT_DATASETS, COST_SPIT_READ_SQL
 from services.cost_schema_service import ensure_cost_settings_schema
 
 
@@ -120,21 +119,54 @@ def _fetch_dataset(query, parameters):
             return _json_rows(cursor.fetchall())
 
 
-def _fetch_spit_datasets(parameters):
-    """Execute the consolidated source read and restore its dataset envelope."""
-    datasets = {dataset: [] for dataset in COST_SPIT_DATASETS}
-    with source_pool.connection() as connection:
+class CostSpitUnavailableError(RuntimeError):
+    pass
+
+
+def _camel_payload(payload):
+    return {
+        _camel_case(column): _json_value(value)
+        for column, value in payload.items()
+    }
+
+
+def _fetch_spit_read_model(parameters):
+    """Read one published SPIT range from Database A's covering index."""
+    ensure_cost_settings_schema()
+    with cost_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(COST_SPIT_SQL, parameters)
-            for row in cursor.fetchall():
-                dataset = row["dataset"]
-                if dataset not in datasets:
-                    raise ValueError(f"Unknown Cost SPIT dataset: {dataset}")
-                payload = row["payload"] or {}
-                datasets[dataset].append({
-                    _camel_case(column): _json_value(value)
-                    for column, value in payload.items()
-                })
+            cursor.execute(COST_SPIT_READ_SQL, parameters)
+            rows = cursor.fetchall()
+
+    if not rows:
+        raise CostSpitUnavailableError(
+            "Cost SPIT has not been published for this comparison basis"
+        )
+
+    publication = rows[0]
+    if publication["cutoff_date"] != parameters["cutoff_date"]:
+        raise CostSpitUnavailableError(
+            "Cost SPIT publication is stale for the requested cutoff"
+        )
+    if (
+        parameters["start_date"] < publication["minimum_stay_date"]
+        or parameters["end_date"] > publication["maximum_stay_date"]
+    ):
+        raise CostSpitUnavailableError(
+            "Cost SPIT publication does not cover the requested range"
+        )
+
+    datasets = {dataset: [] for dataset in COST_SPIT_DATASETS}
+    for row in rows:
+        dataset = row["dataset"]
+        if dataset is None:
+            continue
+        if dataset not in datasets:
+            raise ValueError(f"Unknown published Cost SPIT dataset: {dataset}")
+        fact_rows = row["fact_rows"] or []
+        if not isinstance(fact_rows, list):
+            raise ValueError("Published Cost SPIT fact_rows must be an array")
+        datasets[dataset].extend(_camel_payload(payload) for payload in fact_rows)
     return datasets
 
 
@@ -284,26 +316,30 @@ def fetch_cost_spit_data(
     end_date,
     cutoff_date,
     publication_version=None,
+    comparison_basis="sameDate",
 ):
-    """Rebuild Cost Data exactly as Database B stood at ``cutoff_date``.
+    """Read Cost Data as Database B stood at ``cutoff_date``.
 
-    Unlike the imported tables, the source retains created and cancelled dates.
-    Each query applies the lifecycle boundary before aggregation, so a booking
-    created later is absent and a booking cancelled later is still present.  An
-    empty result is a valid SPIT answer, not an availability failure.
+    The expensive lifecycle reconstruction is published nightly. This request
+    only reads immutable daily arrays from Database A; an empty covered range is
+    valid, while a missing/stale publication is explicitly unavailable.
     """
+
+    if comparison_basis not in {"sameDate", "sameWeekday"}:
+        raise ValueError("Cost SPIT comparison basis is invalid")
 
     def build():
         parameters = {
             "start_date": start_date,
             "end_date": end_date,
             "cutoff_date": cutoff_date,
+            "comparison_basis": comparison_basis,
         }
         started_at = monotonic()
-        datasets = _fetch_spit_datasets(parameters)
+        datasets = _fetch_spit_read_model(parameters)
         counts = {dataset: len(rows) for dataset, rows in datasets.items()}
         logging.info(
-            "Cost SPIT lifecycle read completed start_date=%s end_date=%s "
+            "Cost SPIT read-model lookup completed start_date=%s end_date=%s "
             "cutoff_date=%s rows=%s duration_ms=%.1f",
             start_date,
             end_date,
@@ -320,6 +356,7 @@ def fetch_cost_spit_data(
             start_date,
             end_date,
             cutoff_date,
+            comparison_basis,
         ),
         build,
     )

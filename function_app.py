@@ -24,6 +24,7 @@ from services.los_facts_service import (
 )
 from services.los_schema_service import LosSchemaError
 from services.cost_data_service import (
+    CostSpitUnavailableError,
     fetch_cost_data,
     fetch_cost_data_ranges,
     fetch_cost_spit_data,
@@ -59,6 +60,7 @@ from services.import_job_service import (
     get_import_job,
     log_pool_stats,
 )
+from shared.comparison_dates import shift_cost_comparison_date
 
 
 app = func.FunctionApp()
@@ -91,7 +93,7 @@ _cost_payload_workers = ThreadPoolExecutor(
 # Part of the validator because a deployment can change response semantics
 # without importing facts or saving settings. Increment this when the Cost Data
 # response contract or calculation changes.
-COST_DATA_RESPONSE_SCHEMA_VERSION = 4
+COST_DATA_RESPONSE_SCHEMA_VERSION = 5
 
 # LOS facts is the largest response the app produces - a year of per-hotel,
 # per-LOS rows - and it had no server-side byte cache at all, only a validator.
@@ -517,17 +519,6 @@ def _los_facts_payload(
     }
 
 
-def shift_cost_comparison_date(value, basis):
-    if basis == "sameWeekday":
-        return value - timedelta(days=364)
-    try:
-        return value.replace(year=value.year - 1)
-    except ValueError:
-        # 29 February compares with the last valid day of February, matching
-        # LosFormat.lastYearDate in the browser.
-        return value.replace(year=value.year - 1, day=28)
-
-
 def validate_facts_parameters(req):
     start_date = parse_date(req.params.get("startDate"))
     end_date = parse_date(req.params.get("endDate"))
@@ -843,16 +834,6 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("Cost publication lookup failed")
         return json_response({"error": "Unable to retrieve cost data"}, 500)
 
-    spit_publication = None
-    if include_comparison and comparison_mode == "spit":
-        try:
-            spit_publication = fetch_supplement_status().get("runId")
-        except Exception:
-            # This marker only invalidates the short response cache when the
-            # integration mirror advances. The lifecycle read below can still
-            # succeed, so a marker failure must not take down either comparison.
-            logging.exception("Cost SPIT publication lookup failed")
-
     identity = "|".join([
         str(COST_DATA_RESPONSE_SCHEMA_VERSION),
         str(publication_version),
@@ -861,7 +842,6 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         comparison_basis if include_comparison else "none",
         comparison_mode if include_comparison else "none",
         comparison_cutoff.isoformat() if comparison_cutoff else "none",
-        str(spit_publication) if spit_publication is not None else "none",
         comparison_start.isoformat() if comparison_start else "none",
         comparison_end.isoformat() if comparison_end else "none",
     ])
@@ -874,7 +854,6 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
         comparison_basis if include_comparison else None,
         comparison_mode if include_comparison else None,
         comparison_cutoff,
-        spit_publication,
         comparison_start,
         comparison_end,
     )
@@ -888,6 +867,7 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                     comparison_end,
                     comparison_cutoff,
                     publication_version,
+                    comparison_basis,
                 )
                 if comparison_mode == "spit"
                 else None
@@ -911,12 +891,19 @@ def cost_data_facts(req: func.HttpRequest) -> func.HttpResponse:
                         "data": spit_datasets,
                         "rowCounts": spit_row_counts,
                     }
+                except CostSpitUnavailableError as error:
+                    logging.warning("Cost SPIT read model unavailable: %s", error)
+                    spit_result = {
+                        "available": False,
+                        "data": {},
+                        "rowCounts": {},
+                    }
                 except Exception:
                     # FINAL LY and the current statement are complete without the
-                    # source lifecycle read.  Keep them visible and report SPIT
+                    # published lifecycle read. Keep them visible and report SPIT
                     # as unavailable rather than falling back to the old ratio
                     # approximation or failing the whole page.
-                    logging.exception("Cost SPIT lifecycle read failed")
+                    logging.exception("Cost SPIT read-model lookup failed")
                     spit_result = {
                         "available": False,
                         "data": {},

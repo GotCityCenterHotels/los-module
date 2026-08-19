@@ -49,6 +49,12 @@ DATASETS = {
         "export_builder": "distribution_mix",
         "import_sql": "import/upsert_distribution_mix_data.sql",
     },
+    # Published last because it is a read model over the complete cost source
+    # lifecycle. HTTP requests only read this Database A snapshot; the expensive
+    # integration_db aggregation belongs in the existing background import job.
+    "spit": {
+        "runner": "cost_spit",
+    },
 }
 
 
@@ -68,7 +74,11 @@ def run_dataset(dataset_name):
 
     config = DATASETS[dataset_name]
 
-    if "export_builder" in config:
+    if config.get("runner") == "cost_spit":
+        from services.cost_spit_sync_service import sync_cost_spit
+
+        result = sync_cost_spit()
+    elif "export_builder" in config:
         from services.cost_mix_export_service import build_mix_export
 
         builder_name = config["export_builder"]

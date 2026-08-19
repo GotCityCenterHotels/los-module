@@ -61,6 +61,10 @@ MIGRATIONS = (
         "019_distribution_lookup_indexes",
         APP_ROOT / "sql" / "migrations" / "019_distribution_lookup_indexes.sql",
     ),
+    (
+        "020_cost_spit_read_model",
+        APP_ROOT / "sql" / "migrations" / "020_cost_spit_read_model.sql",
+    ),
 )
 
 _schema_ready = False

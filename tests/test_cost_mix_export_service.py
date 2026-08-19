@@ -437,9 +437,13 @@ class PipelineRegistrationTests(unittest.TestCase):
             self.assertTrue((root / "sql" / config["import_sql"]).exists())
 
         # Properties has to stay first - every fact table references
-        # functions.hotels - and the two expensive mixes last.
+        # functions.hotels. The two expensive mixes run before SPIT, whose
+        # published read model is the final product of the complete import.
         self.assertEqual(list(DATASETS)[0], "properties")
-        self.assertEqual(list(DATASETS)[-2:], ["departure_mix", "distribution_mix"])
+        self.assertEqual(
+            list(DATASETS)[-3:],
+            ["departure_mix", "distribution_mix", "spit"],
+        )
 
 
 if __name__ == "__main__":

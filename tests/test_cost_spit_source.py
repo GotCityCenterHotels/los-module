@@ -14,7 +14,7 @@ os.environ.setdefault("POSTGRES_DB", "app-test")
 os.environ.setdefault("POSTGRES_USER", "app-test")
 os.environ.setdefault("POSTGRES_PASSWORD", "not-used")
 
-from queries.cost_spit import COST_SPIT_DATASETS, COST_SPIT_SQL
+from queries.cost_spit import COST_SPIT_DATASETS, COST_SPIT_READ_SQL, COST_SPIT_SQL
 from services import cost_data_service
 
 
@@ -103,10 +103,26 @@ class CostSpitSourceTests(unittest.TestCase):
         for dataset in COST_SPIT_DATASETS:
             self.assertIn(f"'{dataset.lower()}'", normalized)
 
+    def test_http_reads_only_the_indexed_database_a_read_model(self):
+        normalized = " ".join(COST_SPIT_READ_SQL.lower().split())
+        self.assertIn("from functions.cost_spit_publication", normalized)
+        self.assertIn("functions.cost_spit_daily", normalized)
+        self.assertNotIn("order_item_current", normalized)
+
     def test_an_empty_lifecycle_result_is_available_not_missing(self):
-        fake_pool = FakePool()
-        original_pool = cost_data_service.source_pool
-        cost_data_service.source_pool = fake_pool
+        fake_pool = FakePool(rows=[{
+            "run_id": 4,
+            "cutoff_date": date(2025, 8, 19),
+            "minimum_stay_date": date(2025, 1, 1),
+            "maximum_stay_date": date(2025, 12, 31),
+            "dataset": None,
+            "stay_date": None,
+            "fact_rows": None,
+        }])
+        original_pool = cost_data_service.cost_pool
+        original_ensure = cost_data_service.ensure_cost_settings_schema
+        cost_data_service.cost_pool = fake_pool
+        cost_data_service.ensure_cost_settings_schema = lambda: None
         try:
             datasets, counts = cost_data_service.fetch_cost_spit_data(
                 date(2025, 10, 1),
@@ -115,7 +131,8 @@ class CostSpitSourceTests(unittest.TestCase):
                 publication_version=7,
             )
         finally:
-            cost_data_service.source_pool = original_pool
+            cost_data_service.cost_pool = original_pool
+            cost_data_service.ensure_cost_settings_schema = original_ensure
 
         self.assertEqual(set(datasets), set(COST_SPIT_DATASETS))
         self.assertTrue(all(rows == [] for rows in datasets.values()))
@@ -126,15 +143,22 @@ class CostSpitSourceTests(unittest.TestCase):
 
     def test_tagged_rows_are_restored_to_the_existing_json_shape(self):
         fake_pool = FakePool(rows=[{
+            "run_id": 5,
+            "cutoff_date": date(2025, 8, 19),
+            "minimum_stay_date": date(2025, 1, 1),
+            "maximum_stay_date": date(2025, 12, 31),
             "dataset": "roomRevenue",
-            "payload": {
+            "stay_date": date(2025, 7, 1),
+            "fact_rows": [{
                 "hotel_name": "Hotel A",
                 "stay_date": "2025-07-01",
                 "room_revenue_incl_products_1_net": "123",
-            },
+            }],
         }])
-        original_pool = cost_data_service.source_pool
-        cost_data_service.source_pool = fake_pool
+        original_pool = cost_data_service.cost_pool
+        original_ensure = cost_data_service.ensure_cost_settings_schema
+        cost_data_service.cost_pool = fake_pool
+        cost_data_service.ensure_cost_settings_schema = lambda: None
         try:
             datasets, counts = cost_data_service.fetch_cost_spit_data(
                 date(2025, 7, 1),
@@ -143,7 +167,8 @@ class CostSpitSourceTests(unittest.TestCase):
                 publication_version=8,
             )
         finally:
-            cost_data_service.source_pool = original_pool
+            cost_data_service.cost_pool = original_pool
+            cost_data_service.ensure_cost_settings_schema = original_ensure
 
         self.assertEqual(datasets["roomRevenue"], [{
             "hotelName": "Hotel A",
@@ -151,6 +176,37 @@ class CostSpitSourceTests(unittest.TestCase):
             "roomRevenueInclProducts1Net": "123",
         }])
         self.assertEqual(counts["roomRevenue"], 1)
+
+    def test_an_uncovered_range_does_not_fall_back_to_the_live_source(self):
+        fake_pool = FakePool(rows=[{
+            "run_id": 6,
+            "cutoff_date": date(2025, 8, 19),
+            "minimum_stay_date": date(2025, 1, 1),
+            "maximum_stay_date": date(2025, 12, 31),
+            "dataset": None,
+            "stay_date": None,
+            "fact_rows": None,
+        }])
+        original_pool = cost_data_service.cost_pool
+        original_ensure = cost_data_service.ensure_cost_settings_schema
+        cost_data_service.cost_pool = fake_pool
+        cost_data_service.ensure_cost_settings_schema = lambda: None
+        try:
+            with self.assertRaisesRegex(
+                cost_data_service.CostSpitUnavailableError,
+                "does not cover",
+            ):
+                cost_data_service.fetch_cost_spit_data(
+                    date(2024, 12, 1),
+                    date(2025, 1, 31),
+                    date(2025, 8, 19),
+                    publication_version=9,
+                )
+        finally:
+            cost_data_service.cost_pool = original_pool
+            cost_data_service.ensure_cost_settings_schema = original_ensure
+
+        self.assertEqual(len(fake_pool.executions), 1)
 
 
 if __name__ == "__main__":

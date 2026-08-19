@@ -131,7 +131,7 @@ class CostDataResponseCacheTests(unittest.TestCase):
         )
         fetch_spit.assert_called_once_with(
             date(2023, 2, 28), date(2023, 2, 28), cutoff,
-            7,
+            7, "sameDate",
         )
         payload = decode(response)
         self.assertEqual(payload["comparison"]["parameters"]["mode"], "spit")

@@ -128,6 +128,27 @@ class CostDataTriggerTests(unittest.TestCase):
         ), self.assertRaisesRegex(RuntimeError, "returned no GCCH properties"):
             pipeline.run_dataset("properties")
 
+    def test_spit_uses_the_read_model_runner_and_advances_publication(self):
+        expected = {
+            "status": "success",
+            "export_rows": 100,
+            "import_rows": 20,
+            "pruned_rows": 0,
+        }
+        with patch(
+            "services.cost_schema_service.ensure_cost_settings_schema",
+        ), patch(
+            "services.cost_spit_sync_service.sync_cost_spit",
+            return_value=expected,
+        ) as sync_spit, patch.object(
+            pipeline, "advance_cost_publication"
+        ) as publish:
+            result = pipeline.run_dataset("spit")
+
+        sync_spit.assert_called_once_with()
+        publish.assert_called_once_with("import:spit")
+        self.assertEqual(result, {"dataset": "spit", **expected})
+
     def test_timer_runs_every_dataset(self):
         output = FakeOut()
         with patch.object(

@@ -653,7 +653,7 @@
         const message = comparisonError
             || (comparison && !spitAvailable
                 ? "SPIT LY is not available for this range: the historical "
-                    + "reservation lifecycle could not be read. FINAL LY "
+                    + "lifecycle snapshot has not been published for it. FINAL LY "
                     + "and this year are unaffected."
                 : "");
         if (!message) {
