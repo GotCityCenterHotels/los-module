@@ -96,6 +96,58 @@ class CostDataServiceTests(unittest.TestCase):
         cost_data_service._result_cache.clear()
         cost_data_service._result_inflight.clear()
 
+    def test_every_dataset_renders_its_date_and_numerics_as_text(self):
+        """The conversion belongs in PostgreSQL, not in _json_value.
+
+        Building a date or a Decimal in psycopg only to stringify it a moment
+        later cost ~343ms of pure Python on a cold build. The service keeps its
+        defensive conversion - the test above proves it still works - but the
+        queries are supposed to make it unnecessary. A new numeric column added
+        without a cast silently puts that cost back, which is what this catches.
+        """
+        numeric_columns = {
+            "breakfast": ["breakfast_net_cost"],
+            "parking": ["total_parking_amount_net_value"],
+            "roomRevenue": [
+                "room_revenue_excl_products_1_net",
+                "product_revenue_1_net",
+                "room_revenue_incl_products_1_net",
+            ],
+            "payments": ["total_payment_amount_gross_value"],
+            "cleaningAllocations": ["allocated_cleanings"],
+            "distributionRates": [
+                "mix_revenue",
+                "matched_revenue",
+                "matched_percent",
+            ],
+        }
+
+        for dataset, query in cost_data_service.COST_DATA_QUERIES.items():
+            with self.subTest(dataset=dataset):
+                self.assertIn(
+                    "::text AS stay_date",
+                    query,
+                    f"{dataset} ships stay_date as a date object",
+                )
+                for column in numeric_columns.get(dataset, []):
+                    self.assertIn(
+                        f")::text AS {column}",
+                        query,
+                        f"{dataset}.{column} ships as a Decimal",
+                    )
+
+    def test_the_last_updated_timestamp_is_deliberately_not_cast(self):
+        """timestamptz::text is not ISO 8601 and Safari rejects it.
+
+        frontend/costdata.js feeds this column straight to new Date(). Casting it
+        the way the dates and numerics are cast would render it space-separated
+        with a two-digit offset, which parses nowhere reliably. If someone casts
+        it for consistency, this says why not.
+        """
+        for dataset, query in cost_data_service.COST_DATA_QUERIES.items():
+            with self.subTest(dataset=dataset):
+                self.assertNotIn("::text AS last_updated_at", query)
+
     def test_all_datasets_are_date_bounded_and_json_safe(self):
         # Keyed by dataset rather than positional. The fake used to hand back
         # result sets in order, so adding a query to COST_DATA_QUERIES gave one

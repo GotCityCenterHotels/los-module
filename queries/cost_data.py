@@ -3,6 +3,26 @@ from shared.mews_source import agency_contains_text
 
 DATE_PREDICATE = "stay_date BETWEEN %(start_date)s AND %(end_date)s"
 
+# Dates and numerics are rendered to text HERE, not in Python.
+#
+# services/cost_data_service.py:_json_value used to convert every cell of every
+# row: date.isoformat() at ~3us a call, str() on every Decimal, across seven
+# datasets of a few thousand rows each. Worse, psycopg had to build the date and
+# Decimal objects first, only for them to be thrown away a moment later as
+# strings. PostgreSQL already holds the text form and can hand it over directly.
+#
+# The output is byte-identical to what Python produced: a date renders ISO as
+# YYYY-MM-DD, and numeric::text is the same digit string str(Decimal) gives,
+# scale included. Integer sums are cast ::bigint and arrive as Python ints, which
+# need no conversion either.
+#
+# last_updated_at is deliberately NOT cast. It is timestamptz, and ::text renders
+# it space-separated with a two-digit offset ("2026-01-03 08:00:00+00") rather
+# than as the ISO 8601 the browser needs - frontend/costdata.js:1161 feeds it
+# straight to new Date(), which rejects that spelling outright in Safari. One
+# timestamp per row is a small share of the cells; a silently unparseable date is
+# not worth the remainder.
+
 # The one rule for "does this agency name contain this term". The two interactive
 # pickers in services/cost_source_service.py apply the same one, so a term that
 # found an agency in the editor is the term that charges it here.
@@ -15,7 +35,7 @@ COST_DATA_QUERIES = {
     "arrivalsDepartures": f"""
         SELECT
             hotel.hotel_name,
-            stay_date,
+            stay_date::text AS stay_date,
             sum(total_arrivals)::bigint AS total_arrivals,
             sum(total_departures)::bigint AS total_departures,
             max(fact.last_updated_at) AS last_updated_at
@@ -28,9 +48,9 @@ COST_DATA_QUERIES = {
     "breakfast": f"""
         SELECT
             hotel.hotel_name,
-            stay_date,
+            stay_date::text AS stay_date,
             sum(breakfast_total)::bigint AS breakfast_total,
-            sum(breakfast_net_cost) AS breakfast_net_cost,
+            sum(breakfast_net_cost)::text AS breakfast_net_cost,
             max(fact.last_updated_at) AS last_updated_at
         FROM functions.breakfast_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
@@ -41,12 +61,12 @@ COST_DATA_QUERIES = {
     "parking": f"""
         SELECT
             hotel.hotel_name,
-            stay_date,
+            stay_date::text AS stay_date,
             coalesce(nullif(trim(service), ''), 'Unspecified') AS service,
             sum(total_reservations_using_parking)::bigint
                 AS total_reservations_using_parking,
             sum(total_parking_spots)::bigint AS total_parking_spots,
-            sum(total_parking_amount_net_value) AS total_parking_amount_net_value,
+            sum(total_parking_amount_net_value)::text AS total_parking_amount_net_value,
             max(fact.last_updated_at) AS last_updated_at
         FROM functions.parking_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
@@ -57,11 +77,11 @@ COST_DATA_QUERIES = {
     "roomRevenue": f"""
         SELECT
             hotel.hotel_name,
-            stay_date,
+            stay_date::text AS stay_date,
             coalesce(nullif(trim(amount_currency), ''), 'Unspecified') AS amount_currency,
-            sum(room_revenue_excl_products_1_net) AS room_revenue_excl_products_1_net,
-            sum(product_revenue_1_net) AS product_revenue_1_net,
-            sum(room_revenue_incl_products_1_net) AS room_revenue_incl_products_1_net,
+            sum(room_revenue_excl_products_1_net)::text AS room_revenue_excl_products_1_net,
+            sum(product_revenue_1_net)::text AS product_revenue_1_net,
+            sum(room_revenue_incl_products_1_net)::text AS room_revenue_incl_products_1_net,
             max(fact.last_updated_at) AS last_updated_at
         FROM functions.room_revenue_night_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
@@ -73,9 +93,9 @@ COST_DATA_QUERIES = {
     "payments": f"""
         SELECT
             hotel.hotel_name,
-            stay_date,
+            stay_date::text AS stay_date,
             coalesce(nullif(trim(amount_currency), ''), 'Unspecified') AS amount_currency,
-            sum(total_payment_amount_gross_value) AS total_payment_amount_gross_value,
+            sum(total_payment_amount_gross_value)::text AS total_payment_amount_gross_value,
             max(fact.last_updated_at) AS last_updated_at
         FROM functions.total_payment_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
@@ -90,10 +110,10 @@ COST_DATA_QUERIES = {
     "cleaningAllocations": f"""
         SELECT
             hotel.hotel_name,
-            fact.stay_date,
+            fact.stay_date::text AS stay_date,
             fact.category_name,
             fact.occupancy,
-            sum(fact.allocated_cleanings) AS allocated_cleanings,
+            sum(fact.allocated_cleanings)::text AS allocated_cleanings,
             max(fact.last_updated_at) AS last_updated_at
         FROM functions.departure_mix_data fact
         JOIN functions.hotels hotel USING (enterprise_id)
@@ -215,16 +235,18 @@ COST_DATA_QUERIES = {
         )
         SELECT
             mix.hotel_name,
-            mix.stay_date,
-            sum(mix.revenue) AS mix_revenue,
+            mix.stay_date::text AS stay_date,
+            sum(mix.revenue)::text AS mix_revenue,
             coalesce(
                 sum(mix.revenue) FILTER (WHERE priced.cost_percent IS NOT NULL), 0
-            ) AS matched_revenue,
-            sum(mix.revenue * priced.cost_percent)
-                FILTER (WHERE priced.cost_percent IS NOT NULL)
-            / nullif(
-                sum(mix.revenue) FILTER (WHERE priced.cost_percent IS NOT NULL), 0
-            ) AS matched_percent,
+            )::text AS matched_revenue,
+            (
+                sum(mix.revenue * priced.cost_percent)
+                    FILTER (WHERE priced.cost_percent IS NOT NULL)
+                / nullif(
+                    sum(mix.revenue) FILTER (WHERE priced.cost_percent IS NOT NULL), 0
+                )
+            )::text AS matched_percent,
             max(mix.last_updated_at) AS last_updated_at
         FROM mix
         JOIN priced

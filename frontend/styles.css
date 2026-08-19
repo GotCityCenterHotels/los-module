@@ -1194,7 +1194,7 @@ tbody tr.total-row:hover {
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.72);
 
-    animation: cost-rise 300ms 45ms ease-out both;
+    animation: cost-rise 300ms ease-out both;
 }
 
 .gop-heading {
@@ -1301,7 +1301,7 @@ tbody tr.total-row:hover {
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.72);
 
-    animation: cost-rise 320ms 65ms ease-out both;
+    animation: cost-rise 320ms ease-out both;
 }
 
 .gop-chart-panel .gop-heading {
@@ -1617,7 +1617,7 @@ tbody tr.total-row:hover {
     border: 1px solid #dfe5e4;
     border-radius: 8px;
     background: white;
-    animation: cost-rise 340ms 85ms ease-out both;
+    animation: cost-rise 340ms ease-out both;
 }
 
 .cost-results-heading {
@@ -1717,14 +1717,6 @@ tbody tr.total-row:hover {
     font-variant-numeric: tabular-nums;
 }
 
-.cost-table-wrapper tbody tr {
-    animation: cost-row-in 180ms ease-out both;
-}
-
-.cost-table-wrapper tbody tr:nth-child(n+16) {
-    animation: none;
-}
-
 .cost-table-wrapper tbody tr:hover {
     background: #f3f8f7;
 }
@@ -1749,18 +1741,11 @@ tbody tr.total-row:hover {
 
 @keyframes cost-rise {
     from {
-        opacity: 0;
         transform: translateY(7px);
     }
     to {
-        opacity: 1;
         transform: translateY(0);
     }
-}
-
-@keyframes cost-row-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
 }
 
 @media (max-width: 700px) {
@@ -1820,8 +1805,7 @@ tbody tr.total-row:hover {
 @media (prefers-reduced-motion: reduce) {
     .cost-filters,
     .gop-statement,
-    .cost-results,
-    .cost-table-wrapper tbody tr {
+    .cost-results {
         animation: none;
     }
 
@@ -2478,7 +2462,7 @@ tbody tr.total-row:hover {
 .setting-grid label { padding:18px; border:1px solid #e4e7ec; border-radius:8px; background:white; }
 .setting-grid small { color:#98a2b3; font-weight:400; }
 .rule-list { display:flex; flex-direction:column; }
-.rule-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)) auto; gap:12px; align-items:end; padding:16px 0; border-bottom:1px solid #e4e7ec; animation:cost-row-in 180ms ease-out both; }
+.rule-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)) auto; gap:12px; align-items:end; padding:16px 0; border-bottom:1px solid #e4e7ec; }
 .distribution-rule { display:block; }
 .rule-main { display:grid; grid-template-columns:minmax(220px,1fr) 140px auto; gap:12px; align-items:end; }
 .remove-rule { width:auto; padding:0 10px; border:1px solid #fecdca; background:white; color:#b42318; font-size:12px; }
