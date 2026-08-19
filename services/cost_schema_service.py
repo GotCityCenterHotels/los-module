@@ -57,6 +57,10 @@ MIGRATIONS = (
         "018_cleaning_night_allocation",
         APP_ROOT / "sql" / "migrations" / "018_cleaning_night_allocation.sql",
     ),
+    (
+        "019_distribution_lookup_indexes",
+        APP_ROOT / "sql" / "migrations" / "019_distribution_lookup_indexes.sql",
+    ),
 )
 
 _schema_ready = False

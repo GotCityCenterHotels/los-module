@@ -83,6 +83,50 @@ class CleaningUniquenessTests(unittest.TestCase):
             registered.index("013_cleaning_occupancy_unique_fix"),
         )
 
+    def test_every_migration_file_is_registered_by_some_service(self):
+        """A file nobody registers is a migration that never runs.
+
+        The four schema services each own a subset, so the check has to be their
+        union. Adding 019 and forgetting to list it in cost_schema_service would
+        otherwise be invisible: the indexes simply would not exist in production
+        and the query would keep its old plan.
+        """
+        from services import (
+            cost_schema_service,
+            import_job_schema_service,
+            los_schema_service,
+            supplement_schema_service,
+        )
+
+        registered = {name for name, _ in cost_schema_service.MIGRATIONS}
+        registered |= {name for name, _ in los_schema_service.MIGRATIONS}
+        registered |= {name for name, _ in supplement_schema_service.MIGRATIONS}
+        registered.add(import_job_schema_service.MIGRATION_NAME)
+
+        # Two are unregistered on purpose, and say so in their own headers:
+        # both are destructive post-deployment cleanups that drop tables or data
+        # once every instance has moved on, so they are applied by hand after a
+        # rollout rather than by the first request that happens to arrive.
+        deliberately_manual = {
+            "007_remove_legacy_hotel_tables",
+            "011_remove_fixed_costs",
+        }
+        on_disk = {path.stem for path in MIGRATIONS.glob("*.sql")}
+        self.assertEqual(
+            on_disk - registered - deliberately_manual,
+            set(),
+            "migration files exist that no schema service applies",
+        )
+        # And the exemptions have to stay real, or this list becomes a place to
+        # hide a migration that was simply forgotten.
+        for name in deliberately_manual:
+            with self.subTest(migration=name):
+                self.assertTrue(
+                    (MIGRATIONS / f"{name}.sql").exists(),
+                    f"{name} is exempted but does not exist",
+                )
+
+
     def test_registered_migration_files_all_exist(self):
         from services import cost_schema_service
 
