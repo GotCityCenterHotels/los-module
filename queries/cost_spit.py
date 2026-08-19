@@ -24,16 +24,25 @@ COST_SPIT_DATASETS = (
 )
 
 
+# The same boundary as before, written as a range on the raw timestamp instead
+# of a cast to date. ``created_utc::date <= C`` and
+# ``created_utc < (C + 1)::date::timestamptz`` select exactly the same rows -
+# both resolve midnight in the session time zone - but casting the column hides
+# it from every index built on it, and order_item_current has a btree on
+# created_utc that the cast form could never use.
 ITEM_LIFECYCLE = """
-    item.created_utc::date <= %(cutoff_date)s
-    AND (item.canceled_utc IS NULL OR item.canceled_utc::date > %(cutoff_date)s)
+    item.created_utc < (%(cutoff_date)s::date + 1)::timestamptz
+    AND (
+        item.canceled_utc IS NULL
+        OR item.canceled_utc >= (%(cutoff_date)s::date + 1)::timestamptz
+    )
 """
 
 RESERVATION_LIFECYCLE = """
-    reservation_created_utc::date <= %(cutoff_date)s
+    reservation_created_utc < (%(cutoff_date)s::date + 1)::timestamptz
     AND (
         reservation_cancelled_utc IS NULL
-        OR reservation_cancelled_utc::date > %(cutoff_date)s
+        OR reservation_cancelled_utc >= (%(cutoff_date)s::date + 1)::timestamptz
     )
 """
 
@@ -329,8 +338,8 @@ distribution_mix AS (
     SELECT trim(enterprise.name)::text AS hotel_name,
            item.stay_date::text AS stay_date,
            nullif(trim(reservation.origin), '')::text AS origin,
-           nullif(trim(agency.name), '')::text AS travel_agency,
-           nullif(trim(rate.rate_name), '')::text AS rate_name,
+           nullif(trim(agency.travel_agency_name), '')::text AS travel_agency,
+           nullif(trim(rate.name), '')::text AS rate_name,
            coalesce(sum(item.amount_net_value), 0)::text AS room_revenue_net,
            NULL::timestamptz AS last_updated_at
     FROM scoped_items item
@@ -340,16 +349,23 @@ distribution_mix AS (
     JOIN enterprise_current enterprise
       ON enterprise.tenant_key = item.tenant_key
      AND enterprise.id = item.stay_enterprise_id
+    -- Both sides of these are uuid. The previous ``::text`` on each side did
+    -- not just cost a cast per row, it made the comparison unindexable, and it
+    -- named columns that do not exist: staging.travel_agency carries
+    -- travel_agency_id/travel_agency_name, and a rate's name is rate_current.name.
+    -- The mirror's naming is exactly what cost_mix_export_service discovers from
+    -- information_schema for the FINAL mix rather than hardcoding.
     LEFT JOIN staging.travel_agency agency
-      ON agency.id::text = reservation.travel_agency_id::text
+      ON agency.travel_agency_id = reservation.travel_agency_id
     LEFT JOIN rate_current rate
-      ON rate.id::text = reservation.rate_id::text
+      ON rate.tenant_key = reservation.tenant_key
+     AND rate.id = reservation.rate_id
     WHERE item.stay_date BETWEEN %(start_date)s AND %(end_date)s
       AND item.type = 'SpaceOrder'
       AND item.is_stay
       AND ({RESERVATION_LIFECYCLE})
     GROUP BY enterprise.name, item.stay_date, reservation.origin,
-             agency.name, rate.rate_name
+             agency.travel_agency_name, rate.name
 ),
 -- stay_date and hotel_name are carried as real columns beside the payload
 -- rather than read back out of it. The sort below is over every fact row in the

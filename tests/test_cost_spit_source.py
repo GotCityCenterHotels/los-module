@@ -90,26 +90,52 @@ class CostSpitSourceTests(unittest.TestCase):
 
     def test_the_consolidated_read_uses_the_los_lifecycle_boundary(self):
         normalized = " ".join(COST_SPIT_SQL.lower().split())
-        self.assertIn("item.created_utc::date <= %(cutoff_date)s", normalized)
         self.assertIn(
-            "item.canceled_utc is null or item.canceled_utc::date > %(cutoff_date)s",
+            "item.created_utc < (%(cutoff_date)s::date + 1)::timestamptz",
+            normalized,
+        )
+        self.assertIn(
+            "item.canceled_utc is null or item.canceled_utc >= "
+            "(%(cutoff_date)s::date + 1)::timestamptz",
             normalized,
         )
         # A final-state predicate would drop the exact records SPIT must retain:
         # bookings/items cancelled after the cutoff.
         self.assertNotIn("item.canceled_utc is null and", normalized)
 
+    def test_the_lifecycle_boundary_stays_off_the_indexed_columns(self):
+        """order_item_current is 5 GB with a btree on created_utc. Casting the
+        column to date selects the same rows and hides them from that index, so
+        the boundary is written as a range on the raw timestamp."""
+        normalized = " ".join(COST_SPIT_SQL.lower().split())
+        self.assertNotIn("created_utc::date", normalized)
+        self.assertNotIn("canceled_utc::date", normalized)
+        self.assertNotIn("cancelled_utc::date", normalized)
+
     def test_reservation_derived_facts_filter_both_lifecycle_levels(self):
         normalized = " ".join(COST_SPIT_SQL.lower().split())
         self.assertIn(
-            "reservation_created_utc::date <= %(cutoff_date)s",
+            "reservation_created_utc < (%(cutoff_date)s::date + 1)::timestamptz",
             normalized,
         )
         self.assertIn(
-            "reservation_cancelled_utc is null or "
-            "reservation_cancelled_utc::date > %(cutoff_date)s",
+            "reservation_cancelled_utc is null or reservation_cancelled_utc >= "
+            "(%(cutoff_date)s::date + 1)::timestamptz",
             normalized,
         )
+
+    def test_the_mix_joins_name_columns_the_mirror_actually_has(self):
+        """staging.travel_agency carries travel_agency_id/travel_agency_name and
+        a rate's name is rate_current.name. The previous guess named agency.id,
+        agency.name and rate.rate_name, so the query failed to parse and this
+        dataset had never once been built."""
+        normalized = " ".join(COST_SPIT_SQL.lower().split())
+        self.assertIn(
+            "agency.travel_agency_id = reservation.travel_agency_id", normalized
+        )
+        self.assertIn("rate.id = reservation.rate_id", normalized)
+        self.assertNotIn("agency.id::text", normalized)
+        self.assertNotIn("rate.rate_name", normalized)
 
     def test_the_full_range_scans_items_twice_not_once_per_dataset(self):
         normalized = " ".join(COST_SPIT_SQL.lower().split())

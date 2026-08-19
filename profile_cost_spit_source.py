@@ -119,14 +119,39 @@ def report(plan, analyzed):
         print("\n  estimated cost: %.0f, estimated rows: %s"
               % (root.get("Total Cost", 0), root.get("Plan Rows", 0)))
 
-    scans = [n for n in nodes if n.get("Node Type") == "Seq Scan"]
+    # Only scans big enough to matter. A dimension table of nine enterprises is
+    # read sequentially because that is the right way to read nine rows, and
+    # listing those buries the one scan worth looking at.
+    scans = [
+        n for n in nodes
+        if n.get("Node Type") == "Seq Scan"
+        and max(n.get("Actual Rows", 0), n.get("Plan Rows", 0)) >= 10_000
+    ]
     if scans:
-        print("\n  sequential scans")
+        print("\n  sequential scans over 10k rows")
         for node in scans:
             actual = node.get("Actual Rows")
             size = f"rows={actual}" if actual is not None else f"est={node.get('Plan Rows')}"
-            print(f"    {describe(node):<48} {size}"
-                  f"  filter={str(node.get('Filter', ''))[:60]}")
+            print(f"    {describe(node):<40} {size:>14}"
+                  f"  loops={node.get('Actual Loops', 1)}")
+
+    # A plan built on a row count that is wrong by orders of magnitude is how a
+    # query that looks cheap runs for minutes: the planner picks nested loops
+    # for what it thinks is a handful of rows and then does it a quarter of a
+    # million times.
+    if analyzed:
+        misestimates = []
+        for node in nodes:
+            planned = node.get("Plan Rows", 0) * max(node.get("Actual Loops", 1), 1)
+            got = node.get("Actual Rows", 0) * max(node.get("Actual Loops", 1), 1)
+            if got >= 10_000 and planned and got / planned >= 10:
+                misestimates.append((got / planned, planned, got, node))
+        if misestimates:
+            misestimates.sort(reverse=True, key=lambda entry: entry[0])
+            print("\n  row estimates the planner got wrong by 10x or more")
+            for ratio, planned, got, node in misestimates[:8]:
+                print(f"    {ratio:7.0f}x under  {describe(node):<38}"
+                      f" planned={planned:>9} actual={got:>9}")
 
     spills = [n for n in nodes if n.get("Sort Space Type") == "Disk"
               or n.get("Peak Memory Usage", 0) > 60_000]
@@ -168,6 +193,20 @@ def main():
 
         with get_export_connection(SOURCE_STATEMENT_TIMEOUT_MS) as connection:
             with connection.cursor() as cursor:
+                # integration_db is read-only at the role and at the session,
+                # and this script only ever issues EXPLAIN over a SELECT. Assert
+                # the session half rather than trusting it: if the connection
+                # settings ever drift, this stops here instead of pointing a
+                # writable session at the source database.
+                cursor.execute("SHOW transaction_read_only")
+                readonly = cursor.fetchone()
+                readonly = readonly["transaction_read_only"] \
+                    if isinstance(readonly, dict) else readonly[0]
+                if readonly != "on":
+                    raise SystemExit(
+                        "Refusing to run: the integration_db session is not "
+                        f"read-only (transaction_read_only={readonly})"
+                    )
                 cursor.execute(f"SET LOCAL work_mem = '{arguments.work_mem}'")
                 cursor.execute(f"{mode} {COST_SPIT_SQL}", {
                     "start_date": window["start_date"],
