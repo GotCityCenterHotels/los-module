@@ -4,9 +4,17 @@ SPIT here means "as the book stood on this same calendar date last year": a
 reservation or item belongs in the snapshot when it was created on or before
 that cutoff and was either never cancelled or cancelled after it. Bookings that
 existed then and died later are therefore included, which is exactly what a
-final-state read of the imported tables cannot reproduce - and it is why the
-snapshot cannot be incremental. The cutoff moves every day, so every night asks
-a different question and the whole window is rebuilt.
+final-state read of the imported tables cannot reproduce.
+
+The cutoff moves every day, so every night asks a different question and this
+job answers it by rebuilding the whole window. That is not the only way it could
+be answered: consecutive nights differ by exactly one day of creations added and
+one day of cancellations removed, so the snapshot is in principle maintainable
+incrementally. It is not done that way here because these datasets are
+aggregates - sums, counts, and a cleaning share weighted by whole stay length -
+and retracting a reservation from an aggregate needs per-reservation detail this
+read model does not keep. Rebuilding is the honest version of the cheap thing;
+if the nightly window ever stops fitting its budget, that is where to look.
 
 This follows the other read-model synchronizers: build an immutable run from the
 read-only integration database, validate it, then move small publication
@@ -21,6 +29,7 @@ that a read - which is what a user actually waits on - pays nothing for it.
 import logging
 import os
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
@@ -36,6 +45,11 @@ from shared.json_shape import camel_keys, compact_json
 SYNC_LOCK_NAME = "functions.cost_spit_sync"
 COMPARISON_BASES = ("sameDate", "sameWeekday")
 SOURCE_BATCH_SIZE = int(os.environ.get("COST_SPIT_SOURCE_BATCH_SIZE", "5000"))
+# A build that takes minutes and logs nothing until it finishes is indisputably
+# "taking forever" from the outside, whatever it is actually doing. One line per
+# this many source rows turns that into a rate a reader can extrapolate from,
+# and makes a stall distinguishable from slow progress.
+PROGRESS_EVERY_ROWS = int(os.environ.get("COST_SPIT_PROGRESS_EVERY_ROWS", "50000"))
 DAILY_INSERT_BATCH_SIZE = int(
     os.environ.get("COST_SPIT_DAILY_INSERT_BATCH_SIZE", "500")
 )
@@ -57,11 +71,12 @@ SOURCE_STATEMENT_TIMEOUT_MS = int(
 # synchronization is live, so anything still 'running' and this old is abandoned.
 ABANDONED_RUN_HOURS = int(os.environ.get("COST_SPIT_ABANDONED_RUN_HOURS", "6"))
 
-# The Cost Data page opens on 1 January to today, so a request made in early
-# January asks for a comparison range beginning in the previous calendar year. A
-# lead-in before 1 January keeps those covered. It is deliberately modest
-# because every extra day is another day of source lifecycle scan on a job that
-# shares a 30 minute budget with eight other datasets.
+# The Cost Data page opens on 1 January to today, so a reading taken in early
+# January is the one that wants to look back across the year boundary. A lead-in
+# before 1 January covers that, but every extra day is another day of source
+# lifecycle scan, so it is only spent while the calendar can actually use it:
+# inside the lead-in window itself. For the other ten months of the year it
+# costs nothing, because nothing in range can reach behind 1 January.
 COVERAGE_LEAD_IN_DAYS = int(
     os.environ.get("COST_SPIT_COVERAGE_LEAD_IN_DAYS", "45")
 )
@@ -82,8 +97,11 @@ def stockholm_today():
 
 def coverage_window(as_of_date):
     """The current-year span that the two snapshots are shifted from."""
+    first_of_year = date(as_of_date.year, 1, 1)
+    lead_in = timedelta(days=COVERAGE_LEAD_IN_DAYS)
+    within_lead_in = as_of_date - first_of_year < lead_in
     return (
-        date(as_of_date.year, 1, 1) - timedelta(days=COVERAGE_LEAD_IN_DAYS),
+        first_of_year - lead_in if within_lead_in else first_of_year,
         date(as_of_date.year, 12, 31),
     )
 
@@ -190,6 +208,12 @@ def _stream_basis(run_id, basis, plan):
         "end_date": plan["end_date"],
         "cutoff_date": plan["cutoff_date"],
     }
+    started = monotonic()
+    next_progress = PROGRESS_EVERY_ROWS
+    logging.info(
+        "Cost SPIT basis %s starting range=%s..%s cutoff=%s",
+        basis, plan["start_date"], plan["end_date"], plan["cutoff_date"],
+    )
     with get_export_connection(SOURCE_STATEMENT_TIMEOUT_MS) as source_connection:
         with source_connection.cursor() as setup_cursor:
             setup_cursor.execute("SET LOCAL work_mem = '64MB'")
@@ -197,8 +221,21 @@ def _stream_basis(run_id, basis, plan):
             with source_connection.cursor(name=f"cost_spit_{basis.lower()}") as source:
                 source.itersize = SOURCE_BATCH_SIZE
                 source.execute(COST_SPIT_SQL, parameters)
+                # The first fetch is the one that waits: a server-side cursor
+                # declares cheaply, then the whole lifecycle scan and its sort
+                # happen before a single row comes back. Timing it separately is
+                # what says whether a slow build is the source query or the
+                # streaming after it.
+                first_fetch_at = None
                 while True:
                     rows = source.fetchmany(SOURCE_BATCH_SIZE)
+                    if first_fetch_at is None:
+                        first_fetch_at = monotonic()
+                        logging.info(
+                            "Cost SPIT basis %s source query returned its first "
+                            "rows after %.1fs",
+                            basis, first_fetch_at - started,
+                        )
                     if not rows:
                         break
                     for row in rows:
@@ -208,7 +245,7 @@ def _stream_basis(run_id, basis, plan):
                             raise RuntimeError(
                                 f"Unknown Cost SPIT source dataset: {dataset}"
                             )
-                        stay_date = date.fromisoformat(payload["stay_date"])
+                        stay_date = row["stay_date"]
                         if not plan["start_date"] <= stay_date <= plan["end_date"]:
                             raise RuntimeError(
                                 "Cost SPIT source returned a row outside coverage"
@@ -220,9 +257,24 @@ def _stream_basis(run_id, basis, plan):
                         current_rows.append(_shape_fact(payload))
                         exported += 1
 
+                    if exported >= next_progress:
+                        elapsed = monotonic() - started
+                        logging.info(
+                            "Cost SPIT basis %s streamed %d source rows into %d "
+                            "daily arrays after %.1fs (%.0f rows/s)",
+                            basis, exported, imported, elapsed,
+                            exported / elapsed if elapsed else 0,
+                        )
+                        next_progress += PROGRESS_EVERY_ROWS
+
                 finish_group(target_connection)
                 imported += _write_daily_batch(target_connection, pending_daily)
 
+    logging.info(
+        "Cost SPIT basis %s finished %d source rows into %d daily arrays "
+        "in %.1fs",
+        basis, exported, imported, monotonic() - started,
+    )
     return exported, imported
 
 
@@ -353,12 +405,26 @@ def sync_cost_spit(as_of_date=None):
         started = monotonic()
         try:
             run_id = _create_run(as_of_date)
-            source_rows = 0
-            daily_rows = 0
-            for basis in COMPARISON_BASES:
-                exported, imported = _stream_basis(run_id, basis, plan[basis])
-                source_rows += exported
-                daily_rows += imported
+            # The two bases are separate source queries over their own
+            # connections writing disjoint rows, so running them one after the
+            # other simply added their durations together. Overlapping them
+            # costs one more Database B backend for the length of the build and
+            # takes the wall clock down to the slower of the two.
+            with ThreadPoolExecutor(
+                max_workers=len(COMPARISON_BASES),
+                thread_name_prefix="cost-spit-basis",
+            ) as basis_workers:
+                streams = {
+                    basis: basis_workers.submit(
+                        _stream_basis, run_id, basis, plan[basis]
+                    )
+                    for basis in COMPARISON_BASES
+                }
+                counts = {
+                    basis: stream.result() for basis, stream in streams.items()
+                }
+            source_rows = sum(exported for exported, _ in counts.values())
+            daily_rows = sum(imported for _, imported in counts.values())
 
             _publish(run_id, as_of_date, plan, source_rows, daily_rows)
             result = {

@@ -351,27 +351,40 @@ distribution_mix AS (
     GROUP BY enterprise.name, item.stay_date, reservation.origin,
              agency.name, rate.rate_name
 ),
+-- stay_date and hotel_name are carried as real columns beside the payload
+-- rather than read back out of it. The sort below is over every fact row in the
+-- window, and ordering by ``payload ->> 'stay_date'`` made Postgres extract two
+-- text keys from a jsonb value for each one before it could compare anything -
+-- work that the source columns already had sitting in a date and a text.
 result_rows AS (
     SELECT 1 AS dataset_order, 'arrivalsDepartures'::text AS dataset,
+           fact.stay_date::date AS stay_date, fact.hotel_name AS hotel_name,
            to_jsonb(fact) AS payload
     FROM arrivals_departures fact
     UNION ALL
-    SELECT 2, 'breakfast', to_jsonb(fact) FROM breakfast fact
+    SELECT 2, 'breakfast', fact.stay_date::date, fact.hotel_name, to_jsonb(fact)
+    FROM breakfast fact
     UNION ALL
-    SELECT 3, 'parking', to_jsonb(fact) FROM parking fact
+    SELECT 3, 'parking', fact.stay_date::date, fact.hotel_name, to_jsonb(fact)
+    FROM parking fact
     UNION ALL
-    SELECT 4, 'roomRevenue', to_jsonb(fact) FROM room_revenue fact
+    SELECT 4, 'roomRevenue', fact.stay_date::date, fact.hotel_name, to_jsonb(fact)
+    FROM room_revenue fact
     UNION ALL
-    SELECT 5, 'payments', to_jsonb(fact) FROM payments fact
+    SELECT 5, 'payments', fact.stay_date::date, fact.hotel_name, to_jsonb(fact)
+    FROM payments fact
     UNION ALL
-    SELECT 6, 'cleaningAllocations', to_jsonb(fact)
+    SELECT 6, 'cleaningAllocations', fact.stay_date::date, fact.hotel_name,
+           to_jsonb(fact)
     FROM cleaning_allocations fact
     UNION ALL
-    SELECT 7, 'distributionMix', to_jsonb(fact) FROM distribution_mix fact
+    SELECT 7, 'distributionMix', fact.stay_date::date, fact.hotel_name,
+           to_jsonb(fact)
+    FROM distribution_mix fact
 )
-SELECT dataset, payload
+SELECT dataset, stay_date, payload
 FROM result_rows
-ORDER BY dataset_order, payload ->> 'stay_date', payload ->> 'hotel_name'
+ORDER BY dataset_order, stay_date, hotel_name
 """
 
 

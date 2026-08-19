@@ -118,35 +118,61 @@ class CostSpitSyncTests(unittest.TestCase):
         self.assertIn("fact_count integer not null", ddl)
 
     def test_snapshot_plan_matches_the_http_comparison_dates(self):
-        lead_in = timedelta(days=sync.COVERAGE_LEAD_IN_DAYS)
+        """Mid-year there is nothing behind 1 January a legal range can reach,
+        so the plan is the calendar year and the lead-in costs nothing."""
         plan = sync.snapshot_plan(date(2026, 8, 19))
 
         self.assertEqual(plan["sameDate"], {
             "cutoff_date": date(2025, 8, 19),
-            "start_date": date(2025, 1, 1) - lead_in,
+            "start_date": date(2025, 1, 1),
             "end_date": date(2025, 12, 31),
         })
         self.assertEqual(plan["sameWeekday"], {
             "cutoff_date": date(2025, 8, 20),
-            "start_date": date(2025, 1, 2) - lead_in,
+            "start_date": date(2025, 1, 2),
             "end_date": date(2026, 1, 1),
         })
 
-    def test_coverage_reaches_back_before_the_first_of_january(self):
-        """The page opens on 1 January to today, so a reading taken in early
-        January compares against a range that starts in the previous year. The
-        lead-in is what keeps that request covered instead of unavailable."""
-        self.assertLess(
-            sync.coverage_window(date(2026, 1, 3))[0], date(2026, 1, 1)
+    def test_coverage_reaches_back_only_while_january_can_use_it(self):
+        """In early January the page's own default range looks back across the
+        year boundary, so coverage extends behind 1 January. Every extra day is
+        another day of lifecycle scan, so it is not paid for in August."""
+        lead_in = timedelta(days=sync.COVERAGE_LEAD_IN_DAYS)
+
+        january = sync.coverage_window(date(2026, 1, 3))
+        self.assertEqual(january, (date(2026, 1, 1) - lead_in, date(2026, 12, 31)))
+
+        august = sync.coverage_window(date(2026, 8, 19))
+        self.assertEqual(august, (date(2026, 1, 1), date(2026, 12, 31)))
+
+    def test_the_two_bases_are_streamed_concurrently(self):
+        """Two independent source queries on their own connections writing
+        disjoint rows. Run one after the other, their durations simply added."""
+        source = inspect.getsource(sync.sync_cost_spit)
+        self.assertIn("ThreadPoolExecutor", source)
+        self.assertIn("_stream_basis, run_id, basis", source)
+
+    def test_the_source_sort_avoids_reparsing_the_payload(self):
+        """The final sort covers every fact row in the window. Ordering it by
+        payload ->> 'stay_date' made Postgres pull two text keys out of a jsonb
+        value per row before it could compare anything."""
+        from queries.cost_spit import COST_SPIT_SQL
+
+        statements = " ".join(
+            line for line in COST_SPIT_SQL.lower().splitlines()
+            if not line.strip().startswith("--")
         )
-        self.assertEqual(
-            sync.coverage_window(date(2026, 1, 3))[1], date(2026, 12, 31)
+        normalized = " ".join(statements.split())
+        self.assertIn(
+            "order by dataset_order, stay_date, hotel_name", normalized
         )
+        self.assertNotIn("payload ->> 'stay_date'", normalized)
 
     def test_source_rows_are_compacted_to_one_array_per_dataset_day(self):
         source = SourceConnection([
             {
                 "dataset": "arrivalsDepartures",
+                "stay_date": date(2025, 1, 1),
                 "payload": {
                     "stay_date": "2025-01-01",
                     "hotel_name": "A",
@@ -155,6 +181,7 @@ class CostSpitSyncTests(unittest.TestCase):
             },
             {
                 "dataset": "arrivalsDepartures",
+                "stay_date": date(2025, 1, 1),
                 "payload": {
                     "stay_date": "2025-01-01",
                     "hotel_name": "B",
@@ -163,6 +190,7 @@ class CostSpitSyncTests(unittest.TestCase):
             },
             {
                 "dataset": "breakfast",
+                "stay_date": date(2025, 1, 2),
                 "payload": {"stay_date": "2025-01-02", "hotel_name": "A"},
             },
         ])
@@ -235,6 +263,7 @@ class CostSpitSyncTests(unittest.TestCase):
     def test_a_row_outside_the_published_coverage_is_rejected(self):
         source = SourceConnection([{
             "dataset": "payments",
+            "stay_date": date(2024, 12, 31),
             "payload": {"stay_date": "2024-12-31", "hotel_name": "A"},
         }])
         target = TargetConnection()
