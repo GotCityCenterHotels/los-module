@@ -12,7 +12,7 @@ from psycopg.rows import dict_row
 from cost_database import cost_pool
 from database import pool as source_pool
 from queries.cost_data import COST_DATA_QUERIES
-from queries.cost_spit import COST_SPIT_QUERIES
+from queries.cost_spit import COST_SPIT_DATASETS, COST_SPIT_SQL
 from services.cost_schema_service import ensure_cost_settings_schema
 
 
@@ -32,30 +32,6 @@ COST_DATA_QUERY_CONCURRENCY = max(
 )
 _dataset_workers = ThreadPoolExecutor(
     max_workers=COST_DATA_QUERY_CONCURRENCY, thread_name_prefix="cost-data"
-)
-
-# SPIT reads Database B, not the imported final-state tables in Database A.
-# Keeping its executor separate means the exact lifecycle reconstruction cannot
-# consume the Database A connection ceiling used by the current/final statement.
-_CONFIGURED_SPIT_CONCURRENCY = int(
-    os.environ.get("COST_SPIT_QUERY_CONCURRENCY", "3")
-)
-COST_SPIT_QUERY_CONCURRENCY = max(
-    1,
-    min(
-        _CONFIGURED_SPIT_CONCURRENCY,
-        source_pool.max_size,
-        len(COST_SPIT_QUERIES),
-    ),
-)
-_spit_workers = ThreadPoolExecutor(
-    max_workers=COST_SPIT_QUERY_CONCURRENCY,
-    thread_name_prefix="cost-spit",
-)
-COST_SPIT_SUBMISSION_PRIORITY = (
-    "distributionMix",
-    "cleaningAllocations",
-    "roomRevenue",
 )
 
 # Submission order, which is not the same thing as response order.
@@ -144,11 +120,22 @@ def _fetch_dataset(query, parameters):
             return _json_rows(cursor.fetchall())
 
 
-def _fetch_spit_dataset(query, parameters):
+def _fetch_spit_datasets(parameters):
+    """Execute the consolidated source read and restore its dataset envelope."""
+    datasets = {dataset: [] for dataset in COST_SPIT_DATASETS}
     with source_pool.connection() as connection:
         with connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(query, parameters)
-            return _json_rows(cursor.fetchall())
+            cursor.execute(COST_SPIT_SQL, parameters)
+            for row in cursor.fetchall():
+                dataset = row["dataset"]
+                if dataset not in datasets:
+                    raise ValueError(f"Unknown Cost SPIT dataset: {dataset}")
+                payload = row["payload"] or {}
+                datasets[dataset].append({
+                    _camel_case(column): _json_value(value)
+                    for column, value in payload.items()
+                })
+    return datasets
 
 
 def _fetch_cost_data_uncached(start_date, end_date):
@@ -312,38 +299,17 @@ def fetch_cost_spit_data(
             "end_date": end_date,
             "cutoff_date": cutoff_date,
         }
-        order = [
-            *(
-                dataset
-                for dataset in COST_SPIT_SUBMISSION_PRIORITY
-                if dataset in COST_SPIT_QUERIES
-            ),
-            *(
-                dataset
-                for dataset in COST_SPIT_QUERIES
-                if dataset not in COST_SPIT_SUBMISSION_PRIORITY
-            ),
-        ]
-        pending = {
-            dataset: _spit_workers.submit(
-                _fetch_spit_dataset,
-                COST_SPIT_QUERIES[dataset],
-                parameters,
-            )
-            for dataset in order
-        }
-        datasets = {
-            dataset: pending[dataset].result()
-            for dataset in COST_SPIT_QUERIES
-        }
+        started_at = monotonic()
+        datasets = _fetch_spit_datasets(parameters)
         counts = {dataset: len(rows) for dataset, rows in datasets.items()}
         logging.info(
             "Cost SPIT lifecycle read completed start_date=%s end_date=%s "
-            "cutoff_date=%s rows=%s",
+            "cutoff_date=%s rows=%s duration_ms=%.1f",
             start_date,
             end_date,
             cutoff_date,
             sum(counts.values()),
+            (monotonic() - started_at) * 1000,
         )
         return datasets, counts
 
