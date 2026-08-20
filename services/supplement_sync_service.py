@@ -450,14 +450,61 @@ def _publish_stage(cursor, run_id, source_snapshots):
         WHERE d.stay_date BETWEEN %(minimum_stay_date)s AND %(maximum_stay_date)s
     """, rebuild)
 
+    _refresh_coverage(cursor)
+
+
+def _refresh_coverage(cursor):
+    """Record what the read paths can actually answer for.
+
+    The stay-date extent comes from supplement_latest_inventory and the
+    snapshot-date extent from supplement_snapshot_inventory, because those are
+    two different questions about two differently-managed tables.
+
+    Both used to come from supplement_snapshot_inventory, and that is what made
+    the grid refuse dates it was perfectly able to serve. Those snapshot tables
+    are dense pickup history and are pruned hard - _apply_retention above deletes
+    anything with `snapshot_date > stay_date + 7` - while supplement_latest_* is,
+    as the comment there says, "the permanent latest/final fact set and is
+    deliberately never deleted". So a stay date more than a week in the past kept
+    its permanent facts and lost its snapshots, the coverage window contracted to
+    roughly `min(snapshot_date) - 7`, and fetch_supplement_grid then declined
+    anything older than about a week on the strength of a window describing the
+    wrong table.
+
+    That is why 1 August showed nothing on 20 August: supplement_latest_inventory
+    still held it, supplement_snapshot_inventory no longer did, and coverage was
+    reporting the second one.
+
+    The snapshot extent stays as it was and stays honest - it is what bounds the
+    pickup curves and the SPIT column, and a stay date inside the stay-date
+    window but outside the snapshot window degrades to an empty SPIT cell
+    (_cell_for_categories uses source.get) rather than failing.
+    """
     cursor.execute("""
         INSERT INTO functions.supplement_coverage (
             singleton, minimum_stay_date, maximum_stay_date,
             minimum_snapshot_date, maximum_snapshot_date, updated_at
         )
-        SELECT true, min(stay_date), max(stay_date),
-               min(snapshot_date), max(snapshot_date), now()
-        FROM functions.supplement_snapshot_inventory
+        SELECT true,
+               stay.minimum_stay_date, stay.maximum_stay_date,
+               snap.minimum_snapshot_date, snap.maximum_snapshot_date,
+               now()
+        FROM (
+            SELECT min(stay_date) AS minimum_stay_date,
+                   max(stay_date) AS maximum_stay_date
+            FROM functions.supplement_latest_inventory
+        ) stay
+        CROSS JOIN (
+            SELECT min(snapshot_date) AS minimum_snapshot_date,
+                   max(snapshot_date) AS maximum_snapshot_date
+            FROM functions.supplement_snapshot_inventory
+        ) snap
+        -- All four columns are NOT NULL, and min()/max() over an empty table is
+        -- NULL. Skipping the write leaves the previous window in place, which
+        -- _status_payload already handles; failing here would abort the whole
+        -- publication transaction over bookkeeping.
+        WHERE stay.minimum_stay_date IS NOT NULL
+          AND snap.minimum_snapshot_date IS NOT NULL
         ON CONFLICT (singleton) DO UPDATE SET
             minimum_stay_date = EXCLUDED.minimum_stay_date,
             maximum_stay_date = EXCLUDED.maximum_stay_date,
@@ -489,21 +536,7 @@ def _apply_retention(cursor, reference_date):
                OR snapshot_date < (stay_date - 366)
                OR snapshot_date > (stay_date + 7)
         """, (minimum_stay_date, maximum_stay_date))
-    cursor.execute("""
-        INSERT INTO functions.supplement_coverage (
-            singleton, minimum_stay_date, maximum_stay_date,
-            minimum_snapshot_date, maximum_snapshot_date, updated_at
-        )
-        SELECT true, min(stay_date), max(stay_date),
-               min(snapshot_date), max(snapshot_date), now()
-        FROM functions.supplement_snapshot_inventory
-        ON CONFLICT (singleton) DO UPDATE SET
-            minimum_stay_date = EXCLUDED.minimum_stay_date,
-            maximum_stay_date = EXCLUDED.maximum_stay_date,
-            minimum_snapshot_date = EXCLUDED.minimum_snapshot_date,
-            maximum_snapshot_date = EXCLUDED.maximum_snapshot_date,
-            updated_at = now()
-    """)
+    _refresh_coverage(cursor)
 
 
 def sync_supplement(mode="delta", snapshot_from=None, snapshot_to=None):

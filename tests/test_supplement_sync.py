@@ -67,6 +67,77 @@ class FakeConnection:
         self.events.append(("rollback",))
 
 
+class SupplementCoverageSourceTests(unittest.TestCase):
+    """Coverage must describe the table the grid reads.
+
+    The stay-date window is what fetch_supplement_grid clips against, and the
+    grid's own figures come from supplement_latest_inventory - which
+    _apply_retention explicitly never deletes from. Deriving the window from
+    supplement_snapshot_inventory instead made the grid decline dates it held
+    perfectly good facts for: those snapshot tables are pruned with
+    `snapshot_date > stay_date + 7`, so a stay date more than a week old keeps its
+    permanent facts and loses its snapshots, and the window collapsed to roughly
+    `min(snapshot_date) - 7`. That is why 1 August returned nothing on 20 August.
+    """
+
+    def _coverage_statement(self):
+        events = []
+        cursor = FakeCursor(events)
+        sync_service._refresh_coverage(cursor)
+        statements = [
+            query for kind, query, _params in events
+            if kind == "execute"
+            and "INSERT INTO functions.supplement_coverage" in query
+        ]
+        self.assertEqual(len(statements), 1)
+        return statements[0]
+
+    def test_the_stay_window_comes_from_the_permanent_latest_table(self):
+        statement = self._coverage_statement()
+
+        stay_half = statement[:statement.index("CROSS JOIN")]
+        self.assertIn("min(stay_date) AS minimum_stay_date", stay_half)
+        self.assertIn("functions.supplement_latest_inventory", stay_half)
+        # The pruned table must not be what bounds the stay-date window.
+        self.assertNotIn("supplement_snapshot_inventory", stay_half)
+
+    def test_the_snapshot_window_still_comes_from_the_snapshot_table(self):
+        statement = self._coverage_statement()
+
+        snapshot_half = statement[statement.index("CROSS JOIN"):]
+        self.assertIn("min(snapshot_date) AS minimum_snapshot_date", snapshot_half)
+        self.assertIn("functions.supplement_snapshot_inventory", snapshot_half)
+
+    def test_the_write_is_skipped_rather_than_failing_on_empty_tables(self):
+        # Every date column is NOT NULL and min() over an empty table is NULL, so
+        # without this guard a first run or a fully-pruned snapshot table would
+        # abort the publication transaction over bookkeeping.
+        statement = self._coverage_statement()
+
+        self.assertIn("WHERE stay.minimum_stay_date IS NOT NULL", statement)
+        self.assertIn("AND snap.minimum_snapshot_date IS NOT NULL", statement)
+
+    def test_retention_reuses_the_same_coverage_writer(self):
+        # Two call sites wrote this statement independently, so they could drift
+        # and one could keep reading the wrong table.
+        events = []
+        cursor = FakeCursor(events)
+        sync_service._apply_retention(cursor, date(2026, 8, 20))
+        coverage = [
+            query for kind, query, _params in events
+            if kind == "execute"
+            and "INSERT INTO functions.supplement_coverage" in query
+        ]
+        self.assertEqual(len(coverage), 1)
+        self.assertIn("functions.supplement_latest_inventory", coverage[0])
+        # And the column list still matches the six values selected.
+        self.assertIn(
+            "singleton, minimum_stay_date, maximum_stay_date, "
+            "minimum_snapshot_date, maximum_snapshot_date, updated_at",
+            coverage[0],
+        )
+
+
 class SupplementSyncOrchestrationTests(unittest.TestCase):
     def test_inventory_variance_is_compared_per_snapshot_not_batch_total(self):
         self.assertFalse(sync_service._inventory_variance_exceeds(52, 52))

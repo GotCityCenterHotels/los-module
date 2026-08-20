@@ -125,10 +125,22 @@
 
     function setFreshness(payload) {
         const approximate = payload?.inventoryQuality === "approximated-current";
-        elements.freshness.classList.toggle("is-stale", Boolean(payload?.stale || approximate));
+        elements.freshness.classList.toggle(
+            "is-stale",
+            Boolean(payload?.stale || approximate || payload?.clipped)
+        );
         let next;
         if (!payload?.dataAsOf) {
             next = "<strong>Supplement unavailable</strong><span>No snapshot has been published.</span>";
+        } else if (payload.clipped) {
+            // Ahead of the stale and approximate branches on purpose: a range
+            // that was narrowed is the most important thing to say about this
+            // grid, because some of what the reader asked for is simply not on
+            // screen. Showing the covered window is what lets them pick a range
+            // that works instead of guessing.
+            next = `<strong>Showing ${escapeHtml(payload.clipped.servedStartDate)} – `
+                + `${escapeHtml(payload.clipped.servedEndDate)}</strong>`
+                + `<span>${escapeHtml(payload.clipped.reason)}</span>`;
         } else if (payload.stale) {
             next = `<strong>Data is stale</strong><span>Last published snapshot: ${escapeHtml(payload.dataAsOf)}.</span>`;
         } else if (approximate) {
@@ -295,8 +307,23 @@
 
     function describeRange(payload) {
         const dayCount = payload.dates.length;
-        return `${dayCount}-day view · ${state.inventoryBasis === "sellable" ? "sellable" : "physical"} inventory`
-            + ` · ${state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"}`;
+        const parts = [
+            `${dayCount}-day view`,
+            state.inventoryBasis === "sellable" ? "sellable inventory" : "physical inventory",
+            state.lyComparisonType === "sameWeekday" ? "same weekday LY" : "same date LY"
+        ];
+        // A clipped range must say so here. The server now serves the covered
+        // part of a wider request instead of refusing the whole thing, so the
+        // grid can legitimately hold fewer days than were asked for - and a
+        // caption that did not mention it would read as a complete answer to a
+        // question that was only partly answered.
+        if (payload.clipped) {
+            parts.push(
+                `showing ${payload.clipped.servedStartDate} – ${payload.clipped.servedEndDate}`
+                + ` of ${payload.clipped.requestedStartDate} – ${payload.clipped.requestedEndDate}`
+            );
+        }
+        return parts.join(" · ");
     }
 
     // The single place the grid is painted from. It owns the range summary too,

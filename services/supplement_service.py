@@ -90,6 +90,57 @@ def add_months(value, months):
     return date(year, month, min(value.day, last_day))
 
 
+def clip_to_coverage(start_date, end_date, coverage):
+    """Narrow a requested stay-date range to what is actually published.
+
+    Returns ``(start, end, clipped)``, where ``clipped`` is None when the whole
+    request was covered and a report of what was dropped otherwise.
+
+    This replaced an all-or-nothing gate. A range extending one day past either
+    end of coverage used to raise SupplementUnavailableError, so the page showed
+    nothing at all - and two entirely ordinary requests hit it. "The whole of
+    this year" runs to 31 December, months past the published horizon, and
+    returned no data despite most of the year being available. A range starting
+    on 1 August fell below minimumStayDate, because a delta sync stages stay
+    dates from ``snapshot_date - 7``, so anything more than about a week old sat
+    outside coverage even where supplement_latest still held it from the run that
+    did cover it.
+
+    Only an empty intersection is an error, and the caller's message then names
+    the covered window rather than saying "not backfilled", which gave the reader
+    no way to choose a range that would work.
+    """
+    if not coverage:
+        return start_date, end_date, None
+
+    covered_start = date.fromisoformat(coverage["minimumStayDate"])
+    covered_end = date.fromisoformat(coverage["maximumStayDate"])
+    served_start = max(start_date, covered_start)
+    served_end = min(end_date, covered_end)
+
+    if served_start > served_end:
+        raise SupplementUnavailableError(
+            "No published Supplement data falls inside "
+            f"{start_date.isoformat()} to {end_date.isoformat()}. Published "
+            f"stay dates run from {covered_start.isoformat()} to "
+            f"{covered_end.isoformat()}."
+        )
+
+    if (served_start, served_end) == (start_date, end_date):
+        return served_start, served_end, None
+
+    return served_start, served_end, {
+        "requestedStartDate": start_date.isoformat(),
+        "requestedEndDate": end_date.isoformat(),
+        "servedStartDate": served_start.isoformat(),
+        "servedEndDate": served_end.isoformat(),
+        "reason": (
+            "Published Supplement stay dates run from "
+            f"{covered_start.isoformat()} to {covered_end.isoformat()}."
+        ),
+    }
+
+
 def validate_date_range(start_date, end_date):
     if start_date > end_date:
         raise ValueError("startDate cannot be after endDate")
@@ -429,13 +480,41 @@ def fetch_supplement_grid(
             publication = _publication(cursor)
             status = _status_payload(publication)
             coverage = status.get("coverage")
-            if coverage and (
-                start_date < date.fromisoformat(coverage["minimumStayDate"])
-                or end_date > date.fromisoformat(coverage["maximumStayDate"])
-            ):
-                raise SupplementUnavailableError(
-                    "The selected dates have not been backfilled into PostgreSQL"
+
+            # Serve the part of the range that IS published, rather than refusing
+            # the whole request because part of it is not.
+            #
+            # This was an all-or-nothing gate: a range extending one day past
+            # either end of coverage raised SupplementUnavailableError and the
+            # page showed nothing at all. Two entirely ordinary requests hit it.
+            # "The whole of this year" runs to 31 December, months past the
+            # published horizon, so it returned no data despite most of the year
+            # being available. And a range starting on 1 August fell below
+            # minimumStayDate, because a delta sync stages stay dates from
+            # snapshot_date - 7 - so anything more than a week old sat outside
+            # coverage even though supplement_latest still holds it from the run
+            # that did cover it.
+            #
+            # Clipping is the honest answer: the reader asked a question, part of
+            # it is answerable, and which part was dropped is reported rather than
+            # guessed at. Only an intersection that is genuinely empty is an
+            # error, and then the message says what the covered window actually
+            # is instead of "not backfilled".
+            requested_start, requested_end = start_date, end_date
+            start_date, end_date, clipped = clip_to_coverage(
+                start_date, end_date, coverage
+            )
+            if clipped:
+                logging.info(
+                    "Supplement grid clipped to coverage requested=%s..%s "
+                    "served=%s..%s",
+                    requested_start, requested_end, start_date, end_date,
                 )
+
+            # The served range, not the requested one: two different requests
+            # that clip to the same window are the same answer and must share a
+            # cache entry, and one that clips must never collide with the entry
+            # for a request that did not.
             cache_key = (
                 publication["run_id"], status["status"], start_date, end_date, mode,
                 requested_hotels, requested_categories,
@@ -542,9 +621,15 @@ def fetch_supplement_grid(
 
             payload = {
                 **status,
+                # The range actually served. A clipped request reports both, so
+                # the page can caption what it is showing rather than implying it
+                # answered the question that was asked.
+                "clipped": clipped,
                 "parameters": {
                     "startDate": start_date.isoformat(),
                     "endDate": end_date.isoformat(),
+                    "requestedStartDate": requested_start.isoformat(),
+                    "requestedEndDate": requested_end.isoformat(),
                     "mode": mode,
                     "hotelCodes": selected_hotels,
                     "lyComparisonBasis": ly_comparison_basis,
@@ -834,12 +919,18 @@ def fetch_supplement_detail(
             logging.info("Supplement detail cache miss run_id=%s", publication["run_id"])
             comparison_date = shift_last_year(stay_date, ly_comparison_basis)
             coverage = status.get("coverage")
+            # One stay date, so there is nothing to clip here - unlike the grid,
+            # which now serves the covered part of a wider range. The message
+            # names the covered window, because "has not been backfilled" left
+            # the reader with no way to pick a date that would work.
             if coverage and (
                 stay_date < date.fromisoformat(coverage["minimumStayDate"])
                 or stay_date > date.fromisoformat(coverage["maximumStayDate"])
             ):
                 raise SupplementUnavailableError(
-                    "The selected detail date has not been backfilled into PostgreSQL"
+                    f"{stay_date.isoformat()} is outside the published Supplement "
+                    f"window, which runs from {coverage['minimumStayDate']} to "
+                    f"{coverage['maximumStayDate']}."
                 )
             # Answered from the dimensions already held for this publication
             # rather than from two more round trips. Same rules: an active hotel,

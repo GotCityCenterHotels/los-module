@@ -120,11 +120,102 @@ class SupplementDomainTests(unittest.TestCase):
         source = Path(supplement_service.__file__).read_text(encoding="utf-8")
         detail_source = source[source.index("def fetch_supplement_detail"):]
         start = detail_source.index("if coverage and (")
+        # Anchored on the raise itself rather than its wording, which now names
+        # the covered window instead of saying "not backfilled".
         coverage_guard = detail_source[start:detail_source.index(
-            "The selected detail date has not been backfilled", start
+            "is outside the published Supplement", start
         )]
         self.assertNotIn("comparison_date", coverage_guard)
         self.assertIn('"comparisonAvailable"', detail_source)
+
+
+class SupplementCoverageClippingTests(unittest.TestCase):
+    """A partly-covered range must serve the covered part, not nothing.
+
+    The gate this replaced refused the whole request if either end fell outside
+    coverage, so the page showed no data at all for two entirely ordinary asks.
+    """
+
+    COVERAGE = {
+        "minimumStayDate": "2026-08-13",
+        "maximumStayDate": "2028-02-13",
+    }
+
+    def test_the_whole_year_serves_the_covered_part(self):
+        start, end, clipped = supplement_service.clip_to_coverage(
+            date(2026, 1, 1), date(2026, 12, 31), self.COVERAGE
+        )
+
+        # Eleven months of 2026 are published. Refusing all of it because
+        # January is not was the bug.
+        self.assertEqual(start, date(2026, 8, 13))
+        self.assertEqual(end, date(2026, 12, 31))
+        self.assertEqual(clipped["requestedStartDate"], "2026-01-01")
+        self.assertEqual(clipped["requestedEndDate"], "2026-12-31")
+        self.assertEqual(clipped["servedStartDate"], "2026-08-13")
+        self.assertEqual(clipped["servedEndDate"], "2026-12-31")
+        # The reason has to name the window, or the reader cannot pick a range
+        # that works.
+        self.assertIn("2026-08-13", clipped["reason"])
+        self.assertIn("2028-02-13", clipped["reason"])
+
+    def test_a_range_starting_on_the_first_of_august_still_returns_data(self):
+        start, end, clipped = supplement_service.clip_to_coverage(
+            date(2026, 8, 1), date(2026, 8, 31), self.COVERAGE
+        )
+
+        self.assertEqual(start, date(2026, 8, 13))
+        self.assertEqual(end, date(2026, 8, 31))
+        self.assertIsNotNone(clipped)
+
+    def test_a_fully_covered_range_is_untouched_and_reports_nothing(self):
+        start, end, clipped = supplement_service.clip_to_coverage(
+            date(2026, 9, 1), date(2026, 9, 30), self.COVERAGE
+        )
+
+        self.assertEqual((start, end), (date(2026, 9, 1), date(2026, 9, 30)))
+        # No note on a complete answer, so the caption and the freshness chip
+        # stay quiet on the normal path.
+        self.assertIsNone(clipped)
+
+    def test_an_empty_intersection_is_still_an_error_that_names_the_window(self):
+        with self.assertRaises(
+            supplement_service.SupplementUnavailableError
+        ) as raised:
+            supplement_service.clip_to_coverage(
+                date(2020, 1, 1), date(2020, 12, 31), self.COVERAGE
+            )
+
+        message = str(raised.exception)
+        self.assertIn("2026-08-13", message)
+        self.assertIn("2028-02-13", message)
+        # The old wording told the reader nothing they could act on.
+        self.assertNotIn("has not been backfilled", message)
+
+    def test_no_published_coverage_leaves_the_range_alone(self):
+        start, end, clipped = supplement_service.clip_to_coverage(
+            date(2026, 1, 1), date(2026, 12, 31), None
+        )
+
+        self.assertEqual((start, end), (date(2026, 1, 1), date(2026, 12, 31)))
+        self.assertIsNone(clipped)
+
+    def test_a_full_calendar_year_is_inside_the_request_limits(self):
+        # Both caps allow 366 days, so the year itself was never what blocked
+        # this - worth pinning so a future tightening does not silently reinstate
+        # the symptom from the other direction.
+        self.assertEqual(
+            supplement_service.validate_date_range(
+                date(2026, 1, 1), date(2026, 12, 31)
+            ),
+            365,
+        )
+        self.assertEqual(
+            supplement_service.validate_date_range(
+                date(2028, 1, 1), date(2028, 12, 31)
+            ),
+            366,
+        )
 
 
 class SupplementApiBoundaryTests(unittest.TestCase):
