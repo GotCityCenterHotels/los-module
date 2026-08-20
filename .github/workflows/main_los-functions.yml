@@ -67,8 +67,45 @@ jobs:
           COST_DB_PASSWORD: ci-postgres
         run: python scripts/apply_migrations.py
 
+      # COST_DB_* is exported here, not only on the migration step above, because
+      # the suite now contains tests that EXECUTE runtime SQL rather than reading
+      # it as text. They skip themselves when no database is offered, so without
+      # these they would silently skip in the one place they matter most.
+      #
+      # This is the narrow end of the gap docs/LOAD_TIME_PLAN.md names: nothing
+      # in this repository ran the SQL under queries/ or inside services/ against
+      # data, so a statement could be reviewed, substring-tested and still be
+      # wrong the first time a planner saw it. Writing the first such test found
+      # exactly that - supplement_snapshot_inventory is PARTITIONED BY RANGE
+      # (snapshot_date) and rejects a row whose month has no partition, which no
+      # amount of reading the statement would have surfaced.
       - name: Run Python tests
+        env:
+          COST_DB_HOST: localhost
+          COST_DB_PORT: '5432'
+          COST_DB_NAME: costdb
+          COST_DB_USER: postgres
+          COST_DB_PASSWORD: ci-postgres
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      # The suite passes when a SQL-executing test skips, so assert that the ones
+      # that matter actually ran. Otherwise a renamed variable or a dropped
+      # service block turns real coverage back into a green skip, which is the
+      # failure mode this whole step exists to avoid.
+      - name: Assert the SQL-executing tests did not skip
+        env:
+          COST_DB_HOST: localhost
+          COST_DB_PORT: '5432'
+          COST_DB_NAME: costdb
+          COST_DB_USER: postgres
+          COST_DB_PASSWORD: ci-postgres
+        run: |
+          python -m unittest tests.test_supplement_coverage_sql -v 2>&1 | tee sql-tests.log
+          if grep -qi "skipped" sql-tests.log; then
+            echo "::error::the runtime-SQL tests skipped; they must execute in CI"
+            exit 1
+          fi
+          grep -q "^OK" sql-tests.log
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
