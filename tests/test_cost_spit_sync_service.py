@@ -118,90 +118,83 @@ class CostSpitSyncTests(unittest.TestCase):
         self.assertIn("fact_count integer not null", ddl)
 
     def test_snapshot_plan_matches_the_http_comparison_dates(self):
-        """The plan is 1 January to today, shifted - which is the page's own
-        default range - not the whole calendar year."""
-        margin = timedelta(days=sync.COVERAGE_FORWARD_DAYS)
         plan = sync.snapshot_plan(date(2026, 8, 19))
 
         self.assertEqual(plan["sameDate"], {
             "cutoff_date": date(2025, 8, 19),
             "start_date": date(2025, 1, 1),
-            "end_date": date(2025, 8, 19) + margin,
+            "end_date": date(2025, 12, 31),
         })
         self.assertEqual(plan["sameWeekday"], {
             "cutoff_date": date(2025, 8, 20),
             "start_date": date(2025, 1, 2),
-            "end_date": date(2025, 8, 20) + margin,
+            "end_date": date(2026, 1, 1),
         })
 
-    def test_coverage_stops_at_today_rather_than_year_end(self):
-        """SPIT serves the default reading only, so scanning to 31 December
-        bought nothing. In August that is about a third less source scan."""
-        start, end = sync.coverage_window(date(2026, 8, 19))
-        self.assertEqual(start, date(2026, 1, 1))
-        self.assertLess(end, date(2026, 12, 31))
+    def test_coverage_runs_to_year_end_not_to_today(self):
+        """The regression that made SPIT look empty for every future date.
 
-    def test_coverage_reaches_past_today_far_enough_to_be_served_stale(self):
-        """A request just after midnight, or one answered from a publication a
-        night or two old, asks for a range ending after the snapshot was built.
-        The margin has to outlast the staleness allowance or that range falls
-        off the end of coverage and reports unavailable."""
-        from services import cost_data_service
+        The cutoff bounds when a booking was made, not which nights it covers.
+        Last August the book already held reservations for the coming December,
+        and those are exactly the rows a forward-looking comparison needs. A
+        window that stopped at today answered the past and returned nothing for
+        the future, which on screen is indistinguishable from missing data.
+        """
+        for as_of in (date(2026, 1, 5), date(2026, 8, 20), date(2026, 11, 30)):
+            start, end = sync.coverage_window(as_of)
+            self.assertEqual(start, date(as_of.year, 1, 1))
+            self.assertEqual(end, date(as_of.year, 12, 31))
+            self.assertGreater(
+                end, as_of,
+                f"coverage on {as_of} has to reach past today",
+            )
 
-        self.assertGreater(
-            sync.COVERAGE_FORWARD_DAYS,
-            cost_data_service.COST_SPIT_MAX_STALE_DAYS,
-        )
-        _start, end = sync.coverage_window(date(2026, 8, 19))
-        self.assertGreater(end, date(2026, 8, 19))
+    def test_a_stay_date_after_today_is_inside_published_coverage(self):
+        """The reading the bug actually broke: December, asked in August.
 
-    def test_the_pages_own_default_request_is_inside_published_coverage(self):
-        """The one reading SPIT has to answer.
-
-        The page opens on 1 January to today and asks for the same span last
-        year, so the snapshot only covers that - not an arbitrary picked range.
-        The arithmetic on the two sides is written in different places (the route
-        shifts the requested dates, the publisher shifts the coverage window), so
-        this walks a year of days and asserts they agree on every one of them,
-        for both bases, including the leap-year and staleness edges that a single
-        example would step over.
+        Walked across the year for both bases, because the route and the
+        publisher shift dates in different places and only have to disagree on
+        one day for a column to go blank.
         """
         from shared.comparison_dates import shift_cost_comparison_date
-        from services.cost_data_service import COST_SPIT_MAX_STALE_DAYS
 
         for offset in range(0, 366):
             today = date(2026, 1, 1) + timedelta(days=offset)
             plan = sync.snapshot_plan(today)
 
-            # What the route asks for, from the page's default range.
-            requested_start = date(today.year, 1, 1)
-            requested_end = today
+            # The page's full-year range: every night of this year, which is
+            # mostly nights that have not happened yet.
+            for requested in (date(today.year, 1, 1),
+                              today,
+                              date(today.year, 12, 31)):
+                for basis in sync.COMPARISON_BASES:
+                    asked = shift_cost_comparison_date(requested, basis)
+                    published = plan[basis]
+                    self.assertGreaterEqual(
+                        asked, published["start_date"],
+                        f"{basis} on {today}: {requested} precedes coverage",
+                    )
+                    self.assertLessEqual(
+                        asked, published["end_date"],
+                        f"{basis} on {today}: {requested} is past coverage",
+                    )
 
-            for basis in sync.COMPARISON_BASES:
-                published = plan[basis]
-                asked_start = shift_cost_comparison_date(requested_start, basis)
-                asked_end = shift_cost_comparison_date(requested_end, basis)
+    def test_a_stale_publication_still_covers_the_whole_year(self):
+        """Coverage no longer moves with today, so a publication a few nights
+        old covers exactly what a fresh one does. That is what makes the
+        staleness allowance safe rather than a source of blank columns."""
+        from shared.comparison_dates import shift_cost_comparison_date
+        from services.cost_data_service import COST_SPIT_MAX_STALE_DAYS
 
-                self.assertGreaterEqual(
-                    asked_start, published["start_date"],
-                    f"{basis} on {today}: range starts before coverage",
-                )
-                self.assertLessEqual(
-                    asked_end, published["end_date"],
-                    f"{basis} on {today}: range ends after coverage",
-                )
-
-            # And the same request still fits a publication left over from a few
-            # nights ago, which is what the staleness allowance lets us serve.
-            stale_plan = sync.snapshot_plan(
-                today - timedelta(days=COST_SPIT_MAX_STALE_DAYS)
+        today = date(2026, 8, 20)
+        stale = sync.snapshot_plan(
+            today - timedelta(days=COST_SPIT_MAX_STALE_DAYS)
+        )
+        for basis in sync.COMPARISON_BASES:
+            self.assertLessEqual(
+                shift_cost_comparison_date(date(today.year, 12, 31), basis),
+                stale[basis]["end_date"],
             )
-            for basis in sync.COMPARISON_BASES:
-                self.assertLessEqual(
-                    shift_cost_comparison_date(requested_end, basis),
-                    stale_plan[basis]["end_date"],
-                    f"{basis} on {today}: a stale publication cannot cover today",
-                )
 
     def test_the_two_bases_are_streamed_concurrently(self):
         """Two independent source queries on their own connections writing

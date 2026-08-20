@@ -30,7 +30,7 @@ import logging
 import os
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from time import monotonic
 from zoneinfo import ZoneInfo
 
@@ -71,21 +71,6 @@ SOURCE_STATEMENT_TIMEOUT_MS = int(
 # synchronization is live, so anything still 'running' and this old is abandoned.
 ABANDONED_RUN_HOURS = int(os.environ.get("COST_SPIT_ABANDONED_RUN_HOURS", "6"))
 
-# SPIT answers one reading: the Cost Data page's default, 1 January to today
-# against the same span last year. It is not asked to serve an arbitrary picked
-# range, so the window stops at today rather than running to 31 December - in
-# August that is a third less lifecycle scan for exactly the same answer, and it
-# grows back only as the year does.
-#
-# The forward margin is what keeps that from being brittle. A request made just
-# after midnight, or served from a publication a night or two old, asks for a
-# range ending later than the snapshot was built for; without the margin it
-# would fall off the end of the covered range and report unavailable. It is
-# deliberately larger than COST_SPIT_MAX_STALE_DAYS for that reason.
-COVERAGE_FORWARD_DAYS = int(
-    os.environ.get("COST_SPIT_COVERAGE_FORWARD_DAYS", "10")
-)
-
 STOCKHOLM = ZoneInfo("Europe/Stockholm")
 
 
@@ -101,10 +86,22 @@ def stockholm_today():
 
 
 def coverage_window(as_of_date):
-    """The current-year span that the two snapshots are shifted from."""
+    """The current-year span that the two snapshots are shifted from.
+
+    The whole calendar year, deliberately - not 1 January to today.
+
+    The cutoff bounds when a booking was *made*, not which nights it covers. On
+    20 August last year the book already held reservations for September,
+    October and December, and comparing those against what is on the books for
+    the rest of this year is the entire point of the reading: it is the only
+    version of last year that is a fair comparison for a future date. Ending
+    coverage at today would answer "how did last year finish" for the past and
+    return nothing at all for the future, which reads as missing data on every
+    stay date after today.
+    """
     return (
         date(as_of_date.year, 1, 1),
-        as_of_date + timedelta(days=COVERAGE_FORWARD_DAYS),
+        date(as_of_date.year, 12, 31),
     )
 
 
