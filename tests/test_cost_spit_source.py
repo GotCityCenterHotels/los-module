@@ -145,6 +145,29 @@ class CostSpitSourceTests(unittest.TestCase):
         for dataset in COST_SPIT_DATASETS:
             self.assertIn(f"'{dataset.lower()}'", normalized)
 
+    def test_whole_stays_survive_the_window_edges(self):
+        """Nights come from scoped_items, which has already read every
+        SpaceOrder item in the window, so the per-reservation lookup that used
+        to dominate this query is now only done for stays that reach past an
+        edge. A stay truncated at an edge would invent its arrival and departure
+        dates and over-allocate its cleaning share, so the top-up is what keeps
+        the shortcut honest - measured identical on all seven datasets, and on a
+        stay starting 2024-12-15, outside the window entirely."""
+        normalized = " ".join(COST_SPIT_SQL.lower().split())
+
+        # Nights are taken from the already-materialised item set...
+        self.assertIn("window_nights as materialized", normalized)
+        self.assertIn("join scoped_items item", normalized)
+        # ...and only edge-touching stays go back to the source table.
+        self.assertIn("edge_reservations as materialized", normalized)
+        self.assertIn("having min(stay_date) <= %(start_date)s::date", normalized)
+        self.assertIn("or max(stay_date) >= %(end_date)s::date", normalized)
+        self.assertIn("edge_nights as materialized", normalized)
+        # The union of both is what the rest of the query consumes, so a stay
+        # recovered from the edge is indistinguishable from one that never left.
+        self.assertIn("from window_nights union", normalized)
+        self.assertIn("select reservation_id, stay_date from edge_nights", normalized)
+
     def test_http_reads_only_the_indexed_database_a_read_model(self):
         normalized = " ".join(COST_SPIT_READ_SQL.lower().split())
         self.assertIn("from functions.cost_spit_publication", normalized)

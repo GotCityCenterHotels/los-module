@@ -190,24 +190,59 @@ reservation_dimensions AS MATERIALIZED (
         ) entry
     ) persons ON true
 ),
--- The only second access to order_item_current is by relevant reservation id.
--- Whole stays are required so range edges do not invent stay endpoints or
--- over-allocate cleaning shares.
-eligible_nights AS MATERIALIZED (
-    SELECT DISTINCT
-        reservation.reservation_id,
-        reservation.enterprise_id,
-        (item.start_utc AT TIME ZONE 'Europe/Stockholm')::date AS stay_date,
-        reservation.category_id,
-        reservation.category_name,
-        reservation.occupancy
+-- Whole stays are required here: a stay truncated at a range edge invents its
+-- own arrival and departure dates and over-allocates its cleaning share across
+-- the nights that survived.
+--
+-- Getting them used to mean going back to order_item_current once per relevant
+-- reservation - fifty thousand index probes, each with a random heap fetch on a
+-- 3.5 GB table, which was around sixty per cent of this query's runtime. But
+-- scoped_items has already read every SpaceOrder item in the window, so almost
+-- every one of those nights was sitting in a materialised CTE the whole time.
+-- Only a stay reaching past an edge of that window can be short a night, and
+-- those are few enough to look up individually.
+window_nights AS MATERIALIZED (
+    SELECT DISTINCT reservation.reservation_id, item.stay_date
     FROM reservation_dimensions reservation
-    JOIN order_item_current item
+    JOIN scoped_items item
       ON item.tenant_key = reservation.tenant_key
      AND item.service_order_id = reservation.reservation_id
      AND item.type = 'SpaceOrder'
+),
+-- scoped_items spans one night before start_date to end_date, so a stay whose
+-- first night sits on the low edge may continue earlier and one whose last night
+-- sits on the high edge may continue later. A stay strictly inside those bounds
+-- is provably complete already. The comparison is deliberately inclusive of
+-- start_date and end_date rather than of the true edges: it costs a few extra
+-- lookups and cannot miss one.
+edge_reservations AS MATERIALIZED (
+    SELECT reservation_id
+    FROM window_nights
+    GROUP BY reservation_id
+    HAVING min(stay_date) <= %(start_date)s::date
+        OR max(stay_date) >= %(end_date)s::date
+),
+edge_nights AS MATERIALIZED (
+    SELECT DISTINCT edge.reservation_id,
+           (item.start_utc AT TIME ZONE 'Europe/Stockholm')::date AS stay_date
+    FROM edge_reservations edge
+    JOIN order_item_current item
+      ON item.tenant_key = 'GCCH'
+     AND item.service_order_id = edge.reservation_id
+     AND item.type = 'SpaceOrder'
     WHERE item.start_utc IS NOT NULL
       AND ({ITEM_LIFECYCLE})
+),
+eligible_nights AS MATERIALIZED (
+    SELECT night.reservation_id, reservation.enterprise_id, night.stay_date,
+           reservation.category_id, reservation.category_name,
+           reservation.occupancy
+    FROM (
+        SELECT reservation_id, stay_date FROM window_nights
+        UNION
+        SELECT reservation_id, stay_date FROM edge_nights
+    ) night
+    JOIN reservation_dimensions reservation USING (reservation_id)
 ),
 stays AS (
     SELECT reservation_id, enterprise_id,
