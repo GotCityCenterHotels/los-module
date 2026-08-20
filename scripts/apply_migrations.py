@@ -56,7 +56,34 @@ def main():
     ):
         os.environ.setdefault(name, placeholder)
 
+    # All four schema services, not just the cost one.
+    #
+    # This script imported cost_schema_service.MIGRATIONS alone, so CI executed
+    # 14 of the 21 files in sql/migrations/ and never ran 003 and 004
+    # (supplement), 005 (import jobs) or 008 and 009 (LOS) against a real
+    # PostgreSQL at all. What stood in for them was substring assertions on the
+    # file text - tests/test_los_read_model.py checks that a particular string
+    # appears in 008 - which is precisely the verification this file's own
+    # docstring says is insufficient, because it is how a migration comparing
+    # name[] to text[] once reached production.
+    #
+    # Latent rather than live: the existing databases already record these, so a
+    # defect in one surfaces only when an environment is rebuilt. That is exactly
+    # the moment nobody wants to discover it.
+    #
+    # Order matters. 006_unified_hotels is shared by the cost and supplement
+    # services and creates the hotel dimension the others reference, and the cost
+    # base schema has to exist before anything that alters it, so the cost list
+    # runs first and duplicates are applied once.
     from services.cost_schema_service import BASE_SCHEMA_PATH, MIGRATIONS
+    from services.los_schema_service import MIGRATIONS as LOS_MIGRATIONS
+    from services.supplement_schema_service import (
+        MIGRATIONS as SUPPLEMENT_MIGRATIONS,
+    )
+    from services.import_job_schema_service import (
+        MIGRATION_NAME as IMPORT_JOB_MIGRATION_NAME,
+        MIGRATION_PATH as IMPORT_JOB_MIGRATION_PATH,
+    )
 
     # cost_database builds a ConnectionPool at import, which this script never
     # uses. Left open, its worker threads outlive main() and print "couldn't
@@ -68,7 +95,53 @@ def main():
     except Exception:  # pragma: no cover - only affects log noise
         pass
 
-    steps = [("base schema", BASE_SCHEMA_PATH)] + list(MIGRATIONS)
+    steps = [("base schema", BASE_SCHEMA_PATH)]
+    seen = set()
+    for name, path in (
+        list(MIGRATIONS)
+        + list(SUPPLEMENT_MIGRATIONS)
+        # Before the LOS list: 009_import_jobs_los is an ALTER TABLE against
+        # functions.import_jobs, which 005_import_jobs creates.
+        + [(IMPORT_JOB_MIGRATION_NAME, IMPORT_JOB_MIGRATION_PATH)]
+        + list(LOS_MIGRATIONS)
+    ):
+        if name in seen:
+            continue
+        seen.add(name)
+        steps.append((name, path))
+
+    # Nothing under sql/migrations/ may go unexecuted without saying so out loud.
+    # 007 and 011 are deliberately manual - they drop legacy objects and are
+    # excluded from every service's list - so they are named here rather than
+    # silently absent, and a NEW file that no service registers fails the build
+    # instead of being quietly untested.
+    MANUAL_ONLY = {
+        "007_remove_legacy_hotel_tables",
+        "011_remove_fixed_costs",
+    }
+    on_disk = {
+        path.stem
+        for path in sorted((REPO_ROOT / "sql" / "migrations").glob("*.sql"))
+    }
+    unclaimed = on_disk - seen - MANUAL_ONLY
+    if unclaimed:
+        print(
+            "FAIL  no schema service registers these migrations, so nothing "
+            f"executes them: {sorted(unclaimed)}",
+            file=sys.stderr,
+        )
+        return 1
+    missing_files = seen - on_disk
+    if missing_files:
+        print(
+            f"FAIL  registered migrations with no file: {sorted(missing_files)}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"ok    {len(seen)} registered migrations, "
+        f"{len(MANUAL_ONLY)} deliberately manual, none unaccounted for"
+    )
 
     with psycopg.connect(build_dsn(arguments.dsn), autocommit=True) as connection:
         with connection.cursor() as cursor:

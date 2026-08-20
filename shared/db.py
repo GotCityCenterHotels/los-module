@@ -78,6 +78,11 @@ def export_connection_settings(statement_timeout_ms=None):
             default="require",
         ),
         connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
+        # application_name is what makes a stuck job identifiable in
+        # pg_stat_activity. Without it every background reader was an anonymous
+        # backend indistinguishable from a page request, on the one database this
+        # app does not own.
+        application_name="los-functions-export",
         options=(
             "-c default_transaction_read_only=on "
             f"-c statement_timeout={timeout_ms}"
@@ -127,4 +132,21 @@ def get_import_connection():
             default="require",
         ),
         connect_timeout=int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
+        # The writable twin of cost_database.py's pooled connection, and it was
+        # missing both of the settings that file sets and explains.
+        #
+        # statement_timeout stays unbounded here on purpose: this connection
+        # belongs to the import and sync jobs, which legitimately run for minutes
+        # under the 30 minute functionTimeout.
+        #
+        # lock_timeout does NOT get the same latitude. Without it, an upsert that
+        # meets a lock held by a leaked session - a migration advisory lock, an
+        # abandoned VACUUM FULL, a psql window someone left open - waits forever,
+        # inside a job holding a server-side cursor on the mirror, until the host
+        # kills the whole invocation at 30 minutes with nothing recorded. Failing
+        # fast on the lock leaves an error an operator can act on.
+        application_name="los-functions-import",
+        options=(
+            f"-c lock_timeout={int(os.environ.get('DB_LOCK_TIMEOUT_MS', '5000'))}"
+        ),
     )

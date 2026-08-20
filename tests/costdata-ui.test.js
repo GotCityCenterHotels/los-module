@@ -451,10 +451,13 @@ test("an empty matching-rate list names the filters that produced it", () => {
     assert.match(script, /lookup\.agencyFilterApplied/);
 });
 
-// This page is the only place the import can be reached from: the Function App is
-// a Static Web Apps linked backend, so App Service Authentication rejects a direct
-// call before the function key is read, and only a request carrying this site's
-// own auth cookie gets through the proxy.
+// This page is the only place the import can be reached from. What guards the
+// route is the deployment - App Service Authentication in front of the linked
+// backend rejects a direct call to the Function App's own hostname, and the site's
+// own access control covers the proxied path. Note what that does NOT mean:
+// linking a backend restricts the CALLER, not the end user, so neither layer is an
+// authorization check on whoever is driving the browser. Nothing in this
+// repository asserts either one; see the auth findings in the architecture review.
 test("Cost Input can trigger the import, one dataset or all of them", () => {
     const html = read("costdata-input.html");
     const script = read("costdata-input.js");
@@ -470,35 +473,34 @@ test("Cost Input can trigger the import, one dataset or all of them", () => {
     assert.match(script, /IMPORT_POLL_TIMEOUT_MS/);
     assert.match(script, /job\.status === "succeeded"/);
     assert.match(script, /job\.status === "failed"/);
-    // A rejected key must not stay cached, or every later attempt fails without
-    // ever asking again.
-    assert.match(script, /forgetImportKey\(\)/);
-    assert.match(script, /costdata-import-key/);
+    // No credential machinery on this path at all: the route is ANONYMOUS and
+    // reads no key, so a page that cached or prompted for one was storing a
+    // high-value secret to no effect.
+    assert.doesNotMatch(script, /costdata-import-key/);
 });
 
-// The Function App is a Static Web Apps linked backend, so App Service
-// Authentication guards it and the platform authenticates the proxied request. A
-// request from this page therefore usually needs no key at all - and a WRONG one is
-// worse than none, because the Functions host key check then turns down a request
-// EasyAuth had already let through.
-test("the import tries without a key first and only asks if refused", () => {
+// costdata/import is ANONYMOUS, so no function key is sent or read on this path.
+// The page used to prompt the operator for the Function App HOST key - the
+// credential that authorises every FUNCTION-level route in the app - and retry
+// with it, against a route that ignores the header. The 401 that triggered the
+// prompt is far more likely to be an expired page session, so it asked for a
+// high-value secret to solve a problem it could not solve.
+test("the import sends no function key and never prompts for one", () => {
     const script = read("costdata-input.js");
 
     assert.match(script, /async function queueImport\(dataset\)/);
-    assert.match(script, /return await postImport\(dataset, ""\)/);
-    // The key is only attached when there is one, so the unauthenticated attempt
-    // sends no header at all rather than an empty one.
-    assert.match(script, /if \(key\) headers\["x-functions-key"\] = key;/);
-    // Asked for after the refusal, not before it.
-    assert.ok(
-        script.indexOf('postImport(dataset, "")') < script.indexOf("const key = importKey()"),
-        "the keyless attempt must come before the prompt"
-    );
-    // And when both attempts are refused, the key is only half the candidates:
-    // this page sits behind the site's own login and an expired session refuses
-    // the proxied request identically. Blaming the key was wrong twice over.
-    assert.match(script, /session has expired/);
-    assert.doesNotMatch(script, /That key was not accepted/);
+    // One attempt, no key argument.
+    assert.match(script, /return await postImport\(dataset\);/);
+    // Nothing here may ask for, store, or transmit a host key.
+    assert.doesNotMatch(script, /x-functions-key/);
+    assert.doesNotMatch(script, /importKey|forgetImportKey|IMPORT_KEY_STORAGE/);
+    assert.doesNotMatch(script, /App keys/);
+    assert.doesNotMatch(script, /prompt\(/);
+    // A refusal names the likely cause instead of blaming a key.
+    // Matched loosely on purpose: the message is split across two string
+    // literals in the source, and this file reads source text rather than
+    // running it.
+    assert.match(script, /most likely expired/);
     // Reloading the property list pulls the server's copy over the form, which is
     // where half an hour of unsaved work may be sitting.
     assert.match(script, /if \(dirty\) \{/);

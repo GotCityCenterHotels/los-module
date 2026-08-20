@@ -180,6 +180,13 @@ def _is_stale(published_at):
     )
 
 
+# The same question, under a name the HTTP layer can import. The answer was
+# already being computed on every read and spent entirely on a log line; the
+# response now carries it so the page can say so.
+def los_facts_is_stale(published_at):
+    return _is_stale(published_at) if published_at else False
+
+
 def fetch_los_read_model_status():
     ensure_los_schema()
     with cost_pool.connection() as connection:

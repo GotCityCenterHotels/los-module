@@ -352,7 +352,11 @@ class CostSettingsValidationTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *args): return False
             def execute(self, sql, parameters=None): pass
-            def fetchone(self): return None
+            # The property is already in the hotel dimension, which is the only
+            # state in which this load bootstraps anything at all.
+            def fetchone(self): return {
+                "enterprise_id": "property-42", "hotel_name": "Hotel A"
+            }
             def fetchall(self): return []
 
         class Connection:
@@ -388,15 +392,94 @@ class CostSettingsValidationTests(unittest.TestCase):
                 property_record["hotelName"],
             )
 
-        # Both bootstrap writes now travel on the read's own pooled connection,
-        # so the connection keyword is part of every call. Assert on the payload
-        # only: which connection carried it is not what this test is about.
-        mirror.assert_called_once()
-        self.assertEqual(mirror.call_args.args[0], [property_record])
+        # The settings row is bootstrapped; the hotel dimension is NOT written.
+        # A settings GET is an anonymous read and has no authority over
+        # functions.hotels - it verifies against it instead, which is what makes
+        # the FK on the row below satisfiable.
         preload.assert_called_once()
         self.assertEqual(preload.call_args.args[0], [property_record])
+        mirror.assert_not_called()
         self.assertEqual(result["enterpriseId"], "property-42")
         self.assertEqual(result["hotelName"], "Hotel A")
+
+    def test_an_unknown_enterprise_id_cannot_be_invented_by_a_get(self):
+        """`?hotelName=` on an unknown id used to create a permanent property.
+
+        _upsert_mirrored_properties INSERTs into functions.hotels with
+        tenant_key='GCCH' and active=true, nothing ever lowers active, and
+        _list_mirrored_properties selects exactly those - so one anonymous GET
+        put a property of the caller's choosing into every picker for good.
+        """
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql, parameters=None): pass
+            def fetchone(self): return None
+            def fetchall(self): return []
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self, **kwargs): return Cursor()
+
+        class Pool:
+            def connection(self): return Connection()
+
+        cost_settings_service._reset_property_memo()
+        with patch.object(
+            cost_settings_service, "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service, "_upsert_mirrored_properties",
+        ) as mirror, patch.object(
+            cost_settings_service, "_preload_property_settings",
+        ) as preload, patch.object(
+            cost_settings_service, "cost_pool", Pool(),
+        ):
+            with self.assertRaises(ValueError):
+                cost_settings_service.fetch_cost_settings(
+                    "injected-by-a-query-string", "Fictional Hotel"
+                )
+
+        mirror.assert_not_called()
+        preload.assert_not_called()
+
+    def test_a_get_cannot_relabel_a_real_property(self):
+        """The name comes from the dimension, never from the query string."""
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def execute(self, sql, parameters=None): pass
+            def fetchone(self): return {
+                "enterprise_id": "property-42", "hotel_name": "Real Name"
+            }
+            def fetchall(self): return []
+
+        class Connection:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def cursor(self, **kwargs): return Cursor()
+
+        class Pool:
+            def connection(self): return Connection()
+
+        cost_settings_service._reset_property_memo()
+        with patch.object(
+            cost_settings_service, "ensure_cost_settings_schema",
+        ), patch.object(
+            cost_settings_service, "_preload_property_settings",
+            return_value=False,
+        ) as preload, patch.object(
+            cost_settings_service, "cost_pool", Pool(),
+        ):
+            result = cost_settings_service.fetch_cost_settings(
+                "property-42", "Attacker Supplied Name"
+            )
+
+        self.assertEqual(result["hotelName"], "Real Name")
+        self.assertEqual(
+            preload.call_args.args[0],
+            [{"enterpriseId": "property-42", "hotelName": "Real Name"}],
+        )
 
     def test_settings_load_runs_the_real_bootstrap_writes(self):
         """The bootstrap writes are exercised, not mocked.
@@ -415,7 +498,12 @@ class CostSettingsValidationTests(unittest.TestCase):
                 self.owner.statements.append(sql)
             def executemany(self, sql, parameters=None):
                 self.owner.statements.append(sql)
-            def fetchone(self): return None
+            def fetchone(self):
+                # The dimension lookup this load now performs before it writes
+                # anything. Returning the row is what makes the property known.
+                return {
+                    "enterprise_id": "property-77", "hotel_name": "Hotel B"
+                }
             def fetchall(self): return []
 
         class Connection:
@@ -461,17 +549,19 @@ class CostSettingsValidationTests(unittest.TestCase):
 
         self.assertEqual(result["enterpriseId"], "property-77")
         self.assertEqual(result["hotelName"], "Hotel B")
-        # Both writes ran, and on the read's own connection rather than taking a
-        # checkout each - one checkout for the whole load.
+        # The write runs on the read's own connection rather than taking a
+        # checkout of its own - one checkout for the whole load.
         self.assertEqual(pool.checkouts, 1)
-        self.assertTrue(any(
-            "INSERT INTO functions.hotels" in sql
-            for sql in connection.statements
-        ), "the mirrored-property upsert did not run")
         self.assertTrue(any(
             "INSERT INTO functions.cost_property_settings" in sql
             for sql in connection.statements
         ), "the settings preload did not run")
+        # And the hotel dimension is left alone. An anonymous GET verifies
+        # against functions.hotels; it does not get to add to it.
+        self.assertFalse(any(
+            "INSERT INTO functions.hotels" in sql
+            for sql in connection.statements
+        ), "a settings GET must not write the hotel dimension")
         self.assertEqual(advance.call_args.args[0], "settings:bootstrap")
         remember.assert_called_once_with(2)
 

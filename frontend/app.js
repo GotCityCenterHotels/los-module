@@ -1,3 +1,19 @@
+// Wrapped, like every other module in this directory.
+//
+// app.js and distribution.js were the only two unwrapped page scripts, and they
+// declared 27 of the same top-level names - including the whole page state
+// machine, declared twice. Nothing loaded both on one page, so the collision was
+// latent rather than live: the day anything did, the second file would fail to
+// parse and the page would silently lose that feature. An IIFE makes it
+// impossible rather than merely unlikely, and costs nothing - neither page has
+// an inline handler (the CSP forbids them) and nothing outside reads these
+// names.
+//
+// The shared state machine still lives in two copies. That is a real extraction
+// and belongs in its own change; this one only closes the collision.
+(function initializeAverageLosPage() {
+"use strict";
+
 const API_BASE_URL = "/api";
 
 const startDateInput = document.getElementById("startDate");
@@ -38,6 +54,13 @@ let loadedGrain = null;
 let lastLoadedRequestKey = null;
 let hotelListLoaded = false;
 let requestInProgress = false;
+// A generation token, the same device supplement.js uses at state.requestId.
+// loadButton.disabled was the only guard, and it does not cover the Group by
+// <select>, which calls loadData() directly on change and is never disabled. Two
+// loads in flight then resolved last-write-wins: the slower one's rows and grain
+// landed after the faster one's, and the first finally block cleared
+// requestInProgress while the other was still running.
+let losRequestId = 0;
 let hotelRequestId = 0;
 let loadedHotelRequestKey = null;
 let loadedRequestState = null;
@@ -188,10 +211,37 @@ function validateInputs() {
     }
 }
 
+// How fresh the loaded facts are, said in words the reader can act on.
+//
+// The server has always known this - services/los_facts_service.py computes
+// staleness on every read - and the only thing it did with the answer was write
+// a log line. So these two pages reported "Data is up to date." on the strength
+// of rows coming back, over a publication that could be days old. Cost Data and
+// Supplement both report their own freshness; these were the exception.
+//
+// A null publishedAt means the raw-query fallback answered, which reads live
+// source data and has no publication at all. That is worth saying too: it is a
+// different mode with different performance, and nothing on either page has ever
+// distinguished it.
+function freshnessSuffix(payload) {
+    if (!payload) return "";
+    if (!payload.publishedAt) return " Read live from source.";
+    const published = new Date(payload.publishedAt);
+    if (Number.isNaN(published.getTime())) return "";
+    const hours = Math.max(0, Math.round((Date.now() - published.getTime()) / 3600000));
+    const age = hours < 1 ? "less than an hour ago"
+        : hours < 24 ? `${hours} hour${hours === 1 ? "" : "s"} ago`
+        : `${Math.round(hours / 24)} day${Math.round(hours / 24) === 1 ? "" : "s"} ago`;
+    return payload.stale
+        ? ` Published ${age} — this is behind the nightly import and may be out of date.`
+        : ` Published ${age}.`;
+}
+
 async function loadData() {
     clearError();
     const requestedState = getRequestState();
     const requestedKey = JSON.stringify(requestedState);
+    const requestId = ++losRequestId;
 
     try {
         validateInputs();
@@ -202,17 +252,23 @@ async function loadData() {
             apiBaseUrl: API_BASE_URL,
             ...requestedState
         });
+        // A superseded response is dropped whole. Nothing it carries is wanted:
+        // its rows, its grain and its status line all describe a request the
+        // user has already moved on from.
+        if (requestId !== losRequestId) return;
         loadedFacts = payload.data || [];
         loadedGrain = requestedState.grain;
         loadedRequestState = requestedState;
         lastLoadedRequestKey = requestedKey;
         render();
-        statusElement.textContent = loadedFacts.length
+        statusElement.textContent = (loadedFacts.length
             ? "Data is up to date."
-            : "No rows for this period. Try a wider date range or another hotel.";
+            : "No rows for this period. Try a wider date range or another hotel.")
+            + freshnessSuffix(payload);
         loadHotels(requestedState, { forceRefresh: true }).catch(handleHotelError);
     }
     catch (error) {
+        if (requestId !== losRequestId) return;
         console.error(error);
         showError(error.message || "Unable to update data.");
         statusElement.textContent = "Update failed.";
@@ -225,10 +281,20 @@ async function loadData() {
         loadedFacts = [];
         loadedGrain = null;
         loadedRequestState = null;
+        // And clear the key as well, which distribution.js already did. render()
+        // returns early on a null key, so leaving the previous key in place let
+        // the next checkbox click sail past the guard and paint "No rows for
+        // this period" over data that had loaded perfectly well.
+        lastLoadedRequestKey = null;
     }
     finally {
-        requestInProgress = false;
-        updateLoadButtonState();
+        // Only the newest request owns the button. A superseded load finishing
+        // second would otherwise re-enable it while the current one is still in
+        // flight.
+        if (requestId === losRequestId) {
+            requestInProgress = false;
+            updateLoadButtonState();
+        }
     }
 }
 
@@ -618,3 +684,5 @@ document.addEventListener("DOMContentLoaded", () => {
     // pay for the start-up.
     if (isValidPeriod()) loadHotels().catch(handleHotelError);
 });
+
+}());

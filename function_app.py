@@ -20,6 +20,7 @@ from services.los_facts_service import (
     fetch_los_facts,
     fetch_los_publication,
     fetch_los_read_model_status,
+    los_facts_is_stale,
     los_read_model_enabled,
 )
 from services.los_schema_service import LosSchemaError
@@ -71,6 +72,49 @@ SUPPLEMENT_TIMER_HOUR = 2
 SUPPLEMENT_TIMER_MINUTE = 15
 IMPORT_QUEUE_NAME = "import-jobs"
 IMPORT_MAX_DEQUEUE_COUNT = int(os.environ.get("IMPORT_MAX_DEQUEUE_COUNT", "3"))
+
+# The import retry ladder, which only works in one order:
+#
+#   functionTimeout (30m)  <  queues.visibilityTimeout (35m)  <  STALE_JOB_MINUTES (45m)
+#
+#   * visibilityTimeout > functionTimeout, or a run that reaches the host limit
+#     races its own message becoming visible again and a second worker can pick
+#     up work the first is still doing. These were both 00:30:00 - exactly equal,
+#     no margin at all.
+#   * STALE_JOB_MINUTES > visibilityTimeout, or a redelivery arrives while the
+#     row is still inside its own quiet window, cannot claim it, and (before the
+#     fix in import_job_worker) had its message deleted - spending an attempt
+#     without retrying anything.
+#
+# Two of the three live in host.json, which cannot hold a comment and is not
+# imported by anything, so the relationship was documented nowhere and enforced
+# nowhere. Checking it here means a drifting value shows up in the logs of the
+# next cold start rather than in a silently dropped import months later.
+IMPORT_VISIBILITY_TIMEOUT_MINUTES = 35
+IMPORT_FUNCTION_TIMEOUT_MINUTES = 30
+
+
+def _check_import_timeout_ladder():
+    from services.import_job_service import STALE_JOB_MINUTES
+
+    if not (
+        IMPORT_FUNCTION_TIMEOUT_MINUTES
+        < IMPORT_VISIBILITY_TIMEOUT_MINUTES
+        < STALE_JOB_MINUTES
+    ):
+        logging.error(
+            "Import retry ladder is out of order: functionTimeout=%dm "
+            "visibilityTimeout=%dm STALE_JOB_MINUTES=%dm. Imports can be "
+            "retried while still running, or dropped without a retry.",
+            IMPORT_FUNCTION_TIMEOUT_MINUTES,
+            IMPORT_VISIBILITY_TIMEOUT_MINUTES,
+            STALE_JOB_MINUTES,
+        )
+        return False
+    return True
+
+
+_check_import_timeout_ladder()
 
 # Static Web Apps aborts a linked-backend call at ~45s, so an unbounded range is
 # not "slow", it is a guaranteed "Backend call failure". 400 days covers a full
@@ -189,12 +233,27 @@ def parse_date(value: str | None) -> date | None:
         return None
 
 
+# Static Web Apps' globalHeaders in staticwebapp.config.json do not reach /api/*
+# ("Global headers do not affect API responses"), so every header this app wants
+# on an API response has to be set here. nosniff is the one that matters: these
+# routes echo database text back inside JSON, and a browser that sniffs a body
+# as something other than what it was labelled is the whole reason the header
+# exists.
+NOSNIFF = {"X-Content-Type-Options": "nosniff"}
+
+
+def _with_nosniff(headers=None):
+    merged = dict(headers or {})
+    merged.setdefault("X-Content-Type-Options", "nosniff")
+    return merged
+
+
 def json_response(payload, status_code=200, headers=None):
     return func.HttpResponse(
         json.dumps(payload, separators=(",", ":")),
         status_code=status_code,
         mimetype="application/json",
-        headers=headers,
+        headers=_with_nosniff(headers),
     )
 
 
@@ -207,7 +266,7 @@ def compressed_json_response(req, payload, status_code=200, headers=None):
     these routes inside the ~45s Static Web Apps proxy budget.
     """
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    response_headers = dict(headers or {})
+    response_headers = _with_nosniff(headers)
     response_headers["Vary"] = "Accept-Encoding"
     # Below roughly one packet, gzip costs more than it saves.
     if len(body) > 1400 and "gzip" in (req.headers.get("Accept-Encoding") or "").lower():
@@ -313,6 +372,7 @@ def cached_json_response(req, payload, etag):
         "ETag": etag,
         "Cache-Control": "private, max-age=300",
         "Vary": "Accept-Encoding",
+        **NOSNIFF,
     }
     if req.headers.get("If-None-Match") == etag:
         return func.HttpResponse(status_code=304, headers=common_headers)
@@ -355,6 +415,7 @@ def content_hash_response(req, payload, prefix, max_age):
         "ETag": etag,
         "Cache-Control": f"private, max-age={max_age}",
         "Vary": "Accept-Encoding",
+        **NOSNIFF,
     }
     if req.headers.get("If-None-Match") == etag:
         return func.HttpResponse(status_code=304, headers=headers)
@@ -398,10 +459,33 @@ class VersionedResponseCache:
             "ETag": etag,
             "Cache-Control": f"private, max-age={self.max_age_seconds}",
             "Vary": "Accept-Encoding",
+            **NOSNIFF,
         }
 
-    def _respond(self, req, entry, etag):
-        headers = self._headers(etag)
+    # A degraded body - one assembled after a dependency failed - carries no
+    # validator and no freshness at all.
+    #
+    # It used to carry both. cacheable=False skipped only the SERVER's retention,
+    # while the response still went out with the ETag a healthy body would have
+    # had, because the validator is derived from the publication version and the
+    # date parameters and knows nothing about whether the rulebook lookup
+    # actually answered. So a browser that caught one timeout kept a statement
+    # with costSettings={} for max-age, revalidated, was told 304 by respond()
+    # before any query ran, and re-upped its freshness - indefinitely, until the
+    # publication moved. Only a hard reload escaped, and everyone else was being
+    # served a healthy body under the very same ETag.
+    #
+    # The rule that fixes it is one line long: a body the server refuses to keep
+    # is a body the browser must not keep either.
+    def _degraded_headers(self):
+        return {
+            "Cache-Control": "no-store",
+            "Vary": "Accept-Encoding",
+            **NOSNIFF,
+        }
+
+    def _respond(self, req, entry, etag, cacheable=True):
+        headers = self._headers(etag) if cacheable else self._degraded_headers()
         accepts_gzip = "gzip" in (
             req.headers.get("Accept-Encoding") or ""
         ).lower()
@@ -445,7 +529,10 @@ class VersionedResponseCache:
                 owns_build = False
 
         if not owns_build:
-            return self._respond(req, pending.result(), etag)
+            # The owner publishes cacheability alongside the bytes, so a waiter
+            # that shared a degraded build is told not to keep it either.
+            shared_entry, shared_cacheable = pending.result()
+            return self._respond(req, shared_entry, etag, shared_cacheable)
 
         try:
             payload, cacheable = payload_factory()
@@ -464,8 +551,8 @@ class VersionedResponseCache:
                     self.entries[cache_key] = entry
                     while len(self.entries) > self.max_entries:
                         self.entries.popitem(last=False)
-            pending.set_result(entry)
-            return self._respond(req, entry, etag)
+            pending.set_result((entry, cacheable))
+            return self._respond(req, entry, etag, cacheable)
         finally:
             with self._lock:
                 if self.inflight.get(cache_key) is pending:
@@ -525,6 +612,28 @@ def _los_facts_payload(
             "grain": grain,
         },
         "runId": facts.run_id,
+        # Both already in hand, neither previously sent.
+        #
+        # The service has computed staleness since the read model shipped
+        # (_is_stale in services/los_facts_service.py) and the only thing it ever
+        # did with the answer was logging.warning - on an app with no telemetry
+        # sink. So the page said "Data is up to date." purely because rows came
+        # back, over a publication that could be days old. Cost Data and
+        # Supplement both report their own freshness; these two pages were the
+        # exception.
+        #
+        # publishedAt is None on the raw-query fallback, which reads live source
+        # data and has no publication to name - and that is itself worth
+        # surfacing, since runId is null there too and nothing in the frontend
+        # reads it.
+        "publishedAt": (
+            facts.published_at.isoformat() if facts.published_at else None
+        ),
+        "stale": (
+            los_facts_is_stale(facts.published_at)
+            if facts.published_at
+            else False
+        ),
         "rowCount": len(facts.rows),
         "data": facts.rows,
     }
@@ -1545,7 +1654,35 @@ def import_job_worker(message: func.QueueMessage) -> None:
     dequeue_count = max(int(getattr(message, "dequeue_count", 1) or 1), 1)
     job = claim_import_job(job_id, dequeue_count)
     if job is None:
-        logging.info("Import queue delivery skipped job_id=%s", job_id)
+        # Returning here ACKNOWLEDGES the delivery, which deletes the message.
+        #
+        # That is right when the job is genuinely finished - a duplicate delivery
+        # of completed work should be dropped. It is wrong for the case
+        # maxDequeueCount exists to cover: a row still marked 'running' because
+        # the previous attempt was evicted mid-import. claim_import_job only
+        # re-claims such a row once it has gone quiet for STALE_JOB_MINUTES, so a
+        # redelivery arriving before that was refused the claim and then had its
+        # message destroyed - the retry budget spent without a single retry.
+        #
+        # Raising instead hands the message back to the queue, where it becomes
+        # visible again after visibilityTimeout and can be re-attempted while
+        # some of maxDequeueCount is left.
+        job_state = get_import_job(job_id)
+        status = (job_state or {}).get("status")
+        if status == "running":
+            logging.warning(
+                "Import queue delivery could not claim a running job; "
+                "returning the message to the queue job_id=%s attempt=%s",
+                job_id,
+                dequeue_count,
+            )
+            raise RuntimeError(
+                f"Import job {job_id} is still running and could not be "
+                "claimed; releasing this delivery for retry"
+            )
+        logging.info(
+            "Import queue delivery skipped job_id=%s status=%s", job_id, status
+        )
         return
 
     started_at = perf_counter()
@@ -1555,8 +1692,32 @@ def import_job_worker(message: func.QueueMessage) -> None:
             dataset = payload.get("dataset") or job["operation"]
             if dataset == "all":
                 result = run_all_datasets()
-                if result.get("status") != "success":
-                    raise RuntimeError(f"Cost import completed with failures: {result}")
+                status = result.get("status")
+                if status == "partial_failure":
+                    # Name the datasets that failed, and their errors, BEFORE
+                    # the rest of the run. fail_import_job stores
+                    # str(error).splitlines()[0][:2000], and each per-dataset
+                    # entry in this dict is 220-240 characters - so eight
+                    # successes ahead of the failing one used to consume the
+                    # whole budget before its "error" key was ever reached, and
+                    # the stored message described only the parts that worked.
+                    broken = [
+                        f'{entry.get("dataset")}: {entry.get("error")}'
+                        for entry in result.get("results", [])
+                        if entry.get("status") == "failed"
+                    ]
+                    raise RuntimeError(
+                        "Cost import failed for "
+                        + "; ".join(broken or ["an unnamed dataset"])
+                    )
+                if status == "incomplete":
+                    # Not a failure worth retrying, and emphatically not a
+                    # success. The job row keeps the full result, which names
+                    # every skipped dataset and why.
+                    logging.warning(
+                        "Cost import completed with skipped datasets: %s",
+                        ", ".join(result.get("skipped_datasets") or []),
+                    )
             else:
                 dataset_result = run_dataset(dataset)
                 result = {

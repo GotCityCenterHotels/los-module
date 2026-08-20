@@ -333,7 +333,19 @@
                 // ranges. The server runs them concurrently under one global
                 // connection ceiling, returns the rulebook once and caches the
                 // complete compressed body against its Database A publication.
-                payload = await LosApi.fetchJson(`${API_URL}?${parameters}`);
+                //
+                // no-store, matching costdata-boot.js and costdata-input.js. The
+                // route sends private, max-age=60, which is right for a reload
+                // but wrong for pressing Update: saving a percentage in Cost
+                // Input and coming straight back here answered from the browser's
+                // own cache with the pre-save figures, captioned "Cost data is up
+                // to date." The server-side caches are keyed on the publication
+                // and a settings save advances it, so the rebuild is a ~40ms
+                // revalidation rather than a fresh build - this costs almost
+                // nothing and removes a wrong answer.
+                payload = await LosApi.fetchJson(
+                    `${API_URL}?${parameters}`, {cache: "no-store"}
+                );
             }
             catch (error) {
                 // Preserve the established partial-failure contract: a problem
@@ -342,7 +354,7 @@
                 console.error(error);
                 comparisonFailure = error;
                 payload = await LosApi.fetchJson(
-                    `${API_URL}?${new URLSearchParams(range)}`
+                    `${API_URL}?${new URLSearchParams(range)}`, {cache: "no-store"}
                 );
             }
             loadedData = payload.data || {};
@@ -433,9 +445,19 @@
         if (!loadedData) return;
         renderGop();
         renderTable();
+        // loadedRange, not the date inputs. The inputs are what will be asked
+        // for next; every figure under this caption came from what was asked for
+        // last. render() is called by each statement-line toggle, so editing a
+        // date and then toggling a line used to recaption eight months of
+        // figures with a twelve-month range - while the chart three panels down,
+        // which reads loadedRange, correctly contradicted it. The distinction is
+        // already documented at the top of this file.
+        const range = loadedRange
+            ? `${loadedRange.startDate} – ${loadedRange.endDate}`
+            : `${elements.startDate.value} – ${elements.endDate.value}`;
         elements.scope.textContent = [
             elements.hotel.value || "All hotels",
-            `${elements.startDate.value} – ${elements.endDate.value}`
+            range
         ].join(" · ");
         elements.gop.hidden = false;
         elements.gopChart.hidden = false;

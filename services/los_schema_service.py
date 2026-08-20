@@ -15,6 +15,21 @@ MIGRATIONS = (
         "008_los_read_model",
         APP_ROOT / "sql" / "migrations" / "008_los_read_model.sql",
     ),
+    # 005 is owned by import_job_schema_service and is listed here as well, the
+    # same way 006_unified_hotels is shared by the cost and supplement services.
+    #
+    # It has to be, because 009 below is an ALTER TABLE against
+    # functions.import_jobs and 005 is what creates it. On an established
+    # database that is invisible - the table has existed for months. On a rebuilt
+    # one, whichever request arrives first applies its own list, so a LOS request
+    # ahead of any import request ran 009 against a table that did not exist yet
+    # and answered 503 on every subsequent LOS call until something happened to
+    # touch the import-jobs schema. Declaring the dependency is what makes the
+    # order independent of which page someone opens first.
+    (
+        "005_import_jobs",
+        APP_ROOT / "sql" / "migrations" / "005_import_jobs.sql",
+    ),
     (
         "009_import_jobs_los",
         APP_ROOT / "sql" / "migrations" / "009_import_jobs_los.sql",

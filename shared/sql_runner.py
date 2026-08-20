@@ -1,3 +1,5 @@
+import logging
+
 from pathlib import Path
 
 from .db import get_export_connection, get_import_connection
@@ -37,6 +39,7 @@ def transfer_dataset(
     total_exported = 0
     total_imported = 0
     total_pruned = 0
+    prune_refused = None
 
     with get_export_connection() as export_conn:
         if export_sql_builder is not None:
@@ -97,14 +100,44 @@ def transfer_dataset(
             # Only the mixes prune. Their rows are keyed by dimension, so a
             # combination that stops occurring has no row for the upsert to
             # overwrite and would keep its old figure for good.
-            if prune_sql is not None:
+            #
+            # But never prune against nothing. The prune deletes every row in a
+            # 730-day window whose last_seen_at predates this run, so an export
+            # that returned zero rows - the first fetchmany comes back empty, the
+            # loop breaks, and control falls straight through to here - deletes
+            # the entire window instead of refreshing it. And because
+            # pruned_rows > 0 advances the cost publication, that emptiness is
+            # then published as if it were a fresh reading.
+            #
+            # Zero exported rows from a full-window rebuild is not a real state:
+            # it means a hard-coded predicate stopped matching (service.name =
+            # 'Stay', enterprise.tenant_key = 'GCCH', the 'SpaceOrder' item type)
+            # while the builder still resolved its columns. The right answer is to
+            # keep last night's data and say so, which is what
+            # supplement_sync_service._inventory_variance_exceeds already does for
+            # its own inventory.
+            if prune_sql is not None and total_imported == 0:
+                logging.warning(
+                    "Refusing to prune %s: the export returned no rows, so the "
+                    "prune would delete the whole window rather than refresh it",
+                    name or import_sql_file,
+                )
+                prune_refused = (
+                    "The export returned no rows, so the stale-row prune was "
+                    "refused rather than emptying the window. Last night's "
+                    "figures stand; the source predicates need checking."
+                )
+            elif prune_sql is not None:
                 with import_conn.cursor() as prune_cur:
                     prune_cur.execute(prune_sql, {"started_at": started_at})
                     total_pruned = max(prune_cur.rowcount, 0)
                 import_conn.commit()
 
-    return {
+    result = {
         "export_rows": total_exported,
         "import_rows": total_imported,
         "pruned_rows": total_pruned,
     }
+    if prune_refused is not None:
+        result["skipped"] = prune_refused
+    return result

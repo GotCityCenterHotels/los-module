@@ -353,9 +353,13 @@ def _list_mirrored_properties():
             return [_property_json(row) for row in cursor.fetchall()]
 
 
-def _get_mirrored_property(enterprise_id):
-    with cost_pool.connection() as connection:
-        with connection.cursor(row_factory=dict_row) as cursor:
+def _get_mirrored_property(enterprise_id, connection=None):
+    # Takes the caller's connection for the same reason the bootstrap writes do:
+    # check=ConnectionPool.check_connection spends a real round trip on every
+    # checkout, and the settings load that needs this answer is already holding
+    # one. See _writable_connection.
+    with _writable_connection(connection) as active:
+        with active.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 """
                 SELECT enterprise_id, hotel_name
@@ -743,40 +747,70 @@ def _read_cost_settings(connection, enterprise_id):
 def fetch_cost_settings(enterprise_id, hotel_name=None):
     ensure_cost_settings_schema()
     bootstrap_property = None
+    requested_enterprise_id = enterprise_id
+    verify_against_dimension = hotel_name is not None
     if hotel_name is None:
         property_record = _resolve_cost_settings_hotel(enterprise_id)
         enterprise_id = property_record["enterpriseId"]
         hotel_name = property_record["hotelName"]
     else:
-        # The ID/name pair came from the property-list endpoint. Persist it
-        # locally on first load as well, so a cached list response cannot leave
-        # the subsequent Save request without a Database A property record.
-        bootstrap_property = {
-            "enterpriseId": _required_text(
-                enterprise_id,
-                "Enterprise ID",
-                250,
-            ),
-            "hotelName": _required_text(hotel_name, "Hotel", 250),
-        }
-        enterprise_id = bootstrap_property["enterpriseId"]
-        hotel_name = bootstrap_property["hotelName"]
+        # The ID/name pair is SUPPOSED to have come from the property-list
+        # endpoint - but this is an anonymous GET, and it used to take the
+        # caller's word for both halves. `?hotelName=` on an unknown id ran
+        # _upsert_mirrored_properties, which INSERTs into functions.hotels with
+        # tenant_key='GCCH' and active=true. Nothing anywhere sets active back to
+        # false and the properties import only ever raises it, so an invented
+        # property was permanent and appeared in every picker from then on. A GET
+        # that creates a dimension row from a query string is not a bootstrap,
+        # it is an injection.
+        #
+        # functions.hotels has exactly two authoritative writers, both fed by
+        # Database B: the properties import, and list_cost_settings_hotels()
+        # seeding an empty mirror from enterprise_current. This path is neither,
+        # so it now verifies against the dimension instead of writing to it, and
+        # takes the name from there rather than from the caller - which also ends
+        # the lesser trick of relabelling a real property through a URL.
+        #
+        # The stated purpose survives: what the subsequent Save actually needs is
+        # a cost_property_settings row, and _preload_property_settings still
+        # creates that. Its FK into functions.hotels is satisfied precisely
+        # because the id was found here.
+        # Shape-checked here so a hostile id never reaches SQL, resolved below
+        # on the read's own connection.
+        requested_enterprise_id = _required_text(
+            enterprise_id, "Enterprise ID", 250
+        )
+        _required_text(hotel_name, "Hotel", 250)
 
     with cost_pool.connection() as connection:
+        if verify_against_dimension:
+            known_property = _get_mirrored_property(
+                requested_enterprise_id, connection=connection
+            )
+            if known_property is None:
+                # The authoritative lookup, which raises ValueError for an
+                # unknown id - a 400, not a silent new property.
+                known_property = _resolve_cost_settings_hotel(
+                    requested_enterprise_id
+                )
+            bootstrap_property = {
+                "enterpriseId": known_property["enterpriseId"],
+                "hotelName": known_property["hotelName"],
+            }
+            enterprise_id = bootstrap_property["enterpriseId"]
+            hotel_name = bootstrap_property["hotelName"]
+
         bootstrap_changed = False
         bootstrap_publication_version = None
         if bootstrap_property is not None:
-            # Both bootstrap writes run on the read's own connection. They used
-            # to take a checkout each, and check=ConnectionPool.check_connection
-            # spends a real round trip on every checkout - three per settings
-            # load, for two writes that in steady state change nothing.
-            mirrored = _upsert_mirrored_properties(
+            # One write now, not two: the dimension row is confirmed to exist
+            # above rather than written here, so only the settings row is
+            # bootstrapped. It runs on the read's own connection, because
+            # check=ConnectionPool.check_connection spends a real round trip on
+            # every checkout and this one changes nothing in steady state.
+            bootstrap_changed = _preload_property_settings(
                 [bootstrap_property], connection=connection
             )
-            preloaded = _preload_property_settings(
-                [bootstrap_property], connection=connection
-            )
-            bootstrap_changed = mirrored or preloaded
             if bootstrap_changed:
                 with connection.cursor() as cursor:
                     bootstrap_publication_version = advance_cost_publication(
@@ -1118,6 +1152,18 @@ def _unique_names(names, label):
         seen.add(folded)
 
 
+# Every collection in this payload is a hand-maintained rulebook: a property has
+# a handful of distribution groups, a dozen room categories, a few staffing
+# tiers. Nothing legitimate comes close to this, and without a ceiling the write
+# loop below - one INSERT ... RETURNING per group and per category, inside one
+# transaction on one of four pooled connections - is bounded only by how much
+# JSON someone cares to post. statement_timeout does not help: it is per
+# statement, and a stream of individually fast INSERTs never trips it.
+MAX_COLLECTION_ENTRIES = int(
+    os.environ.get("COST_SETTINGS_MAX_COLLECTION_ENTRIES", "500")
+)
+
+
 def _entries(value, label):
     """A list of dicts from a JSON payload, or a clear rejection.
 
@@ -1131,6 +1177,11 @@ def _entries(value, label):
         return []
     if not isinstance(value, list):
         raise ValueError(f"{label} must be a list")
+    if len(value) > MAX_COLLECTION_ENTRIES:
+        raise ValueError(
+            f"{label} may not carry more than "
+            f"{MAX_COLLECTION_ENTRIES} entries"
+        )
     for entry in value:
         if not isinstance(entry, dict):
             raise ValueError(f"Each entry in {label} must be an object")
@@ -1355,7 +1406,12 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
         )
 
     result = {"enterpriseId": enterprise_id, "hotelName": hotel_name, "profile": clean_profile}
-    groups = payload.get("distributionGroups") or []
+    # Through _entries like every other collection. This one was iterating the
+    # raw payload value: a bare string here walked character by character and
+    # then died on "x".get(...) with an AttributeError - a 500 for what is
+    # plainly a malformed request, and the one collection in this function that
+    # had no shape check at all.
+    groups = _entries(payload.get("distributionGroups"), "distributionGroups")
     names = set()
     result["distributionGroups"] = []
     for index, group in enumerate(groups):
@@ -1363,7 +1419,7 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
         if name.casefold() in names: raise ValueError("Distribution group names must be unique")
         names.add(name.casefold())
         rules = []
-        for rule in group.get("rules") or []:
+        for rule in _entries(group.get("rules"), f"{name} rules"):
             match_type = rule.get("matchType")
             if match_type not in {"rate", "channel"}: raise ValueError("Distribution match type must be rate or channel")
             rules.append({"matchType": match_type, "matchValue": _required_text(rule.get("matchValue"), "Distribution match value")})
@@ -1424,8 +1480,8 @@ def validate_cost_settings(enterprise_id, hotel_name, payload):
         row["linenCost"] = _round_sek(Decimal(resolved["effectiveLinenCost"]))
 
     for source, target, min_key, max_key, hours_key, label in (
-        (payload.get("arrivalTiers") or [], "arrivalTiers", "minArrivals", "maxArrivals", "receptionHours", "Arrival staffing"),
-        (payload.get("breakfastTiers") or [], "breakfastTiers", "minGuests", "maxGuests", "staffHours", "Breakfast staffing"),
+        (_entries(payload.get("arrivalTiers"), "arrivalTiers"), "arrivalTiers", "minArrivals", "maxArrivals", "receptionHours", "Arrival staffing"),
+        (_entries(payload.get("breakfastTiers"), "breakfastTiers"), "breakfastTiers", "minGuests", "maxGuests", "staffHours", "Breakfast staffing"),
     ):
         _validate_ranges(source, min_key, max_key, label)
         result[target] = [{min_key: _number(row.get(min_key), f"{label} minimum", integer=True), max_key: None if row.get(max_key) in (None, "") else _number(row.get(max_key), f"{label} maximum", integer=True), hours_key: _number(row.get(hours_key), f"{label} hours")} for row in source]

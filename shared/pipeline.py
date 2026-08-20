@@ -148,9 +148,24 @@ def run_all_datasets():
             result = run_dataset(dataset_name)
             finished_at = utc_now()
 
+            # A dataset that skipped is not a dataset that succeeded.
+            #
+            # transfer_dataset returns a "skipped" note in two cases - the mix
+            # builder could not resolve its columns in the mirror, and the
+            # stale-row prune was refused because the export came back empty -
+            # and both used to be recorded as "success" here, which made
+            # run_all_datasets report "success" overall, which made the queue
+            # worker call complete_import_job. Meanwhile the publication never
+            # moved, so every browser ETag and every worker byte cache stayed
+            # valid and the page did not even rebuild. The single signal in the
+            # whole chain was a logging.warning on an app with no telemetry sink.
+            #
+            # Naming it "skipped" here is what lets it travel: the overall status
+            # below stops being success, the job row records it, and an operator
+            # has something to see.
             results.append(
                 {
-                    "status": "success",
+                    "status": "skipped" if result.get("skipped") else "success",
                     "started_at": started_at.isoformat(),
                     "finished_at": finished_at.isoformat(),
                     "duration_seconds": (finished_at - started_at).total_seconds(),
@@ -172,11 +187,27 @@ def run_all_datasets():
                 }
             )
 
+    # Three outcomes, not two, because "skipped" and "failed" want opposite
+    # handling. A failure is usually transient and worth the queue's retries; a
+    # skip means the mirror does not currently carry a column this dataset needs,
+    # or an export matched nothing at all, and retrying that twice more just
+    # spends the attempts and lands in a poison queue nobody consumes. So it
+    # completes the job - and does NOT call itself success, which is the whole
+    # point.
+    statuses = {result["status"] for result in results}
+    if statuses <= {"success"}:
+        overall = "success"
+    elif "failed" in statuses:
+        overall = "partial_failure"
+    else:
+        overall = "incomplete"
+
     return {
-        "status": (
-            "success"
-            if all(result["status"] == "success" for result in results)
-            else "partial_failure"
-        ),
+        "status": overall,
+        "skipped_datasets": [
+            result["dataset"]
+            for result in results
+            if result["status"] == "skipped"
+        ],
         "results": results,
     }

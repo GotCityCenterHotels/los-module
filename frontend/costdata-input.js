@@ -2240,83 +2240,47 @@
         return parts.join(" ");
     }
 
-    // costdata/import is a FUNCTION-level route, so it cannot be left open. What
-    // actually guards it, though, is not the key.
+    // costdata/import is ANONYMOUS (see the decorator and its reasoning in
+    // function_app.py), so a function key is neither sent nor read on this path.
     //
-    // The Function App is a Static Web Apps linked backend, which puts App Service
-    // Authentication in front of it: a direct call to the Function App's own
-    // hostname is rejected before the key is ever read, and a call proxied from
-    // this page is authenticated by the platform. So a request from here usually
-    // needs no key at all - and sending a WRONG one is strictly worse than sending
-    // none, because the Functions host key check then turns down a request EasyAuth
-    // had already let through.
+    // What used to be here was a two-step ladder: post without a key, and on any
+    // 401/403 prompt the operator for the Function App's *host* key - the one
+    // that authorises every FUNCTION-level route in the app - then keep it in
+    // sessionStorage and retry. Three things were wrong with it. The route it
+    // sends to ignores the header entirely, so the retry could never be what
+    // fixed anything. The 401 that triggered it is far more likely to be an
+    // expired page session than a missing key, so the prompt asked a
+    // non-technical operator for a high-value credential to solve a problem it
+    // could not solve. And the comment justifying it described the route as
+    // FUNCTION-level, which it has not been for some time.
     //
-    // Hence: try without a key, and only ask for one if the server actually says
-    // no. An earlier version asked first and reported every 401 as "that key was
-    // not accepted", which was wrong twice over - the key was not needed, and the
-    // 401 it was blaming could equally have been an expired page session.
-    const IMPORT_KEY_STORAGE = "costdata-import-key";
-    function importKey() {
-        let key = "";
-        try { key = sessionStorage.getItem(IMPORT_KEY_STORAGE) || ""; } catch { key = ""; }
-        if (!key) {
-            key = (prompt(
-                "This import needs a function key.\n\n"
-                + "Azure portal > los-functions > App keys > default. Ask IT if you "
-                + "do not have access. It is kept for this browser tab only."
-            ) || "").trim();
-            if (!key) return "";
-            try { sessionStorage.setItem(IMPORT_KEY_STORAGE, key); } catch { /* session-only */ }
-        }
-        return key;
-    }
-    function forgetImportKey() {
-        try { sessionStorage.removeItem(IMPORT_KEY_STORAGE); } catch { /* nothing cached */ }
-    }
-
-    function isAuthFailure(error) {
-        return /\b401\b|\b403\b/.test((error && error.message) || "");
-    }
-
-    function postImport(dataset, key) {
-        const headers = {"Content-Type": "application/json"};
-        if (key) headers["x-functions-key"] = key;
+    // What actually guards this button is the deployment: App Service
+    // Authentication in front of the linked backend, plus the site's own access
+    // control. Neither is something this page can supply on demand, so a refusal
+    // is reported as what it is.
+    function postImport(dataset) {
         return LosApi.fetchJson("/api/costdata/import", {
-            method: "POST", headers, body: JSON.stringify({dataset})
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({dataset})
         });
     }
 
-    // Unauthenticated first, then once more with a key if that is refused.
+    function isAuthFailure(error) {
+        return /401|403/.test((error && error.message) || "");
+    }
+
     async function queueImport(dataset) {
         try {
-            return await postImport(dataset, "");
+            return await postImport(dataset);
         }
         catch (error) {
             if (!isAuthFailure(error)) throw error;
-            // A key already cached in this tab is reused silently; only a tab that
-            // has never needed one gets the prompt.
-            const key = importKey();
-            if (!key) {
-                throw new Error(
-                    "The server asked for a function key and none was entered."
-                );
-            }
-            try {
-                return await postImport(dataset, key);
-            }
-            catch (retry) {
-                if (!isAuthFailure(retry)) throw retry;
-                forgetImportKey();
-                // Both attempts refused, so the key is only half the candidates.
-                // This page sits behind the site's own login, and an expired
-                // session refuses the proxied request exactly the same way.
-                throw new Error(
-                    "The server refused this request both without a key and with the "
-                    + "one entered. Either that key is wrong, or this page's own "
-                    + "session has expired - reload the page and try again before "
-                    + "re-entering a key."
-                );
-            }
+            throw new Error(
+                "The server refused this request. This page's own session has "
+                + "most likely expired - reload the page and try again. If it "
+                + "keeps happening, the import needs to be triggered by IT."
+            );
         }
     }
 

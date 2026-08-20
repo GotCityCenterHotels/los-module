@@ -344,6 +344,80 @@ class CostDataResponseCacheTests(unittest.TestCase):
         self.assertEqual(decode(recovered)["costSettings"], {})
         self.assertEqual(fetch_ranges.call_count, 2)
 
+    def test_a_degraded_body_carries_no_validator_and_no_freshness(self):
+        """The server refusing to keep a body must stop the browser keeping it.
+
+        Retaining it server-side was already skipped, but the response still
+        went out with the ETag a healthy body would have carried - the validator
+        is built from the publication version and the dates, and knows nothing
+        about a rulebook lookup that timed out. So one unlucky client kept a
+        statement with no Cost Input configuration, revalidated inside the
+        window, and was answered 304 before any query ran: stale until the
+        publication moved, while every other client got a healthy body under the
+        identical ETag.
+        """
+        with patch.object(
+            function_app,
+            "fetch_cost_publication_version",
+            return_value=7,
+        ), patch.object(
+            function_app,
+            "fetch_cost_data_ranges",
+            return_value=range_results(),
+        ), patch.object(
+            function_app,
+            "fetch_all_cost_settings",
+            side_effect=[RuntimeError("temporary"), {}],
+        ):
+            degraded = function_app.cost_data_facts(request())
+            healthy = function_app.cost_data_facts(request())
+
+        self.assertNotIn("ETag", degraded.headers)
+        self.assertEqual(degraded.headers["Cache-Control"], "no-store")
+        # The healthy answer is still fully revalidatable, so the fix costs
+        # nothing on the path that matters.
+        self.assertIn("ETag", healthy.headers)
+        self.assertIn("max-age", healthy.headers["Cache-Control"])
+        # And the ETag the degraded body would have carried is the healthy one,
+        # which is exactly why it could not be allowed to carry it.
+        self.assertEqual(
+            degraded.headers.get("ETag", None), None
+        )
+
+    def test_a_waiter_on_a_degraded_build_is_also_told_not_to_keep_it(self):
+        """Single-flight shares the bytes, so it must share the cacheability."""
+        entry = (b'{"a":1}', gzip.compress(b'{"a":1}'))
+        cache = function_app.VersionedResponseCache("probe", 60, 4)
+        pending = function_app.Future()
+        cache.inflight[("k",)] = pending
+        pending.set_result((entry, False))
+
+        response = cache.respond(
+            FakeRequest(), ("k",), 'W/"probe-x"', lambda: (None, True)
+        )
+
+        self.assertNotIn("ETag", response.headers)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_api_responses_carry_nosniff(self):
+        """staticwebapp.config.json globalHeaders do not reach /api/*."""
+        with patch.object(
+            function_app,
+            "fetch_cost_publication_version",
+            return_value=7,
+        ), patch.object(
+            function_app,
+            "fetch_cost_data_ranges",
+            return_value=range_results(),
+        ), patch.object(
+            function_app, "fetch_all_cost_settings", return_value={}
+        ):
+            ok = function_app.cost_data_facts(request())
+
+        self.assertEqual(ok.headers["X-Content-Type-Options"], "nosniff")
+        error = function_app.json_response({"error": "no"}, 400)
+        self.assertEqual(error.headers["X-Content-Type-Options"], "nosniff")
+
 
 if __name__ == "__main__":
     unittest.main()

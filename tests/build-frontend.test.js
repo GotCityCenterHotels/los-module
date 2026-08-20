@@ -69,11 +69,41 @@ test("every minified script still parses and keeps its global", options, () => {
     build();
 
     // A module that lost its global would still parse, so parsing is not enough.
+    //
+    // All eight, derived from the files themselves rather than a hand-kept
+    // subset. Three were listed and five were not - including CostData, which
+    // costdata.js, costdata-input.js and the whole Cost Data statement hang off.
+    // That omission is what made this test unable to guard the premise it exists
+    // for: the build deliberately uses esbuild's `transform` rather than
+    // `bundle`, because bundling renames the globals these classic scripts assign
+    // and would break every page at once. A silent rename in five of the eight
+    // would have shipped.
     const globals = {
+        "costdata-cleaning.js": "CostCleaning",
+        "costdata-data.js": "CostData",
+        "costdata-match.js": "CostMatch",
         "los-api.js": "LosApi",
         "los-data.js": "LosData",
         "los-format.js": "LosFormat",
+        "los-period-picker.js": "LosPeriodPicker",
+        "supplement-data.js": "SupplementData",
     };
+
+    // And the map itself is checked against the source tree, so a new module
+    // that assigns a global cannot quietly go unguarded.
+    const sourceDir = path.join(__dirname, "..", "frontend");
+    const assigned = {};
+    for (const file of fs.readdirSync(sourceDir).filter((n) => n.endsWith(".js"))) {
+        const match = /root\.([A-Z][A-Za-z]*)\s*=/.exec(
+            fs.readFileSync(path.join(sourceDir, file), "utf8")
+        );
+        if (match) assigned[file] = match[1];
+    }
+    assert.deepEqual(
+        assigned,
+        globals,
+        "frontend/ assigns a different set of globals than this test guards"
+    );
 
     for (const file of fs.readdirSync(dist).filter((name) => name.endsWith(".js"))) {
         const full = path.join(dist, file);
@@ -133,4 +163,23 @@ test("dist pages are stamped against the minified bytes, not the sources", optio
             );
         }
     }
+});
+
+test("the two LOS page scripts cannot collide if loaded together", () => {
+    // app.js and distribution.js were the only unwrapped page scripts and shared
+    // 27 top-level names, including the entire page state machine declared twice.
+    // Nothing loads both today, so it was latent - and the failure mode was a
+    // SyntaxError on the second file, i.e. the page minus the added feature.
+    //
+    // new Function parses in function scope, where a duplicate const/let is a
+    // SyntaxError, so this fails on unwrapped sources and passes on wrapped ones.
+    const sourceDir = path.join(__dirname, "..", "frontend");
+    const both = ["app.js", "distribution.js"]
+        .map((name) => fs.readFileSync(path.join(sourceDir, name), "utf8"))
+        .join("\n");
+
+    assert.doesNotThrow(
+        () => new Function(both),
+        "app.js and distribution.js still share top-level names"
+    );
 });
